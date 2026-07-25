@@ -111,7 +111,26 @@ async function withRetry(fn, { retries = 2, delayMs = 500, shouldRetry } = {}) {
   }
 }
 
+// Run `worker(item, index)` over `items` with at most `concurrency` calls in
+// flight — a bounded worker pool so the bulk sync can process several
+// conversations at once instead of strictly one at a time. Resolves when all
+// items are done. `worker` is expected to handle its own errors (a throw will
+// reject the pool). Execution order is not guaranteed unless concurrency is 1.
+async function runPool(items, concurrency, worker) {
+  let next = 0;
+  const n = Math.max(1, Math.min(concurrency | 0 || 1, items.length));
+  async function runner() {
+    while (next < items.length) {
+      const i = next++;
+      await worker(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: n }, runner));
+}
+
 // Browser: expose globally. Node (vitest): export for testing.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { buildIngestPayload, selectConversationsSince, filterUnsynced, withRetry };
+  module.exports = {
+    buildIngestPayload, selectConversationsSince, filterUnsynced, withRetry, runPool,
+  };
 }

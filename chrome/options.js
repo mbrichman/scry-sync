@@ -182,6 +182,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const scry = result.scry || {};
     if (scry.url) document.getElementById('scryUrl').value = scry.url;
     if (scry.token) document.getElementById('scryToken').value = scry.token;
+    document.getElementById('scryConcurrency').value = scry.concurrency || 4;
   });
 });
 
@@ -198,9 +199,15 @@ document.getElementById('saveScryBtn').addEventListener('click', () => {
     return;
   }
 
+  // How many conversations the bulk sync processes at once. Clamp to a sane
+  // range so a typo can't hammer claude.ai or stall on a huge value.
+  let concurrency = parseInt(document.getElementById('scryConcurrency').value, 10);
+  if (!Number.isFinite(concurrency)) concurrency = 4;
+  concurrency = Math.max(1, Math.min(concurrency, 12));
+
   // Pre-request the host permission so the later sync fetch isn't blocked.
   chrome.permissions.request({ origins: [scryOriginPattern(url)] }, (granted) => {
-    chrome.storage.local.set({ scry: { url, token } }, () => {
+    chrome.storage.local.set({ scry: { url, token, concurrency } }, () => {
       showStatus('scryStatus',
         granted ? 'Scry settings saved.' : 'Saved, but host permission was declined — sync will fail until granted.',
         granted ? 'success' : 'error');

@@ -684,12 +684,18 @@ async function syncToScry(mode) {
     showToast('Sync cancelled', true);
   };
 
-  let synced = 0, failed = 0;
+  let synced = 0, failed = 0, done = 0;
   const failures = [];
 
-  for (let i = 0; i < total; i++) {
-    if (cancelled) break;
-    const conv = candidates[i];
+  // Process several conversations at once (bounded pool) so a full sync of
+  // thousands isn't strictly one-at-a-time. Concurrency is configurable in
+  // Options (scry.concurrency); default 4 — enough to speed things up while
+  // staying polite to claude.ai's API. syncedMap is persisted after each
+  // completion so an interrupted run resumes.
+  const concurrency = (scry.concurrency && scry.concurrency > 0) ? scry.concurrency : 4;
+
+  await runPool(candidates, concurrency, async (conv) => {
+    if (cancelled) return;
     try {
       const result = await syncOneConversation(orgId, conv.uuid, scry);
       synced++;
@@ -700,12 +706,11 @@ async function syncToScry(mode) {
       console.error('Scry sync failed for', conv.uuid, e);
     }
 
-    const done = i + 1;
+    done++;
     progressBar.style.width = `${Math.round((done / total) * 100)}%`;
     progressStats.textContent = `${synced} synced, ${failed} failed of ${total}`;
     await setScrySyncedMap(syncedMap); // persist incrementally so a crash resumes
-    await new Promise((r) => setTimeout(r, 150)); // gentle pacing on claude.ai + Scry
-  }
+  });
 
   progressModal.style.display = 'none';
   await refreshSyncStatus();

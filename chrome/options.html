@@ -247,6 +247,9 @@
     <label for="scryToken" style="margin-top: 10px; display: block;">Service Token:</label>
     <input type="password" id="scryToken" placeholder="SCRY_SERVICE_TOKEN">
     <div class="example">Must match <code>SCRY_SERVICE_TOKEN</code> in your Scry .env (min 16 chars).</div>
+    <label for="scryConcurrency" style="margin-top: 10px; display: block;">Sync concurrency:</label>
+    <input type="number" id="scryConcurrency" min="1" max="12" step="1" value="4" style="width: 80px;">
+    <div class="example">How many conversations to sync at once (1–12). Higher = faster full sync; lower if claude.ai rate-limits. Default 4.</div>
     <div class="button-row">
       <button id="saveScryBtn">Save Scry Settings</button>
       <button id="testScryBtn">Test Connection</button>
