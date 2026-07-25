@@ -101,6 +101,22 @@ async function fetchConversationFileBlobs(convData) {
   return out;
 }
 
+// Ask Scry which of the enumerated conversation ids still need (re-)syncing.
+// Sends the full id set; gets back { to_resync: [...], summary: {...}, extra }.
+// This is the completeness gate: it catches both conversations Scry never got
+// (missing) and ones it got but couldn't fully capture (incomplete).
+async function reconcileWithScry(scry, sourceIds) {
+  const url = `${scry.url.replace(/\/+$/, '')}/api/conversations/reconcile`;
+  const headers = { 'Content-Type': 'application/json' };
+  if (scry.token) headers['Authorization'] = `Bearer ${scry.token}`;
+  const resp = await fetch(url, {
+    method: 'POST', headers,
+    body: JSON.stringify({ source_type: 'claude', source_ids: sourceIds }),
+  });
+  if (!resp.ok) throw new Error(`reconcile HTTP ${resp.status}`);
+  return resp.json();
+}
+
 // POST a built payload to Scry's ingest endpoint.
 async function postToScry(scry, payload) {
   const ingestUrl = `${scry.url.replace(/\/+$/, '')}/api/conversations/ingest`;

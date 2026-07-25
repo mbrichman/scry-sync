@@ -531,8 +531,10 @@ function displayConversations() {
   // Enable Scry sync buttons
   const syncAll = document.getElementById('syncAllScryBtn');
   const syncRecent = document.getElementById('syncRecentScryBtn');
+  const reconcile = document.getElementById('reconcileScryBtn');
   if (syncAll) syncAll.disabled = false;
   if (syncRecent) syncRecent.disabled = false;
+  if (reconcile) reconcile.disabled = false;
 }
 
 // Handle individual checkbox change
@@ -649,32 +651,19 @@ async function refreshSyncStatus() {
   updateStats();
 }
 
-// Bulk sync. mode is 'all' or { days: N }.
-async function syncToScry(mode) {
-  const scry = await loadScrySettings();
-  if (!scry.url) { showToast('Set your Scry URL in Options first', true); return; }
-  if (!(await ensureScryPermission(scry.url))) { showToast('Host permission for Scry was declined', true); return; }
-  if (!orgId) { showToast('Organization not detected yet — try again in a moment', true); return; }
-
-  // Pick candidates: recent window (client-side) then drop already-synced versions.
-  let candidates = allConversations.slice();
-  if (mode !== 'all') {
-    candidates = selectConversationsSince(candidates, Date.now() - mode.days * 86400000);
-  }
-  const syncedMap = await getScrySyncedMap();
-  candidates = filterUnsynced(candidates, syncedMap);
-
+// Sync a given list of conversation objects to Scry with the bounded pool +
+// progress modal. Shared by "Sync all/last-N" and "Reconcile". Returns
+// { synced, failed, cancelled }.
+async function syncCandidateList(candidates, scry, headerText) {
   const total = candidates.length;
-  if (total === 0) { showToast('Nothing to sync — Scry is up to date'); return; }
 
-  // Reuse the progress modal.
   const progressModal = document.getElementById('progressModal');
   const progressBar = document.getElementById('progressBar');
   const progressText = document.getElementById('progressText');
   const progressStats = document.getElementById('progressStats');
   progressBar.style.width = '0%';
   progressStats.textContent = '';
-  progressText.textContent = `Syncing ${total} conversation${total === 1 ? '' : 's'} to Scry…`;
+  progressText.textContent = headerText;
   progressModal.style.display = 'block';
 
   let cancelled = false;
@@ -684,13 +673,13 @@ async function syncToScry(mode) {
     showToast('Sync cancelled', true);
   };
 
+  const syncedMap = await getScrySyncedMap();
   let synced = 0, failed = 0, done = 0;
   const failures = [];
 
   // Process several conversations at once (bounded pool) so a full sync of
   // thousands isn't strictly one-at-a-time. Concurrency is configurable in
-  // Options (scry.concurrency); default 4 — enough to speed things up while
-  // staying polite to claude.ai's API. syncedMap is persisted after each
+  // Options (scry.concurrency); default 4. syncedMap is persisted after each
   // completion so an interrupted run resumes.
   const concurrency = (scry.concurrency && scry.concurrency > 0) ? scry.concurrency : 4;
 
@@ -714,14 +703,78 @@ async function syncToScry(mode) {
 
   progressModal.style.display = 'none';
   await refreshSyncStatus();
-  if (cancelled) return;
+  if (failed > 0) console.warn('Scry sync failures:', failures);
+  return { synced, failed, cancelled };
+}
 
-  if (failed > 0) {
-    console.warn('Scry sync failures:', failures);
-    showToast(`Synced ${synced}/${total} to Scry — ${failed} failed (see console)`, true);
-  } else {
-    showToast(`Synced ${synced} conversation${synced === 1 ? '' : 's'} to Scry ✓`);
+// Bulk sync. mode is 'all' or { days: N }.
+async function syncToScry(mode) {
+  const scry = await loadScrySettings();
+  if (!scry.url) { showToast('Set your Scry URL in Options first', true); return; }
+  if (!(await ensureScryPermission(scry.url))) { showToast('Host permission for Scry was declined', true); return; }
+  if (!orgId) { showToast('Organization not detected yet — try again in a moment', true); return; }
+
+  // Pick candidates: recent window (client-side) then drop already-synced versions.
+  let candidates = allConversations.slice();
+  if (mode !== 'all') {
+    candidates = selectConversationsSince(candidates, Date.now() - mode.days * 86400000);
   }
+  const syncedMap = await getScrySyncedMap();
+  candidates = filterUnsynced(candidates, syncedMap);
+
+  const total = candidates.length;
+  if (total === 0) { showToast('Nothing to sync — Scry is up to date'); return; }
+
+  const r = await syncCandidateList(candidates, scry,
+    `Syncing ${total} conversation${total === 1 ? '' : 's'} to Scry…`);
+  if (r.cancelled) return;
+  if (r.failed > 0) {
+    showToast(`Synced ${r.synced}/${total} to Scry — ${r.failed} failed (see console)`, true);
+  } else {
+    showToast(`Synced ${r.synced} conversation${r.synced === 1 ? '' : 's'} to Scry ✓`);
+  }
+}
+
+// Reconcile against Scry: ask which enumerated conversations are missing or
+// incompletely captured, then re-sync exactly those. This is the completeness
+// gate — the authoritative "does Scry hold every conversation with full
+// fidelity?" check — run before deleting anything from Claude.
+async function reconcileAndSync() {
+  const scry = await loadScrySettings();
+  if (!scry.url) { showToast('Set your Scry URL in Options first', true); return; }
+  if (!(await ensureScryPermission(scry.url))) { showToast('Host permission for Scry was declined', true); return; }
+  if (!orgId) { showToast('Organization not detected yet — try again in a moment', true); return; }
+
+  const sourceIds = allConversations.map((c) => c.uuid).filter(Boolean);
+  let report;
+  try {
+    showToast(`Reconciling ${sourceIds.length} conversations with Scry…`);
+    report = await reconcileWithScry(scry, sourceIds);
+  } catch (e) {
+    console.error('Reconcile failed', e);
+    showToast(`Reconcile failed: ${e.message}`, true);
+    return;
+  }
+
+  const s = report.summary || {};
+  const resync = new Set(report.to_resync || []);
+  console.log('Scry reconcile:', s, 'extra(in Scry, not listed):', report.extra);
+
+  if (resync.size === 0) {
+    showToast(`✓ Scry holds all ${s.complete} conversations with full fidelity`);
+    return;
+  }
+
+  const candidates = allConversations.filter((c) => resync.has(c.uuid));
+  const r = await syncCandidateList(candidates, scry,
+    `Reconcile: ${s.missing} missing + ${s.incomplete} incomplete → re-syncing ${candidates.length}…`);
+  if (r.cancelled) return;
+  showToast(
+    r.failed > 0
+      ? `Re-synced ${r.synced}/${candidates.length} — ${r.failed} failed (see console)`
+      : `Reconciled ✓ re-synced ${r.synced}. Run again to confirm 0 remaining.`,
+    r.failed > 0,
+  );
 }
 
 // Sync a single conversation from the dashboard's per-row Sync button.
@@ -937,5 +990,9 @@ function setupEventListeners() {
       const days = parseInt(document.getElementById('syncRecentDays').value, 10);
       syncToScry({ days: Number.isFinite(days) && days > 0 ? days : 7 });
     });
+  }
+  const reconcileBtn = document.getElementById('reconcileScryBtn');
+  if (reconcileBtn) {
+    reconcileBtn.addEventListener('click', () => reconcileAndSync());
   }
 }
