@@ -142,6 +142,51 @@ async function reconcileWithScry(scry, sourceIds) {
   return resp.json();
 }
 
+// Ask Scry which conversations are CLEARED for deletion from the source. Each
+// item is { source_id, live_body } where live_body is the conversation's tree
+// just fetched LIVE from Claude. Scry clears one only if capture is complete AND
+// the live body still matches the stored archive message-for-message — the
+// fresh, content-level proof the other checks (Scry-internal / trusts-archive /
+// stale snapshot) can't give. Server-authoritative: we delete ONLY what this
+// returns as deletable. Returns { summary, results:[{source_id, deletable, ...}] }.
+async function verifyDeletableWithScry(scry, items) {
+  const url = `${scry.url.replace(/\/+$/, '')}/api/conversations/verify-deletable`;
+  const headers = { 'Content-Type': 'application/json' };
+  if (scry.token) headers['Authorization'] = `Bearer ${scry.token}`;
+  const resp = await fetch(url, {
+    method: 'POST', headers,
+    body: JSON.stringify({ source_type: 'claude', conversations: items }),
+  });
+  if (!resp.ok) throw new Error(`verify-deletable HTTP ${resp.status}`);
+  return resp.json();
+}
+
+// Partition a verify-deletable report into cleared ids + blocked verdicts. Pure
+// so it can be unit-tested; the caller deletes ONLY `cleared`.
+function partitionDeletableReport(report) {
+  const cleared = [];
+  const blocked = [];
+  for (const r of (report && report.results) || []) {
+    if (r.deletable) {
+      cleared.push(r.source_id);
+    } else {
+      blocked.push({ source_id: r.source_id, title: r.title, reasons: r.reasons || [] });
+    }
+  }
+  return { cleared, blocked };
+}
+
+// Delete a conversation from claude.ai (credentialed; IRREVERSIBLE at the
+// source). Only ever called for ids Scry cleared as deletable in the SAME run.
+// Returns { ok, status }.
+async function deleteClaudeConversation(orgId, conversationUuid) {
+  const url = `https://claude.ai/api/organizations/${orgId}/chat_conversations/${conversationUuid}`;
+  const resp = await fetch(url, {
+    method: 'DELETE', credentials: 'include', headers: { 'Accept': 'application/json' },
+  });
+  return { ok: resp.ok, status: resp.status };
+}
+
 // POST a built payload to Scry's ingest endpoint.
 async function postToScry(scry, payload) {
   const ingestUrl = `${scry.url.replace(/\/+$/, '')}/api/conversations/ingest`;
@@ -175,5 +220,5 @@ async function syncOneConversation(orgId, conversationUuid, scry) {
 
 // In Node (vitest), expose the pure helpers for testing.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { conversationBodyIsStub };
+  module.exports = { conversationBodyIsStub, partitionDeletableReport };
 }

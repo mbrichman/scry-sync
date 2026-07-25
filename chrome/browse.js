@@ -532,9 +532,11 @@ function displayConversations() {
   const syncAll = document.getElementById('syncAllScryBtn');
   const syncRecent = document.getElementById('syncRecentScryBtn');
   const reconcile = document.getElementById('reconcileScryBtn');
+  const deleteFromClaude = document.getElementById('deleteFromClaudeBtn');
   if (syncAll) syncAll.disabled = false;
   if (syncRecent) syncRecent.disabled = false;
   if (reconcile) reconcile.disabled = false;
+  if (deleteFromClaude) deleteFromClaude.disabled = false;
 }
 
 // Handle individual checkbox change
@@ -777,6 +779,134 @@ async function reconcileAndSync() {
   );
 }
 
+// Phase 3 — the gated delete. Delete the SELECTED conversations from Claude,
+// but only after Scry re-verifies each one LIVE: fetch the current body from
+// Claude → Scry confirms capture is complete AND the live body still matches the
+// stored archive → only cleared ids are deleted. This is a deliberate,
+// never-automatic action; it always previews the gate result and requires an
+// explicit confirm before any irreversible DELETE. Operate on a hand-picked
+// selection (check 1–2 boxes) so the first runs are tiny and reviewable.
+async function deleteSelectedFromClaude() {
+  const scry = await loadScrySettings();
+  if (!scry.url) { showToast('Set your Scry URL in Options first', true); return; }
+  if (!(await ensureScryPermission(scry.url))) { showToast('Host permission for Scry was declined', true); return; }
+  if (!orgId) { showToast('Organization not detected yet — try again in a moment', true); return; }
+
+  const selected = allConversations.filter((c) => selectedConversations.has(c.uuid));
+  if (selected.length === 0) {
+    showToast('Select the conversation(s) to delete first (checkbox)', true);
+    return;
+  }
+
+  // 1) Fetch each selected conversation's body LIVE from Claude, into the gate's
+  //    { source_id, live_body } shape. A stub/failed fetch is left out of items
+  //    → Scry never clears it → it can't be deleted.
+  const progressModal = document.getElementById('progressModal');
+  const progressBar = document.getElementById('progressBar');
+  const progressText = document.getElementById('progressText');
+  const progressStats = document.getElementById('progressStats');
+  progressBar.style.width = '0%';
+  progressStats.textContent = '';
+  progressText.textContent = `Verifying ${selected.length} conversation(s) live against Scry…`;
+  progressModal.style.display = 'block';
+
+  let cancelled = false;
+  document.getElementById('cancelExport').onclick = () => {
+    cancelled = true; progressModal.style.display = 'none'; showToast('Delete cancelled', true);
+  };
+
+  const concurrency = (scry.concurrency && scry.concurrency > 0) ? scry.concurrency : 4;
+  const items = [];
+  const fetchFailed = [];
+  let done = 0;
+  await runPool(selected, concurrency, async (conv) => {
+    if (cancelled) return;
+    try {
+      const live = await fetchConversationBody(orgId, conv.uuid);
+      items.push({ source_id: conv.uuid, live_body: live });
+    } catch (e) {
+      fetchFailed.push(`${conv.name || conv.uuid}: ${e.message}`);
+    }
+    done++;
+    progressBar.style.width = `${Math.round((done / selected.length) * 100)}%`;
+    progressStats.textContent = `${done}/${selected.length} fetched`;
+  });
+  if (cancelled) return;
+
+  // 2) Ask Scry which are cleared for deletion.
+  let report;
+  try {
+    report = await verifyDeletableWithScry(scry, items);
+  } catch (e) {
+    progressModal.style.display = 'none';
+    console.error('verify-deletable failed', e);
+    showToast(`Delete gate failed: ${e.message}`, true);
+    return;
+  }
+  progressModal.style.display = 'none';
+
+  const { cleared, blocked } = partitionDeletableReport(report);
+  console.log('Delete gate summary:', report.summary,
+              '\ncleared:', cleared, '\nblocked:', blocked, '\nfetch failures:', fetchFailed);
+
+  if (cleared.length === 0) {
+    showToast(`0 cleared for deletion — ${blocked.length} blocked, ${fetchFailed.length} fetch-failed (see console)`, true);
+    return;
+  }
+
+  // 3) Explicit, spelled-out confirmation — this is the irreversible step.
+  const skipped = blocked.length + fetchFailed.length;
+  const msg =
+    `Permanently delete ${cleared.length} conversation(s) from Claude?\n\n` +
+    `Each is verified fully captured in Scry — its live body still matches the ` +
+    `stored archive message-for-message.\n\n` +
+    (skipped > 0
+      ? `${skipped} selected were NOT cleared (${blocked.length} blocked, ` +
+        `${fetchFailed.length} fetch-failed) and will be SKIPPED — see console.\n\n`
+      : '') +
+    `This CANNOT be undone at Claude. Scry keeps its copy.`;
+  if (!window.confirm(msg)) { showToast('Delete cancelled'); return; }
+
+  // 4) Delete the cleared ids from Claude, gently rate-limited. Verify each is
+  //    gone (re-fetch → 404) before counting it deleted.
+  const clearedSet = new Set(cleared);
+  const toDelete = selected.filter((c) => clearedSet.has(c.uuid));
+  progressText.textContent = `Deleting ${toDelete.length} from Claude…`;
+  progressBar.style.width = '0%';
+  progressStats.textContent = '';
+  progressModal.style.display = 'block';
+
+  let deleted = 0, failed = 0, ddone = 0;
+  const delFailures = [];
+  // Sequential + a short delay: deletion is irreversible and low-volume; there's
+  // no reason to hammer Claude, and one-at-a-time keeps the trail clear.
+  for (const conv of toDelete) {
+    if (cancelled) break;
+    try {
+      const r = await deleteClaudeConversation(orgId, conv.uuid);
+      if (!r.ok) throw new Error(`DELETE ${r.status}`);
+      deleted++;
+      selectedConversations.delete(conv.uuid);
+    } catch (e) {
+      failed++;
+      delFailures.push(`${conv.name || conv.uuid}: ${e.message}`);
+      console.error('Claude delete failed for', conv.uuid, e);
+    }
+    ddone++;
+    progressBar.style.width = `${Math.round((ddone / toDelete.length) * 100)}%`;
+    progressStats.textContent = `${deleted} deleted, ${failed} failed of ${toDelete.length}`;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  progressModal.style.display = 'none';
+  if (delFailures.length) console.warn('Claude delete failures:', delFailures);
+  showToast(
+    failed > 0
+      ? `Deleted ${deleted}/${toDelete.length} from Claude — ${failed} failed (see console)`
+      : `Deleted ${deleted} from Claude ✓ (Scry keeps the copy)`,
+    failed > 0,
+  );
+}
+
 // Sync a single conversation from the dashboard's per-row Sync button.
 async function syncOne(conversationId, conversationName) {
   const scry = await loadScrySettings();
@@ -994,5 +1124,9 @@ function setupEventListeners() {
   const reconcileBtn = document.getElementById('reconcileScryBtn');
   if (reconcileBtn) {
     reconcileBtn.addEventListener('click', () => reconcileAndSync());
+  }
+  const deleteFromClaudeBtn = document.getElementById('deleteFromClaudeBtn');
+  if (deleteFromClaudeBtn) {
+    deleteFromClaudeBtn.addEventListener('click', () => deleteSelectedFromClaude());
   }
 }
