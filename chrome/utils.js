@@ -2,19 +2,29 @@
 
 // Helper function to reconstruct the current branch from the message tree
 function getCurrentBranch(data) {
-  if (!data.chat_messages || !data.current_leaf_message_uuid) {
+  const messages = data.chat_messages;
+  if (!messages || messages.length === 0) {
     return [];
   }
-  
+
   // Create a map of UUID to message for quick lookup
   const messageMap = new Map();
-  data.chat_messages.forEach(msg => {
+  messages.forEach(msg => {
     messageMap.set(msg.uuid, msg);
   });
-  
+
+  // No usable leaf pointer (missing, or pointing outside the returned messages):
+  // fall back to all messages in array order so a conversation that HAS content
+  // but no current_leaf is still captured rather than dropped. Mirrors the
+  // server-side current_branch_messages fallback.
+  const leaf = data.current_leaf_message_uuid;
+  if (!leaf || !messageMap.has(leaf)) {
+    return messages.slice();
+  }
+
   // Trace back from the current leaf to the root
   const branch = [];
-  let currentUuid = data.current_leaf_message_uuid;
+  let currentUuid = leaf;
   
   while (currentUuid && messageMap.has(currentUuid)) {
     const message = messageMap.get(currentUuid);

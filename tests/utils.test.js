@@ -21,8 +21,21 @@ describe('getCurrentBranch', () => {
     expect(getCurrentBranch({ chat_messages: [], current_leaf_message_uuid: 'x' })).toEqual([]);
   });
 
-  it('returns empty array when leaf uuid is missing', () => {
-    expect(getCurrentBranch({ chat_messages: [{ uuid: 'a' }] })).toEqual([]);
+  it('falls back to all messages when there is no leaf pointer', () => {
+    // Some conversations have messages but no current_leaf_message_uuid. They
+    // must NOT be dropped (that lost 6 real conversations in prod) — capture all
+    // their messages in order.
+    const msgs = [
+      { uuid: 'a', parent_message_uuid: 'root', text: 'one' },
+      { uuid: 'b', parent_message_uuid: 'a', text: 'two' },
+    ];
+    expect(getCurrentBranch({ chat_messages: msgs }).map(m => m.uuid)).toEqual(['a', 'b']);
+  });
+
+  it('falls back to all messages when the leaf points outside the message set', () => {
+    const msgs = [{ uuid: 'a', text: 'one' }, { uuid: 'b', text: 'two' }];
+    expect(getCurrentBranch({ chat_messages: msgs, current_leaf_message_uuid: 'gone' })
+      .map(m => m.uuid)).toEqual(['a', 'b']);
   });
 
   it('walks from leaf back to root in chronological order', () => {
