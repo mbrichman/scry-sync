@@ -47,13 +47,38 @@ function blobToDataUrl(blob) {
   });
 }
 
+// True if a fetched body is a soft-empty STUB: a 200 with no chat_messages for a
+// conversation that actually had content. Claude's body endpoint occasionally
+// returns the conversation object with an empty chat_messages array (under
+// parallel load / tree-render flakiness on older conversations). A genuinely
+// empty new chat has no title AND created_at == updated_at (no message was ever
+// written); anything titled, or with updated_at != created_at, must have had at
+// least one message — so an empty chat_messages there is a stub, not real.
+// Mirrors Scry's _archive_is_empty_stub so both sides gate identically.
+function conversationBodyIsStub(data) {
+  if (!data || typeof data !== 'object') return false;
+  if (Array.isArray(data.chat_messages) && data.chat_messages.length > 0) return false;
+  const name = (data.name || '').trim();
+  const created = data.created_at;
+  const updated = data.updated_at;
+  return Boolean(name) || (created != null && updated != null && created !== updated);
+}
+
 // Fetch a conversation's full body from claude.ai (credentialed; works from an
-// extension page because host_permissions includes claude.ai).
+// extension page because host_permissions includes claude.ai). Retries a
+// soft-empty stub a few times, then THROWS rather than returning it — so the
+// caller never archives an empty shell and reconcile keeps it in to_resync.
 async function fetchConversationBody(orgId, conversationUuid) {
   const url = `https://claude.ai/api/organizations/${orgId}/chat_conversations/${conversationUuid}?tree=True&rendering_mode=messages&render_all_tools=true`;
-  const resp = await fetch(url, { credentials: 'include', headers: { 'Accept': 'application/json' } });
-  if (!resp.ok) throw new Error(`fetch conversation ${resp.status}`);
-  return resp.json();
+  let last = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt > 0) await new Promise((r) => setTimeout(r, 600 * attempt));
+    const resp = await fetch(url, { credentials: 'include', headers: { 'Accept': 'application/json' } });
+    if (!resp.ok) throw new Error(`fetch conversation ${resp.status}`);
+    last = await resp.json();
+    if (!conversationBodyIsStub(last)) return last;
+  }
+  throw new Error(`fetch conversation ${conversationUuid}: empty body (stub) after retries`);
 }
 
 // Fetch the image bytes for a conversation's current branch, keyed by file_uuid
@@ -146,4 +171,9 @@ async function syncOneConversation(orgId, conversationUuid, scry) {
     throw new Error((resp.body && resp.body.error) || 'ingest rejected');
   }
   return { status: resp.body.status, updatedAt: data.updated_at };
+}
+
+// In Node (vitest), expose the pure helpers for testing.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { conversationBodyIsStub };
 }
