@@ -899,6 +899,9 @@ async function deleteSelectedFromClaude() {
   }
   progressModal.style.display = 'none';
   if (delFailures.length) console.warn('Claude delete failures:', delFailures);
+  // Refresh the dashboard so the just-deleted conversations drop out of the list
+  // — they're gone from Claude now, so re-fetching no longer returns them.
+  if (deleted > 0) await loadConversations();
   showToast(
     failed > 0
       ? `Deleted ${deleted}/${toDelete.length} from Claude — ${failed} failed (see console)`
