@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Browse Claude Conversations</title>
+  <title>Scry Sync — Conversations</title>
   <style>
     :root {
       --bg-body: #f6f7f9;
@@ -789,7 +789,7 @@
             <input type="file" id="restoreFileBrowse" accept="application/json,.json" style="display: none;">
           </div>
         </div>
-        <h1>Browse Claude Conversations</h1>
+        <h1>Scry Sync</h1>
       </div>
 
       <div class="header-right">
@@ -813,8 +813,8 @@
           </button>
           <div class="filter-dropdown" id="filterDropdown">
             <div class="filter-option" data-value="all">All conversations</div>
-            <div class="filter-option" data-value="new">New / Updated</div>
-            <div class="filter-option" data-value="exported">Previously exported</div>
+            <div class="filter-option" data-value="new">Needs sync</div>
+            <div class="filter-option" data-value="synced">Previously synced</div>
             <div class="filter-divider"></div>
             <div class="filter-option" data-value="projects">Search projects</div>
           </div>
@@ -822,68 +822,17 @@
       </div>
 
       <div class="export-controls-wrapper">
-        <div class="export-settings">
-          <div class="export-row">
-            <div class="export-section chat-section">
-              <label>
-                Chat format:
-                <select id="exportFormat">
-                  <option value="json">JSON</option>
-                  <option value="markdown">Markdown</option>
-                  <option value="text">Plain Text</option>
-                </select>
-              </label>
-
-              <label title="Include the conversation messages in the exported file">
-                <input type="checkbox" id="includeChats" checked>
-                Chats
-              </label>
-
-              <label title="Include extended thinking blocks in the exported conversation">
-                <input type="checkbox" id="includeThinking">
-                Thinking
-              </label>
-
-              <label title="Add conversation metadata (name, date, model, etc.) at the top of exported files">
-                <input type="checkbox" id="includeMetadata">
-                Metadata
-              </label>
-            </div>
-
-            <div class="section-divider"></div>
-
-            <div class="export-section artifact-section">
-              <label>
-                Artifact format:
-                <select id="artifactFormat">
-                  <option value="original">Original</option>
-                  <option value="markdown">Markdown</option>
-                  <option value="text">Plain Text</option>
-                  <option value="json">JSON</option>
-                </select>
-              </label>
-
-              <label title="Include artifacts (code, documents, etc.) directly within the conversation text">
-                <input type="checkbox" id="includeArtifacts">
-                Inline
-              </label>
-
-              <label title="Extract artifacts as separate files in nested folders">
-                <input type="checkbox" id="extractArtifacts">
-                Nested
-              </label>
-
-              <label title="Flatten artifact structure (no subfolders, with conversation name prefix)">
-                <input type="checkbox" id="flattenArtifacts">
-                Flat
-              </label>
-            </div>
-          </div>
+        <div class="scry-sync-controls" style="display: inline-flex; align-items: center; gap: 6px;">
+          <button class="export-all-btn" id="syncAllScryBtn" disabled title="Push every conversation (with images) to Scry">
+            Sync all to Scry
+          </button>
+          <button class="export-all-btn" id="syncRecentScryBtn" disabled title="Push conversations updated in the last N days to Scry">
+            Sync last
+          </button>
+          <input type="number" id="syncRecentDays" value="7" min="1" max="3650"
+                 style="width: 56px; padding: 6px; text-align: right;" title="Number of days">
+          <span style="color: var(--text-secondary);">days</span>
         </div>
-
-        <button class="export-all-btn" id="exportAllBtn" disabled>
-          Export All
-        </button>
       </div>
     </div>
   </div>
@@ -996,8 +945,9 @@
   <!-- JSZip library for creating ZIP archives -->
   <!-- Official source: https://github.com/Stuk/jszip -->
   <!-- Website: https://stuk.github.io/jszip/ -->
-  <script src="jszip.min.js"></script>
   <script src="utils.js"></script>
+  <script src="scry_sync.js"></script>
+  <script src="scry_client.js"></script>
   <script src="browse.js"></script>
 </body>
 </html>

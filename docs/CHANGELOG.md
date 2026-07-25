@@ -1,5 +1,38 @@
 # Changelog
 
+## [2.0.1]
+
+- **Retry transient sync failures.** A single image-heavy conversation could fail with `TypeError: Failed to fetch` when Scry's Flask dev server dropped the large POST mid-flight. The sync loop now retries each ingest POST up to 2× with linear backoff (via a new tested `withRetry` in `scry_sync.js`), retrying on a thrown network error or a 5xx — but not on 4xx/auth. Failures that still exhaust retries continue to be caught per-conversation and picked up on the next run (they're never marked synced). 5 new unit tests.
+
+## [2.0.0] — Scry Sync
+
+- **The extension is now "Scry Sync," not "Claude Exporter."** Its sole purpose is pushing Claude.ai conversations (with images) into Scry, so all file-export functionality has been removed — UI *and* code.
+  - **Removed:** the format/artifact/zip controls, Export All / Export Selected, per-conversation file download, and the content-script export handlers. Deleted the now-unused export code from `utils.js` (`convertToMarkdown`, `convertToText`, the artifact extractors, `convertArtifactFormat`, `extractArtifactFiles`, `getFileExtension`, `isProgrammingLanguage`, `addImagesToFolder`, `downloadFile`) and their tests. `content.js` no longer injects JSZip/utils (just `content.js`).
+  - **Popup** → Sync this conversation to Scry, Open Sync Dashboard, Settings.
+  - **Browse page** → the Sync Dashboard: per-conversation Sync buttons, **Sync all** / **Sync last N days** (default 7), and a status column now driven by sync state (needs-sync / synced) instead of export state.
+  - **Options** → *Scry Sync* section (URL + token + Test Connection) is the primary setting; org ID, backup/restore, and display prefs remain.
+  - **New `scry_client.js`** holds the shared imperative sync (fetch body → fetch image bytes → POST) used by both the popup and the dashboard; pure transforms stay in `scry_sync.js` (unit-tested).
+  - Kept the image/branch/model/backup helpers in `utils.js`. Test suite: 53 passing (export tests removed; sync/image/model tests retained).
+
+## [1.11.0]
+
+- **Sync to Scry (Chrome).** Push Claude.ai conversations — including images — directly into a [Scry](https://github.com/mbrichman/scry) instance as first-class conversations, instead of only downloading files. This is the one path that can carry image *bytes* into Scry: only the extension has the authenticated claude.ai session to fetch them.
+  - **Options** gains a *Scry Sync* section: server URL + service token, with a Test Connection button. The token is stored in `chrome.storage.local`; the host permission for the configured origin is requested on save (via `optional_host_permissions`).
+  - **Browse page** gains *Sync all to Scry* and *Sync last N days* (default 7) controls. Sync is a streaming pump — one conversation fetched, image bytes base64'd, POSTed, then discarded — so memory stays flat regardless of library size (no 3000-conversation blowup).
+  - Incremental sync filters the conversation list by `updated_at` client-side and skips conversations already synced at their current version (tracked in `chrome.storage.local`), so re-runs are cheap and resumable.
+  - Idempotent on Scry's side (keyed on `source_type='claude'`, `source_id=uuid`); images land as base64 data-URL attachments Scry renders inline, and its pipeline (embeddings/segmentation/memory) runs unchanged.
+  - New tested module `chrome/scry_sync.js`: `buildIngestPayload` (prune to current branch + attach image data-URLs), `selectConversationsSince`, `filterUnsynced` — 9 unit tests. The Scry endpoint (`POST /api/conversations/ingest`) and importer changes live in the Scry repo, covered by their own pytest slices.
+  - **Firefox:** not ported (Chrome-only, matching the image feature).
+
+## [1.10.18]
+
+- **Image extraction (Chrome).** Uploaded/pasted images (`chat_messages[].files[]` with `file_kind === 'image'`) are now exported, not just their metadata. Each image's bytes are fetched same-origin (credentialed) from its `preview_url` (full-size variant; `thumbnail_url` fallback) and saved into an `images/` folder. Asset filenames are keyed on `file_uuid` so references and saved files always agree without shared dedup state.
+  - Applies to **all formats**: when a conversation contains images, a single-file export automatically becomes a `.zip` (conversation file + `images/`), mirroring how artifact extraction already forces a ZIP. No images → behavior unchanged (lone file).
+  - **Markdown** references each image inline as `![name](images/<uuid>.<ext>)`. **Text** notes an `[Image: <name>]` placeholder (plain text can't embed bytes). **JSON** keeps its raw `files[]` data (preview URLs already present) and gets the local `images/` folder alongside.
+  - `images/` is placed as a sibling of the conversation file in every layout: zip root (plain/nested), `Chats/images` (flat artifact export), `<conversation>/images` (nested per-conversation), and per-conversation in Export All / Export Selected.
+  - New shared helpers in `utils.js`: `getImageExtension`, `imageAssetName`, `imageAssetUrl`, `getMessageImageFiles`, `collectImageFiles`, `addImagesToFolder`. Failed image fetches are logged and skipped, never aborting the rest of the export. Six regression tests added.
+  - **Firefox port pending** — this shipped in `chrome/` only; `firefox/` still needs the same changes to restore Chrome/Firefox parity (per CLAUDE.md, Chrome is canonical).
+
 ## [1.10.17]
 
 - Import Backup now asks merge-vs-replace **before** opening the file picker (was after). Click Import Backup → modal asks "Merge with current data" or "Replace all current data" + "Choose File…" → file picker opens → import runs with the chosen mode. Lets you back out before navigating filesystem, and removes the awkward two-step confirmation. The modal no longer shows file contents (snapshot/export counts, creation date), since the file isn't selected yet — file validation still happens after selection.

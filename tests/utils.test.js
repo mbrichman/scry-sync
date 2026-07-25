@@ -3,259 +3,19 @@ import utils from '../chrome/utils.js';
 
 const {
   getCurrentBranch,
-  convertToMarkdown,
-  extractArtifactsFromMessage,
-  extractArtifactFiles,
-  getFileExtension,
-  isProgrammingLanguage,
   inferModel,
   formatModelName,
   getModelBadgeClass,
   DEFAULT_MODEL_TIMELINE,
+  getImageExtension,
+  imageAssetName,
+  imageAssetUrl,
+  collectImageFiles,
 } = utils;
 
 // Regression coverage for the bug fixed in v1.9.1: bash/web_search/repl
 // tool_use entries used to slip through as fake artifacts. Now gated on
 // `tool_use.name === 'artifacts'`.
-describe('extractArtifactsFromMessage — tool name filter', () => {
-  it('rejects a bash tool_use even with code_block display content', () => {
-    const message = {
-      content: [
-        {
-          type: 'tool_use',
-          name: 'bash',
-          display_content: {
-            type: 'code_block',
-            code: 'ls -la',
-            language: 'bash',
-            filename: 'cmd.sh',
-          },
-        },
-      ],
-    };
-    expect(extractArtifactsFromMessage(message)).toEqual([]);
-  });
-
-  it('rejects a web_search tool_use', () => {
-    const message = {
-      content: [
-        {
-          type: 'tool_use',
-          name: 'web_search',
-          display_content: {
-            type: 'code_block',
-            code: 'results...',
-            language: 'json',
-          },
-        },
-      ],
-    };
-    expect(extractArtifactsFromMessage(message)).toEqual([]);
-  });
-
-  it('extracts an artifacts tool_use with code_block format', () => {
-    const message = {
-      content: [
-        {
-          type: 'tool_use',
-          name: 'artifacts',
-          display_content: {
-            type: 'code_block',
-            code: 'def hello():\n    pass',
-            language: 'python',
-            filename: 'hello.py',
-          },
-        },
-      ],
-    };
-    const artifacts = extractArtifactsFromMessage(message);
-    expect(artifacts).toHaveLength(1);
-    expect(artifacts[0].title).toBe('hello');
-    expect(artifacts[0].language).toBe('python');
-    expect(artifacts[0].content).toBe('def hello():\n    pass');
-  });
-
-  it('extracts an artifacts tool_use with json_block format when filename is present', () => {
-    const message = {
-      content: [
-        {
-          type: 'tool_use',
-          name: 'artifacts',
-          display_content: {
-            type: 'json_block',
-            json_block: JSON.stringify({
-              filename: 'app.js',
-              language: 'javascript',
-              code: 'console.log("hi");',
-            }),
-          },
-        },
-      ],
-    };
-    const artifacts = extractArtifactsFromMessage(message);
-    expect(artifacts).toHaveLength(1);
-    expect(artifacts[0].title).toBe('app');
-  });
-
-  it('rejects a json_block artifacts entry that has no filename', () => {
-    const message = {
-      content: [
-        {
-          type: 'tool_use',
-          name: 'artifacts',
-          display_content: {
-            type: 'json_block',
-            json_block: JSON.stringify({
-              code: 'echo hi',
-            }),
-          },
-        },
-      ],
-    };
-    expect(extractArtifactsFromMessage(message)).toEqual([]);
-  });
-
-  // Regression: when `enabled_artifacts_attachments` is false in conversation
-  // settings, Claude uses the skills-runner `create_file` MCP tool instead of
-  // the legacy `artifacts` tool. display_content shape is identical
-  // (json_block with language / code / filename). The extractor must allowlist
-  // both tool names.
-  it('extracts a create_file tool_use (skills-runner replacement for artifacts)', () => {
-    const message = {
-      content: [
-        {
-          type: 'tool_use',
-          name: 'create_file',
-          input: {
-            path: '/mnt/user-data/outputs/hello.md',
-            file_text: '# Hello, world!\n',
-          },
-          display_content: {
-            type: 'json_block',
-            json_block: JSON.stringify({
-              language: 'markdown',
-              code: '# Hello, world!\n',
-              filename: '/mnt/user-data/outputs/hello.md',
-            }),
-          },
-        },
-      ],
-    };
-    const artifacts = extractArtifactsFromMessage(message);
-    expect(artifacts).toHaveLength(1);
-    expect(artifacts[0].title).toBe('hello');
-    expect(artifacts[0].language).toBe('markdown');
-    expect(artifacts[0].content).toBe('# Hello, world!');
-  });
-
-  it('still rejects other skills tools that share json_block display (e.g. view, list_directory)', () => {
-    const message = {
-      content: [
-        {
-          type: 'tool_use',
-          name: 'view',
-          display_content: {
-            type: 'json_block',
-            json_block: JSON.stringify({
-              language: 'text',
-              code: 'directory listing here',
-              filename: '/mnt/skills/public',
-            }),
-          },
-        },
-      ],
-    };
-    expect(extractArtifactsFromMessage(message)).toEqual([]);
-  });
-});
-
-describe('extractArtifactFiles — end-to-end', () => {
-  function makeConversationWithMessages(messages) {
-    const last = messages[messages.length - 1];
-    return {
-      current_leaf_message_uuid: last.uuid,
-      chat_messages: messages,
-    };
-  }
-
-  it('returns artifact files only from real artifact tool calls', () => {
-    const data = makeConversationWithMessages([
-      {
-        uuid: 'm1',
-        sender: 'human',
-        content: [{ type: 'text', text: 'make me something' }],
-        parent_message_uuid: '00000000-0000-0000-0000-000000000000',
-      },
-      {
-        uuid: 'm2',
-        sender: 'assistant',
-        content: [
-          {
-            type: 'tool_use',
-            name: 'artifacts',
-            display_content: {
-              type: 'code_block',
-              code: '<h1>hi</h1>',
-              language: 'html',
-              filename: 'page.html',
-            },
-          },
-          {
-            type: 'tool_use',
-            name: 'bash',
-            display_content: {
-              type: 'code_block',
-              code: 'ls',
-              language: 'bash',
-              filename: 'noise.sh',
-            },
-          },
-        ],
-        parent_message_uuid: 'm1',
-      },
-    ]);
-    const files = extractArtifactFiles(data);
-    expect(files).toHaveLength(1);
-    expect(files[0].filename).toMatch(/\.html$/);
-  });
-
-  it('deduplicates duplicate filenames with a counter suffix', () => {
-    const data = makeConversationWithMessages([
-      {
-        uuid: 'm1',
-        sender: 'assistant',
-        content: [
-          {
-            type: 'tool_use',
-            name: 'artifacts',
-            display_content: {
-              type: 'code_block',
-              code: 'a',
-              language: 'javascript',
-              filename: 'app.js',
-            },
-          },
-          {
-            type: 'tool_use',
-            name: 'artifacts',
-            display_content: {
-              type: 'code_block',
-              code: 'b',
-              language: 'javascript',
-              filename: 'app.js',
-            },
-          },
-        ],
-        parent_message_uuid: '00000000-0000-0000-0000-000000000000',
-      },
-    ]);
-    const files = extractArtifactFiles(data);
-    expect(files).toHaveLength(2);
-    const names = files.map(f => f.filename);
-    expect(new Set(names).size).toBe(2); // both unique
-  });
-});
-
 describe('getCurrentBranch', () => {
   it('returns empty array when there are no messages', () => {
     expect(getCurrentBranch({ chat_messages: [], current_leaf_message_uuid: 'x' })).toEqual([]);
@@ -294,33 +54,6 @@ describe('getCurrentBranch', () => {
   });
 });
 
-describe('getFileExtension', () => {
-  it('maps common programming languages correctly', () => {
-    expect(getFileExtension('javascript')).toBe('.js');
-    expect(getFileExtension('python')).toBe('.py');
-    expect(getFileExtension('bash')).toBe('.sh');
-  });
-
-  it('falls back to .txt for unknown languages', () => {
-    expect(getFileExtension('totally-not-a-language')).toBe('.txt');
-  });
-});
-
-describe('isProgrammingLanguage', () => {
-  it('recognizes common programming languages', () => {
-    expect(isProgrammingLanguage('javascript')).toBe(true);
-    expect(isProgrammingLanguage('python')).toBe(true);
-    expect(isProgrammingLanguage('rust')).toBe(true);
-  });
-
-  it('rejects markup/document formats', () => {
-    expect(isProgrammingLanguage('markdown')).toBe(false);
-  });
-});
-
-// Regression: claude-opus-4-20250514 used to render as "Claude Opus 4.20250514"
-// because the optional minor group `(\d+)` was eating the 8-digit date.
-// Fix in v1.9.1: constrained minor to `\d{1,2}`.
 describe('formatModelName — new format (claude-{type}-{major}[-{minor}][-{date}])', () => {
   it('renders major-only with date suffix correctly (regression)', () => {
     expect(formatModelName('claude-opus-4-20250514')).toBe('Claude Opus 4');
@@ -506,51 +239,71 @@ describe('getModelBadgeClass', () => {
   });
 });
 
-describe('convertToMarkdown — smoke test', () => {
-  it('renders both human and assistant message text', () => {
-    const data = {
-      name: 'Test Chat',
-      model: 'claude-sonnet-4-5-20250929',
-      created_at: '2026-04-01T12:00:00Z',
-      updated_at: '2026-04-01T12:00:00Z',
-      current_leaf_message_uuid: 'm2',
-      chat_messages: [
-        {
-          uuid: 'm1',
-          sender: 'human',
-          content: [{ type: 'text', text: 'Hello there' }],
-          parent_message_uuid: '00000000-0000-0000-0000-000000000000',
-        },
-        {
-          uuid: 'm2',
-          sender: 'assistant',
-          content: [{ type: 'text', text: 'General Kenobi' }],
-          parent_message_uuid: 'm1',
-        },
-      ],
-    };
-    const md = convertToMarkdown(data, false);
-    expect(md).toContain('Hello there');
-    expect(md).toContain('General Kenobi');
+describe('image file handling', () => {
+  const imageFile = {
+    file_kind: 'image',
+    file_uuid: 'fae994b8-5bd3-492a-9a2e-0245f5ec5e7a',
+    file_name: 'shot 1.png',
+    thumbnail_url: '/api/ORG/files/fae994b8/thumbnail',
+    preview_url: '/api/ORG/files/fae994b8/preview',
+  };
+
+  it('derives extension from file name, defaulting to .png', () => {
+    expect(getImageExtension('a.PNG')).toBe('.png');
+    expect(getImageExtension('a.jpeg')).toBe('.jpeg');
+    expect(getImageExtension('noext')).toBe('.png');
+    expect(getImageExtension(undefined)).toBe('.png');
   });
 
-  it('includes metadata block when includeMetadata is true', () => {
+  it('names the asset by uuid so renderer and zip entry always agree', () => {
+    expect(imageAssetName(imageFile)).toBe('fae994b8-5bd3-492a-9a2e-0245f5ec5e7a.png');
+  });
+
+  it('prefers the full-size preview url and makes it absolute', () => {
+    expect(imageAssetUrl(imageFile)).toBe('https://claude.ai/api/ORG/files/fae994b8/preview');
+    expect(imageAssetUrl({ thumbnail_url: '/api/x/thumbnail' }))
+      .toBe('https://claude.ai/api/x/thumbnail');
+    expect(imageAssetUrl({ preview_url: 'https://cdn.example/p.png' }))
+      .toBe('https://cdn.example/p.png');
+    expect(imageAssetUrl({})).toBe(null);
+  });
+
+  it('collects (deduped) images across the current branch', () => {
     const data = {
-      name: 'My Chat',
-      model: 'claude-opus-4-5-20251101',
-      created_at: '2026-04-01T12:00:00Z',
-      updated_at: '2026-04-01T12:00:00Z',
       current_leaf_message_uuid: 'm1',
       chat_messages: [
         {
           uuid: 'm1',
           sender: 'human',
-          content: [{ type: 'text', text: 'hi' }],
+          content: [{ type: 'text', text: 'look' }],
+          files: [imageFile, imageFile], // same file twice → one entry
           parent_message_uuid: '00000000-0000-0000-0000-000000000000',
         },
       ],
     };
-    const md = convertToMarkdown(data, true);
-    expect(md).toContain('My Chat');
+    const imgs = collectImageFiles(data);
+    expect(imgs).toHaveLength(1);
+    expect(imgs[0].name).toBe('fae994b8-5bd3-492a-9a2e-0245f5ec5e7a.png');
+    expect(imgs[0].url).toContain('/preview');
+    expect(imgs[0].fileName).toBe('shot 1.png');
+  });
+
+  it('ignores non-image files and entries without a usable url', () => {
+    const data = {
+      current_leaf_message_uuid: 'm1',
+      chat_messages: [
+        {
+          uuid: 'm1',
+          sender: 'human',
+          content: [{ type: 'text', text: 'x' }],
+          files: [
+            { file_kind: 'document', file_uuid: 'd1', file_name: 'a.pdf', preview_url: '/api/x/preview' },
+            { file_kind: 'image', file_uuid: 'i1', file_name: 'b.png' }, // no url
+          ],
+          parent_message_uuid: '00000000-0000-0000-0000-000000000000',
+        },
+      ],
+    };
+    expect(collectImageFiles(data)).toHaveLength(0);
   });
 });

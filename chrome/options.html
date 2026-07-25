@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Claude Exporter Settings</title>
+  <title>Scry Sync Settings</title>
   <style>
     :root {
       --bg-body: #ffffff;
@@ -215,7 +215,7 @@
   </style>
 </head>
 <body>
-  <h1>Claude Conversation Exporter Settings</h1>
+  <h1>Scry Sync Settings</h1>
   
   <div class="instructions">
     <h3>How to find your Organization ID:</h3>
@@ -236,6 +236,22 @@
     </div>
     <div id="status" class="status"></div>
     <div id="testStatus" class="status"></div>
+  </div>
+
+  <div class="section">
+    <h3>Scry Sync</h3>
+    <p>Push your Claude.ai conversations (with images) into <a href="https://github.com/mbrichman/scry" target="_blank" rel="noopener">Scry</a>. Set your Scry server URL and service token, then use the Sync controls on the Browse page.</p>
+    <label for="scryUrl">Scry URL:</label>
+    <input type="text" id="scryUrl" placeholder="http://localhost:5001">
+    <div class="example">Base URL of your Scry server, e.g. http://localhost:5001 or http://your-host.tailnet:5001</div>
+    <label for="scryToken" style="margin-top: 10px; display: block;">Service Token:</label>
+    <input type="password" id="scryToken" placeholder="SCRY_SERVICE_TOKEN">
+    <div class="example">Must match <code>SCRY_SERVICE_TOKEN</code> in your Scry .env (min 16 chars).</div>
+    <div class="button-row">
+      <button id="saveScryBtn">Save Scry Settings</button>
+      <button id="testScryBtn">Test Connection</button>
+    </div>
+    <div id="scryStatus" class="status"></div>
   </div>
 
   <div class="section">

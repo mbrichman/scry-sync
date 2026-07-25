@@ -53,11 +53,12 @@ let dateFormat = 'mdy'; // 'mdy' or 'dmy'
 let timeFormat = '12h'; // '12h' or '24h'
 let modelDisplay = 'original'; // 'original' (first-seen) or 'current'
 
-// Export timestamp storage helpers
+// Sync-state storage helper. Backed by scrySyncedMap { uuid -> last-synced
+// updated_at }, so the table's status reflects what's been pushed to Scry.
 async function loadExportTimestamps() {
   return new Promise((resolve) => {
-    chrome.storage.local.get(['exportTimestamps'], (result) => {
-      exportTimestamps = result.exportTimestamps || {};
+    chrome.storage.local.get(['scrySyncedMap'], (result) => {
+      exportTimestamps = result.scrySyncedMap || {};
       resolve();
     });
   });
@@ -320,7 +321,7 @@ function applyFiltersAndSort() {
     let matchesStatus = true;
     if (statusFilter === 'new') {
       matchesStatus = isNewOrUpdated(conv);
-    } else if (statusFilter === 'exported') {
+    } else if (statusFilter === 'synced') {
       matchesStatus = !isNewOrUpdated(conv);
     }
 
@@ -464,7 +465,7 @@ function displayConversations() {
       <tr data-id="${escapeHtml(conv.uuid)}">
         <td>
           <div class="conversation-name">
-            ${newUpdated ? '<span class="new-dot" title="New or updated since last export"></span>' : ''}
+            ${newUpdated ? '<span class="new-dot" title="Needs sync — new or changed since last sync to Scry"></span>' : ''}
             <a href="https://claude.ai/chat/${escapeHtml(conv.uuid)}" target="_blank" title="${escapeHtml(conv.name)}">
               ${escapeHtml(conv.name)}
             </a>
@@ -481,8 +482,8 @@ function displayConversations() {
         </td>
         <td>
           <div class="actions">
-            <button class="btn-small btn-export" data-id="${escapeHtml(conv.uuid)}" data-name="${escapeHtml(conv.name)}">
-              Export
+            <button class="btn-small btn-sync" data-id="${escapeHtml(conv.uuid)}" data-name="${escapeHtml(conv.name)}">
+              Sync
             </button>
           </div>
         </td>
@@ -502,13 +503,13 @@ function displayConversations() {
   // before concatenation. The HTML structure itself is static/trusted template code.
   tableContent.innerHTML = html;
   
-  // Add export button listeners
-  document.querySelectorAll('.btn-export').forEach(btn => {
+  // Add per-row Sync button listeners
+  document.querySelectorAll('.btn-sync').forEach(btn => {
     btn.addEventListener('click', (e) => {
-      exportConversation(e.target.dataset.id, e.target.dataset.name);
+      syncOne(e.target.dataset.id, e.target.dataset.name);
     });
   });
-  
+
   // Add checkbox listeners (use 'click' instead of 'change' to capture shift key)
   document.querySelectorAll('.conversation-checkbox').forEach(checkbox => {
     checkbox.addEventListener('click', handleCheckboxChange);
@@ -527,11 +528,11 @@ function displayConversations() {
     });
   });
 
-  // Update export button text
-  updateExportButtonText();
-
-  // Enable export all button
-  document.getElementById('exportAllBtn').disabled = false;
+  // Enable Scry sync buttons
+  const syncAll = document.getElementById('syncAllScryBtn');
+  const syncRecent = document.getElementById('syncRecentScryBtn');
+  if (syncAll) syncAll.disabled = false;
+  if (syncRecent) syncRecent.disabled = false;
 }
 
 // Handle individual checkbox change
@@ -573,7 +574,6 @@ function handleCheckboxChange(e) {
   // Update last checked index
   lastCheckedIndex = currentIndex;
 
-  updateExportButtonText();
   updateSelectAllCheckbox();
 }
 
@@ -598,7 +598,6 @@ function handleSelectAll(e) {
   // Reset last checked index when using select all
   lastCheckedIndex = null;
 
-  updateExportButtonText();
 }
 
 // Update select all checkbox state
@@ -611,18 +610,6 @@ function updateSelectAllCheckbox() {
 }
 
 // Update export button text based on selection
-function updateExportButtonText() {
-  const exportBtn = document.getElementById('exportAllBtn');
-  if (!exportBtn) return;
-
-  if (selectedConversations.size > 0) {
-    exportBtn.textContent = `Export Selected (${selectedConversations.size})`;
-  } else {
-    exportBtn.textContent = 'Export All';
-  }
-}
-
-// Update statistics
 function updateStats() {
   const stats = document.getElementById('stats');
   const newCount = allConversations.filter(c => isNewOrUpdated(c)).length;
@@ -638,432 +625,10 @@ function autoSelectNewUpdated() {
     }
   });
   displayConversations();
-  updateExportButtonText();
 }
 
 // Export single conversation
-async function exportConversation(conversationId, conversationName) {
-  const format = document.getElementById('exportFormat').value;
-  const includeChats = document.getElementById('includeChats').checked;
-  const includeThinking = document.getElementById('includeThinking').checked;
-  const includeMetadata = document.getElementById('includeMetadata').checked;
-  const includeArtifacts = document.getElementById('includeArtifacts').checked;
-  const extractArtifacts = document.getElementById('extractArtifacts').checked;
-  const artifactFormat = document.getElementById('artifactFormat').value;
-  const flattenArtifacts = document.getElementById('flattenArtifacts').checked;
-
-  // Tracked at function scope so the unified post-save toast can mention it
-  let artifactCount = 0;
-
-  try {
-    showToast(`Exporting ${conversationName}...`);
-
-    const response = await fetch(
-      `https://claude.ai/api/organizations/${orgId}/chat_conversations/${conversationId}?tree=True&rendering_mode=messages&render_all_tools=true`,
-      {
-        credentials: 'include',
-        headers: {
-          'Accept': 'application/json',
-        }
-      }
-    );
-
-    if (!response.ok) {
-      throw new Error(`Failed to fetch conversation: ${response.status}`);
-    }
-
-    const data = await response.json();
-
-    // Infer model if null
-    data.model = inferModel(data);
-
-    // Check if we need to extract artifacts to separate files
-    if (extractArtifacts || flattenArtifacts) {
-      const artifactFiles = extractArtifactFiles(data, artifactFormat);
-
-      if (artifactFiles.length > 0) {
-        artifactCount = artifactFiles.length;
-        // Create a ZIP with artifacts (and optionally conversation)
-        const zip = new JSZip();
-
-        // Add conversation file only if includeChats is true
-        if (includeChats !== false) {
-          let conversationContent, conversationFilename;
-          switch (format) {
-            case 'markdown':
-              conversationContent = convertToMarkdown(data, includeMetadata, conversationId, includeArtifacts, includeThinking);
-              conversationFilename = `${conversationName || conversationId}.md`;
-              break;
-            case 'text':
-              conversationContent = convertToText(data, includeMetadata, includeArtifacts, includeThinking);
-              conversationFilename = `${conversationName || conversationId}.txt`;
-              break;
-            default:
-              conversationContent = JSON.stringify(data, null, 2);
-              conversationFilename = `${conversationName || conversationId}.json`;
-          }
-
-          // Flat export: add to Chats folder
-          if (flattenArtifacts && !extractArtifacts) {
-            const chatsFolder = zip.folder('Chats');
-            chatsFolder.file(conversationFilename, conversationContent);
-          } else {
-            // Nested or no artifact extraction: add to root
-            zip.file(conversationFilename, conversationContent);
-          }
-        }
-
-        // Add artifact files
-        // Nested: create artifacts subfolder
-        if (extractArtifacts) {
-          const artifactsFolder = includeChats !== false ? zip.folder('artifacts') : zip;
-          for (const artifact of artifactFiles) {
-            artifactsFolder.file(artifact.filename, artifact.content);
-          }
-        }
-
-        // Flat: add artifacts with conversation name prefix to Artifacts folder
-        if (flattenArtifacts && !extractArtifacts) {
-          const artifactsFolder = zip.folder('Artifacts');
-          for (const artifact of artifactFiles) {
-            const filename = `${conversationName}_${artifact.filename}`;
-            artifactsFolder.file(filename, artifact.content);
-          }
-        }
-
-        // Generate and download ZIP
-        const blob = await zip.generateAsync({ type: 'blob' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `${conversationName || conversationId}.zip`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-
-        // Toast handled below after timestamp save
-      } else {
-        // No artifacts found, export normally
-        let content, filename, type;
-        switch (format) {
-          case 'markdown':
-            content = convertToMarkdown(data, includeMetadata, conversationId, includeArtifacts, includeThinking);
-            filename = `${conversationName || conversationId}.md`;
-            type = 'text/markdown';
-            break;
-          case 'text':
-            content = convertToText(data, includeMetadata, includeArtifacts, includeThinking);
-            filename = `${conversationName || conversationId}.txt`;
-            type = 'text/plain';
-            break;
-          default:
-            content = JSON.stringify(data, null, 2);
-            filename = `${conversationName || conversationId}.json`;
-            type = 'application/json';
-        }
-        downloadFile(content, filename, type);
-      }
-    } else {
-      // Normal export without artifact extraction
-      if (includeChats === false) {
-        // If chats are disabled and we're not extracting artifacts, there's nothing to export
-        showToast('Nothing to export. Enable "Chats" or "Artifacts nested".', true);
-        return;
-      } else {
-        let content, filename, type;
-        switch (format) {
-          case 'markdown':
-            content = convertToMarkdown(data, includeMetadata, conversationId, includeArtifacts, includeThinking);
-            filename = `${conversationName || conversationId}.md`;
-            type = 'text/markdown';
-            break;
-          case 'text':
-            content = convertToText(data, includeMetadata, includeArtifacts, includeThinking);
-            filename = `${conversationName || conversationId}.txt`;
-            type = 'text/plain';
-            break;
-          default:
-            content = JSON.stringify(data, null, 2);
-            filename = `${conversationName || conversationId}.json`;
-            type = 'application/json';
-        }
-        downloadFile(content, filename, type);
-      }
-    }
-
-    // Record export timestamp and refresh display
-    await saveExportTimestamp(conversationId);
-    showToast(artifactCount > 0
-      ? `Exported: ${conversationName} with ${artifactCount} artifact(s)`
-      : `Exported: ${conversationName}`);
-    displayConversations();
-    updateStats();
-
-  } catch (error) {
-    console.error('Export error:', error);
-    showToast(`Failed to export: ${error.message}`, true);
-  }
-}
-
-// Export all filtered conversations
-async function exportAllFiltered() {
-  const format = document.getElementById('exportFormat').value;
-  const includeChats = document.getElementById('includeChats').checked;
-  const includeThinking = document.getElementById('includeThinking').checked;
-  const includeMetadata = document.getElementById('includeMetadata').checked;
-  const includeArtifacts = document.getElementById('includeArtifacts').checked;
-  const extractArtifacts = document.getElementById('extractArtifacts').checked;
-  const artifactFormat = document.getElementById('artifactFormat').value;
-  const flattenArtifacts = document.getElementById('flattenArtifacts').checked;
-
-  const button = document.getElementById('exportAllBtn');
-  button.disabled = true;
-  const originalButtonText = button.textContent;
-  button.textContent = 'Preparing...';
-
-  // Determine which conversations to export
-  let conversationsToExport;
-  if (selectedConversations.size > 0) {
-    // Export ALL selected conversations, even ones currently hidden by the
-    // filter — the checkbox is the user's explicit choice, the filter is just
-    // a view. The "Export Selected (N)" button text already reflects the
-    // full selection count, so users aren't surprised.
-    conversationsToExport = allConversations.filter(conv => selectedConversations.has(conv.uuid));
-  } else {
-    // No explicit selection: export everything currently visible.
-    conversationsToExport = filteredConversations;
-  }
-
-  // Single conversation: delegate to exportConversation so we skip the ZIP
-  // when the output is a single file (artifact-extraction paths still ZIP there)
-  if (conversationsToExport.length === 1) {
-    const conv = conversationsToExport[0];
-    const progressModal = document.getElementById('progressModal');
-    const progressBar = document.getElementById('progressBar');
-    const progressText = document.getElementById('progressText');
-    const progressStats = document.getElementById('progressStats');
-    progressModal.style.display = 'block';
-    progressText.textContent = `Exporting ${conv.name}...`;
-    progressBar.style.width = '0%';
-    progressStats.textContent = '';
-    try {
-      await exportConversation(conv.uuid, conv.name);
-      progressBar.style.width = '100%';
-    } finally {
-      progressModal.style.display = 'none';
-      button.disabled = false;
-      button.textContent = originalButtonText;
-    }
-    return;
-  }
-
-  // Show progress modal
-  const progressModal = document.getElementById('progressModal');
-  const progressBar = document.getElementById('progressBar');
-  const progressText = document.getElementById('progressText');
-  const progressStats = document.getElementById('progressStats');
-  progressBar.style.width = '0%';
-  progressStats.textContent = '';
-  progressText.textContent = 'Preparing export...';
-  progressModal.style.display = 'block';
-
-  let cancelExport = false;
-  const cancelButton = document.getElementById('cancelExport');
-  cancelButton.onclick = () => {
-    cancelExport = true;
-    progressModal.style.display = 'none';
-    showToast('Export cancelled', true);
-  };
-
-  try {
-    // Create a new ZIP file
-    const zip = new JSZip();
-    const total = conversationsToExport.length;
-    let completed = 0;
-    let failed = 0;
-    const failedConversations = [];
-
-    progressText.textContent = `Exporting ${total} conversations...`;
-
-    // Process conversations in batches to avoid overwhelming the API
-    const batchSize = 3; // Process 3 at a time
-    for (let i = 0; i < total; i += batchSize) {
-      if (cancelExport) break;
-
-      const batch = conversationsToExport.slice(i, Math.min(i + batchSize, total));
-      const promises = batch.map(async (conv) => {
-        try {
-          const response = await fetch(
-            `https://claude.ai/api/organizations/${orgId}/chat_conversations/${conv.uuid}?tree=True&rendering_mode=messages&render_all_tools=true`,
-            {
-              credentials: 'include',
-              headers: {
-                'Accept': 'application/json',
-              }
-            }
-          );
-          
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-          }
-          
-          const data = await response.json();
-
-          // Infer model if null
-          data.model = inferModel(data);
-
-          // Extract artifacts first to check if this conversation should be included
-          const artifactFiles = extractArtifactFiles(data, artifactFormat);
-
-          // If chats are disabled and no artifacts, skip this conversation
-          if (includeChats === false && artifactFiles.length === 0) {
-            console.log(`Skipping ${conv.name} - no artifacts found (chats disabled)`);
-            completed++; // Count as completed even though skipped
-            return; // Skip this conversation in the promise
-          }
-
-          // Generate filename and content based on format
-          let content, filename;
-          const safeName = conv.name.replace(/[<>:"/\\|?*]/g, '_'); // Remove invalid filename characters
-
-          switch (format) {
-            case 'markdown':
-              content = convertToMarkdown(data, includeMetadata, conv.uuid, includeArtifacts, includeThinking);
-              filename = `${safeName}.md`;
-              break;
-            case 'text':
-              content = convertToText(data, includeMetadata, includeArtifacts, includeThinking);
-              filename = `${safeName}.txt`;
-              break;
-            default: // json
-              content = JSON.stringify(data, null, 2);
-              filename = `${safeName}.json`;
-          }
-
-          // Flat export: use Chats and Artifacts top-level folders
-          if (flattenArtifacts && !extractArtifacts) {
-            // Add chat file to Chats folder if chats are enabled
-            if (includeChats !== false) {
-              const chatsFolder = zip.folder('Chats');
-              chatsFolder.file(filename, content);
-            }
-
-            // Add artifacts to Artifacts folder with conversation name prefix
-            if (artifactFiles.length > 0) {
-              const artifactsFolder = zip.folder('Artifacts');
-              for (const artifact of artifactFiles) {
-                const artifactFilename = `${safeName}_${artifact.filename}`;
-                artifactsFolder.file(artifactFilename, artifact.content);
-              }
-            }
-          }
-          // Nested export: create per-conversation folders with artifacts subfolder
-          else if (extractArtifacts) {
-            const convFolder = zip.folder(safeName);
-
-            // Add conversation file only if includeChats is true
-            if (includeChats !== false) {
-              convFolder.file(filename, content);
-            }
-
-            // Add artifact files in nested artifacts subfolder
-            if (artifactFiles.length > 0) {
-              const artifactsFolder = includeChats !== false ? convFolder.folder('artifacts') : convFolder;
-              for (const artifact of artifactFiles) {
-                artifactsFolder.file(artifact.filename, artifact.content);
-              }
-            }
-          } else {
-            // No artifact extraction - add file to ZIP root only if chats are enabled
-            if (includeChats !== false) {
-              zip.file(filename, content);
-            }
-          }
-
-          completed++;
-          
-        } catch (error) {
-          console.error(`Failed to export ${conv.name}:`, error);
-          failed++;
-          failedConversations.push(conv.name);
-        }
-      });
-      
-      // Wait for batch to complete
-      await Promise.all(promises);
-      
-      // Update progress
-      const progress = Math.round((completed + failed) / total * 100);
-      progressBar.style.width = `${progress}%`;
-      progressStats.textContent = `${completed} succeeded, ${failed} failed out of ${total}`;
-      
-      // Small delay between batches
-      if (i + batchSize < total && !cancelExport) {
-        await new Promise(resolve => setTimeout(resolve, 200));
-      }
-    }
-    
-    if (cancelExport) return;
-
-    // Generate and download the ZIP file
-    progressText.textContent = 'Creating ZIP file...';
-    const blob = await zip.generateAsync({
-      type: 'blob',
-      compression: 'DEFLATE',
-      compressionOptions: {
-        level: 6 // Medium compression
-      }
-    }, (metadata) => {
-      // Update progress during ZIP creation
-      const zipProgress = Math.round(metadata.percent);
-      progressBar.style.width = `${zipProgress}%`;
-    });
-    
-    // Download the ZIP file
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    // Format: claude-artifacts-20251031-143045.zip or claude-exports-20251031-143045.zip
-    const datetime = getLocalDateTimeString();
-    // Use 'claude-artifacts' when ONLY flat artifacts are exported
-    const prefix = (flattenArtifacts && !extractArtifacts && includeChats === false) ? 'claude-artifacts' : 'claude-exports';
-    a.download = `${prefix}-${datetime}.zip`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    
-    progressModal.style.display = 'none';
-
-    // Record export timestamps for successfully exported conversations
-    const exportedIds = conversationsToExport
-      .filter(conv => !failedConversations.includes(conv.name))
-      .map(conv => conv.uuid);
-    await saveExportTimestamps(exportedIds);
-    displayConversations();
-    updateStats();
-
-    if (failed > 0) {
-      showToast(`Exported ${completed} of ${total} conversations (${failed} failed).`);
-    } else {
-      showToast(`Successfully exported all ${completed} conversations!`);
-    }
-    
-  } catch (error) {
-    console.error('Export error:', error);
-    progressModal.style.display = 'none';
-    showToast(`Export failed: ${error.message}`, true);
-  } finally {
-    button.disabled = false;
-    button.textContent = originalButtonText;
-  }
-}
-
-// Conversion functions are now imported from utils.js
-// Functions available: getCurrentBranch, convertToMarkdown, convertToText, downloadFile
-
-// Show error message
+// Trigger a browser download for an already-built Blob (e.g. a zip).
 function showError(message) {
   const tableContent = document.getElementById('tableContent');
   const errorDiv = document.createElement('div');
@@ -1074,6 +639,107 @@ function showError(message) {
 }
 
 // Show toast notification
+// ===== Scry sync =====
+
+// Re-read sync state and repaint the table so status badges update after a sync.
+async function refreshSyncStatus() {
+  await loadExportTimestamps();
+  applyFiltersAndSort();
+  displayConversations();
+  updateStats();
+}
+
+// Bulk sync. mode is 'all' or { days: N }.
+async function syncToScry(mode) {
+  const scry = await loadScrySettings();
+  if (!scry.url) { showToast('Set your Scry URL in Options first', true); return; }
+  if (!(await ensureScryPermission(scry.url))) { showToast('Host permission for Scry was declined', true); return; }
+  if (!orgId) { showToast('Organization not detected yet — try again in a moment', true); return; }
+
+  // Pick candidates: recent window (client-side) then drop already-synced versions.
+  let candidates = allConversations.slice();
+  if (mode !== 'all') {
+    candidates = selectConversationsSince(candidates, Date.now() - mode.days * 86400000);
+  }
+  const syncedMap = await getScrySyncedMap();
+  candidates = filterUnsynced(candidates, syncedMap);
+
+  const total = candidates.length;
+  if (total === 0) { showToast('Nothing to sync — Scry is up to date'); return; }
+
+  // Reuse the progress modal.
+  const progressModal = document.getElementById('progressModal');
+  const progressBar = document.getElementById('progressBar');
+  const progressText = document.getElementById('progressText');
+  const progressStats = document.getElementById('progressStats');
+  progressBar.style.width = '0%';
+  progressStats.textContent = '';
+  progressText.textContent = `Syncing ${total} conversation${total === 1 ? '' : 's'} to Scry…`;
+  progressModal.style.display = 'block';
+
+  let cancelled = false;
+  document.getElementById('cancelExport').onclick = () => {
+    cancelled = true;
+    progressModal.style.display = 'none';
+    showToast('Sync cancelled', true);
+  };
+
+  let synced = 0, failed = 0;
+  const failures = [];
+
+  for (let i = 0; i < total; i++) {
+    if (cancelled) break;
+    const conv = candidates[i];
+    try {
+      const result = await syncOneConversation(orgId, conv.uuid, scry);
+      synced++;
+      syncedMap[conv.uuid] = result.updatedAt || conv.updated_at;
+    } catch (e) {
+      failed++;
+      failures.push(`${conv.name || conv.uuid}: ${e.message}`);
+      console.error('Scry sync failed for', conv.uuid, e);
+    }
+
+    const done = i + 1;
+    progressBar.style.width = `${Math.round((done / total) * 100)}%`;
+    progressStats.textContent = `${synced} synced, ${failed} failed of ${total}`;
+    await setScrySyncedMap(syncedMap); // persist incrementally so a crash resumes
+    await new Promise((r) => setTimeout(r, 150)); // gentle pacing on claude.ai + Scry
+  }
+
+  progressModal.style.display = 'none';
+  await refreshSyncStatus();
+  if (cancelled) return;
+
+  if (failed > 0) {
+    console.warn('Scry sync failures:', failures);
+    showToast(`Synced ${synced}/${total} to Scry — ${failed} failed (see console)`, true);
+  } else {
+    showToast(`Synced ${synced} conversation${synced === 1 ? '' : 's'} to Scry ✓`);
+  }
+}
+
+// Sync a single conversation from the dashboard's per-row Sync button.
+async function syncOne(conversationId, conversationName) {
+  const scry = await loadScrySettings();
+  if (!scry.url) { showToast('Set your Scry URL in Options first', true); return; }
+  if (!(await ensureScryPermission(scry.url))) { showToast('Host permission for Scry was declined', true); return; }
+  if (!orgId) { showToast('Organization not detected yet', true); return; }
+
+  showToast(`Syncing ${conversationName || conversationId}…`);
+  try {
+    const result = await syncOneConversation(orgId, conversationId, scry);
+    const syncedMap = await getScrySyncedMap();
+    syncedMap[conversationId] = result.updatedAt;
+    await setScrySyncedMap(syncedMap);
+    await refreshSyncStatus();
+    showToast(`Synced to Scry (${result.status}) ✓`);
+  } catch (e) {
+    console.error('Scry sync failed for', conversationId, e);
+    showToast(`Sync failed: ${e.message}`, true);
+  }
+}
+
 function showToast(message, isError = false) {
   const toast = document.getElementById('toast');
   toast.textContent = message;
@@ -1087,31 +753,6 @@ function showToast(message, isError = false) {
 
 // Setup event listeners
 function setupEventListeners() {
-  // Handle checkbox dependencies
-  const includeChatsCheckbox = document.getElementById('includeChats');
-  const includeThinkingCheckbox = document.getElementById('includeThinking');
-  const includeMetadataCheckbox = document.getElementById('includeMetadata');
-  const includeArtifactsCheckbox = document.getElementById('includeArtifacts');
-
-  function updateCheckboxStates() {
-    const chatsEnabled = includeChatsCheckbox.checked;
-
-    // Disable thinking, metadata and inline artifacts when chats is unchecked
-    includeThinkingCheckbox.disabled = !chatsEnabled;
-    includeMetadataCheckbox.disabled = !chatsEnabled;
-    includeArtifactsCheckbox.disabled = !chatsEnabled;
-
-    // Optionally uncheck them when disabled
-    if (!chatsEnabled) {
-      includeThinkingCheckbox.checked = false;
-      includeMetadataCheckbox.checked = false;
-      includeArtifactsCheckbox.checked = false;
-    }
-  }
-
-  includeChatsCheckbox.addEventListener('change', updateCheckboxStates);
-  updateCheckboxStates(); // Initialize on load
-
   // Settings dropdown
   const settingsBtn = document.getElementById('settingsBtn');
   const settingsDropdown = document.getElementById('settingsDropdown');
@@ -1279,5 +920,17 @@ function setupEventListeners() {
   document.querySelector('.filter-option[data-value="all"]').classList.add('selected');
 
   // Export all button
-  document.getElementById('exportAllBtn').addEventListener('click', exportAllFiltered);
+
+  // Scry sync buttons
+  const syncAllBtn = document.getElementById('syncAllScryBtn');
+  if (syncAllBtn) {
+    syncAllBtn.addEventListener('click', () => syncToScry('all'));
+  }
+  const syncRecentBtn = document.getElementById('syncRecentScryBtn');
+  if (syncRecentBtn) {
+    syncRecentBtn.addEventListener('click', () => {
+      const days = parseInt(document.getElementById('syncRecentDays').value, 10);
+      syncToScry({ days: Number.isFinite(days) && days > 0 ? days : 7 });
+    });
+  }
 }

@@ -141,7 +141,7 @@ document.querySelectorAll('input[name="modelDisplay"]').forEach((radio) => {
 document.getElementById('emailDevLink').addEventListener('click', (e) => {
   e.preventDefault();
   const version = chrome.runtime.getManifest().version;
-  const subject = encodeURIComponent(`Claude Exporter Bug Report — v${version}`);
+  const subject = encodeURIComponent(`Scry Sync Bug Report — v${version}`);
   const body = encodeURIComponent('Describe the issue here. If this is a bug, please attach a diagnostics file generated from the Options page.\n\n');
   window.location.href = `mailto:agoramachina@gmail.com?subject=${subject}&body=${body}`;
 });
@@ -164,3 +164,86 @@ function hideStatus(elementId) {
   const statusEl = document.getElementById(elementId);
   statusEl.className = 'status';
 }
+
+// ===== Scry Sync settings =====
+
+// Derive an "origin/*" match pattern for the optional host permission request.
+function scryOriginPattern(url) {
+  try {
+    return new URL(url).origin + '/*';
+  } catch {
+    return null;
+  }
+}
+
+// Load saved Scry settings into the form.
+document.addEventListener('DOMContentLoaded', () => {
+  chrome.storage.local.get(['scry'], (result) => {
+    const scry = result.scry || {};
+    if (scry.url) document.getElementById('scryUrl').value = scry.url;
+    if (scry.token) document.getElementById('scryToken').value = scry.token;
+  });
+});
+
+document.getElementById('saveScryBtn').addEventListener('click', () => {
+  const url = document.getElementById('scryUrl').value.trim().replace(/\/+$/, '');
+  const token = document.getElementById('scryToken').value.trim();
+
+  if (!url || !scryOriginPattern(url)) {
+    showStatus('scryStatus', 'Enter a valid Scry URL (e.g. http://localhost:5001)', 'error');
+    return;
+  }
+  if (token && token.length < 16) {
+    showStatus('scryStatus', 'Service token must be at least 16 characters', 'error');
+    return;
+  }
+
+  // Pre-request the host permission so the later sync fetch isn't blocked.
+  chrome.permissions.request({ origins: [scryOriginPattern(url)] }, (granted) => {
+    chrome.storage.local.set({ scry: { url, token } }, () => {
+      showStatus('scryStatus',
+        granted ? 'Scry settings saved.' : 'Saved, but host permission was declined — sync will fail until granted.',
+        granted ? 'success' : 'error');
+      setTimeout(() => hideStatus('scryStatus'), 4000);
+    });
+  });
+});
+
+document.getElementById('testScryBtn').addEventListener('click', async () => {
+  const url = document.getElementById('scryUrl').value.trim().replace(/\/+$/, '');
+  const token = document.getElementById('scryToken').value.trim();
+  const pattern = scryOriginPattern(url);
+  if (!pattern) {
+    showStatus('scryStatus', 'Enter a valid Scry URL first', 'error');
+    return;
+  }
+
+  showStatus('scryStatus', 'Testing…', 'info');
+  const granted = await new Promise((resolve) =>
+    chrome.permissions.request({ origins: [pattern] }, resolve));
+  if (!granted) {
+    showStatus('scryStatus', 'Host permission declined — cannot reach Scry', 'error');
+    return;
+  }
+
+  try {
+    // A POST with a valid token but empty body returns 200 {success:false,...}
+    // from the ingest endpoint — enough to confirm URL + token are accepted.
+    const resp = await fetch(`${url}/api/conversations/ingest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: '{}',
+    });
+    if (resp.status === 200) {
+      showStatus('scryStatus', 'Connected — Scry URL and token accepted ✓', 'success');
+    } else if (resp.status === 401) {
+      showStatus('scryStatus', 'Reached Scry, but the service token was rejected (401)', 'error');
+    } else if (resp.status === 503) {
+      showStatus('scryStatus', 'Scry has no SCRY_SERVICE_TOKEN configured (503)', 'error');
+    } else {
+      showStatus('scryStatus', `Unexpected response from Scry: ${resp.status}`, 'error');
+    }
+  } catch (e) {
+    showStatus('scryStatus', `Could not reach Scry: ${e.message}`, 'error');
+  }
+});

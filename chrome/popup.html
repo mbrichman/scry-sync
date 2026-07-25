@@ -148,77 +148,21 @@
 </head>
 <body>
   <div id="popup-header">
-    <div id="header-title">Claude Exporter</div>
+    <div id="header-title">Scry Sync</div>
     <div id="header-version"></div>
   </div>
   <div style="padding: 0 5px;">
-    <div class="options">
-    <!-- Chat Export Options -->
-    <div class="export-row">
-      <label>
-        Chat format:
-        <select id="format">
-          <option value="json">JSON</option>
-          <option value="markdown">Markdown</option>
-          <option value="text">Plain Text</option>
-        </select>
-      </label>
+    <button id="syncCurrent">Sync this conversation to Scry</button>
+    <button id="openDashboard">Open Sync Dashboard</button>
+    <button id="openSettings" style="background: transparent; color: var(--link-color);">Settings</button>
 
-      <label title="Include the conversation messages in the exported file">
-        <input type="checkbox" id="includeChats" checked>
-        Chats
-      </label>
-
-      <label title="Include extended thinking blocks in the exported conversation">
-        <input type="checkbox" id="includeThinking">
-        Extended Thinking
-      </label>
-
-      <label title="Add conversation metadata (name, date, model, etc.) at the top of exported files">
-        <input type="checkbox" id="includeMetadata">
-        Metadata
-      </label>
-    </div>
-
-    <!-- Artifact Export Options -->
-    <div class="export-row" style="margin-top: 12px;">
-      <label>
-        Artifact format:
-        <select id="artifactFormat">
-          <option value="original">Original</option>
-          <option value="markdown">Markdown</option>
-          <option value="text">Plain Text</option>
-          <option value="json">JSON</option>
-        </select>
-      </label>
-
-      <label title="Include artifacts (code, documents, etc.) directly within the conversation text">
-        <input type="checkbox" id="includeArtifacts">
-        Inline Artifacts
-      </label>
-
-      <label title="Extract artifacts as separate files in nested folders">
-        <input type="checkbox" id="extractArtifacts">
-        Nested Artifacts
-      </label>
-
-      <label title="Flatten artifact structure (no subfolders, with conversation name prefix)">
-        <input type="checkbox" id="flattenArtifacts">
-        Flat Artifacts
-      </label>
-    </div>
-  </div>
-
-  <button id="exportCurrent">Export Current Conversation</button>
-  <button id="exportAll">Export All Conversations</button>
-
-  <button id="browseConversations">Browse All Conversations</button>
-  
-  <div id="status"></div>
+    <div id="status"></div>
   </div>
 
   <script src="popup-theme.js"></script>
   <script src="utils.js"></script>
+  <script src="scry_sync.js"></script>
+  <script src="scry_client.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>
