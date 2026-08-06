@@ -183,6 +183,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (scry.url) document.getElementById('scryUrl').value = scry.url;
     if (scry.token) document.getElementById('scryToken').value = scry.token;
     document.getElementById('scryConcurrency').value = scry.concurrency || 4;
+    // Absent = enabled (default-on): only an explicit false unchecks.
+    document.getElementById('scryContinuous').checked = scry.continuousSync !== false;
   });
 });
 
@@ -205,9 +207,11 @@ document.getElementById('saveScryBtn').addEventListener('click', () => {
   if (!Number.isFinite(concurrency)) concurrency = 4;
   concurrency = Math.max(1, Math.min(concurrency, 12));
 
+  const continuousSync = document.getElementById('scryContinuous').checked;
+
   // Pre-request the host permission so the later sync fetch isn't blocked.
   chrome.permissions.request({ origins: [scryOriginPattern(url)] }, (granted) => {
-    chrome.storage.local.set({ scry: { url, token, concurrency } }, () => {
+    chrome.storage.local.set({ scry: { url, token, concurrency, continuousSync } }, () => {
       showStatus('scryStatus',
         granted ? 'Scry settings saved.' : 'Saved, but host permission was declined — sync will fail until granted.',
         granted ? 'success' : 'error');

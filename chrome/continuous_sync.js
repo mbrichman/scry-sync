@@ -131,6 +131,11 @@ function nextBackoff(prevMs) {
 function shouldRun(state, nowMs) {
   const s = state || {};
 
+  // The user's explicit off-switch (options page). Checked first so the popup
+  // can say "off" rather than a confusing backoff/unconfigured reason.
+  // Absent/undefined = enabled: existing installs keep syncing by default.
+  if (s.continuousSyncEnabled === false) return { run: false, reason: 'disabled' };
+
   if (s.configured === false) return { run: false, reason: 'unconfigured' };
 
   if (typeof s.running === 'number') {
@@ -417,7 +422,10 @@ async function runContinuousSync(kind) {
   const orgId = await readOrgIdFromStorage();
   const configured = Boolean(scry && scry.url && orgId);
 
-  const gate = shouldRun(Object.assign({}, state, { configured }), nowMs);
+  const gate = shouldRun(Object.assign({}, state, {
+    configured,
+    continuousSyncEnabled: scry.continuousSync !== false,
+  }), nowMs);
   if (!gate.run) return { ran: false, reason: gate.reason };
 
   await _setState(Object.assign({}, state, { running: nowMs }));

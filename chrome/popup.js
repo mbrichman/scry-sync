@@ -85,6 +85,17 @@ function getContinuousSyncState() {
 async function renderAutoSyncStatus() {
   const el = document.getElementById('autoSyncStatus');
   if (!el) return;
+
+  // The options-page off-switch beats any state: say "off", not a stale
+  // last-sync time or error.
+  const scry = await new Promise((resolve) =>
+    chrome.storage.local.get(['scry'], (r) => resolve(r.scry || {})));
+  if (scry.continuousSync === false) {
+    el.textContent = 'Auto-sync: off';
+    el.className = 'auto-sync-status';
+    return;
+  }
+
   const state = await getContinuousSyncState();
 
   if (!state || (!state.lastSyncAt && !state.lastError)) {

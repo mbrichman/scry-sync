@@ -449,3 +449,21 @@ describe('computeWatermarkAfter', () => {
     expect(computeWatermarkAfter([], ['x'], [], prior)).toBe(prior);
   });
 });
+
+// --- user-facing enable/disable toggle (options page → scry.continuousSync) ---
+describe('continuous sync enable toggle', () => {
+  it('an explicit disabled setting stops wakes with reason "disabled"', () => {
+    expect(shouldRun({ continuousSyncEnabled: false }, 1000)).toEqual({ run: false, reason: 'disabled' });
+  });
+
+  it('absent or true flag means enabled — default-on so existing installs keep syncing', () => {
+    expect(shouldRun({}, 1000).run).toBe(true);
+    expect(shouldRun({ continuousSyncEnabled: true }, 1000).run).toBe(true);
+    expect(shouldRun({ continuousSyncEnabled: undefined }, 1000).run).toBe(true);
+  });
+
+  it('disabled wins over backoff/running/unconfigured — the user turned it off, say so', () => {
+    const s = { continuousSyncEnabled: false, configured: false, nextAllowedAt: 999999, running: 900 };
+    expect(shouldRun(s, 1000).reason).toBe('disabled');
+  });
+});

@@ -250,6 +250,11 @@
     <label for="scryConcurrency" style="margin-top: 10px; display: block;">Sync concurrency:</label>
     <input type="number" id="scryConcurrency" min="1" max="12" step="1" value="4" style="width: 80px;">
     <div class="example">How many conversations to sync at once (1–12). Higher = faster full sync; lower if claude.ai rate-limits. Default 4.</div>
+    <label for="scryContinuous" style="margin-top: 12px; display: flex; align-items: center; gap: 8px;">
+      <input type="checkbox" id="scryContinuous" checked style="margin: 0;">
+      Continuous background sync
+    </label>
+    <div class="example">Every 15 minutes, push new/changed claude.ai conversations to Scry, plus a daily deep reconcile. A red "!" badge appears after repeated failures. Unchecking stops the background wakes; manual sync from the Browse page still works.</div>
     <div class="button-row">
       <button id="saveScryBtn">Save Scry Settings</button>
       <button id="testScryBtn">Test Connection</button>
