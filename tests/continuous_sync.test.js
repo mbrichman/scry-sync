@@ -279,3 +279,100 @@ describe('planDeepReconcile', () => {
     expect(planDeepReconcile(convs, undefined)).toEqual([]);
   });
 });
+
+// --- stub-skip: conversations tombstoned in Scry must not pin the watermark ---
+// Live bug: two chats tombstoned in Scry (deliberately deleted empty stubs)
+// still enumerate at claude.ai; their body fetch correctly throws "empty body
+// (stub) after retries", the failure pinned the incremental watermark, and the
+// walk retried them every wake forever. The fix: on a stub failure, ask Scry's
+// reconcile about that one id — only a server-authoritative "not wanted"
+// (tombstoned/complete) lets the watermark advance past it.
+
+const {
+  isStubFetchError,
+  classifyStubAfterReconcile,
+  filterSkippedConversations,
+} = require('../chrome/continuous_sync.js');
+
+describe('isStubFetchError', () => {
+  it('matches the stub-after-retries error thrown by fetchConversationBody', () => {
+    const e = new Error('fetch conversation 11111111-2222-3333-4444-555555555555: empty body (stub) after retries');
+    expect(isStubFetchError(e)).toBe(true);
+  });
+
+  it('does not match other claude-side fetch errors', () => {
+    expect(isStubFetchError(new Error('fetch conversation 403'))).toBe(false);
+    expect(isStubFetchError(new Error('fetch conversation list 500'))).toBe(false);
+  });
+
+  it('does not match scry-side errors, and never throws on junk', () => {
+    expect(isStubFetchError(new Error('ingest HTTP 500'))).toBe(false);
+    expect(isStubFetchError(null)).toBe(false);
+    expect(isStubFetchError(undefined)).toBe(false);
+    expect(isStubFetchError('string')).toBe(false);
+  });
+});
+
+describe('classifyStubAfterReconcile', () => {
+  const report = (toResync, tombstoned) => ({
+    success: true,
+    summary: { enumerated: 1, tombstoned },
+    to_resync: toResync,
+  });
+
+  it('id still in to_resync → wanted (real conversation stubbing transiently; keep pinning)', () => {
+    expect(classifyStubAfterReconcile(report(['u1'], 0), 'u1')).toBe('wanted');
+  });
+
+  it('id absent and tombstoned counted → tombstoned (permanent skip)', () => {
+    expect(classifyStubAfterReconcile(report([], 1), 'u1')).toBe('tombstoned');
+  });
+
+  it('id absent, nothing tombstoned → unwanted (e.g. already complete; skip this wake, no permanent cache)', () => {
+    expect(classifyStubAfterReconcile(report([], 0), 'u1')).toBe('unwanted');
+  });
+
+  it('fails safe: malformed/missing report → wanted (never advance the watermark on a guess)', () => {
+    expect(classifyStubAfterReconcile(null, 'u1')).toBe('wanted');
+    expect(classifyStubAfterReconcile({}, 'u1')).toBe('wanted');
+    expect(classifyStubAfterReconcile({ to_resync: null }, 'u1')).toBe('wanted');
+  });
+});
+
+describe('filterSkippedConversations', () => {
+  const convs = [conv('a', '2026-07-01T00:00:00Z'), conv('b', '2026-07-02T00:00:00Z')];
+
+  it('drops permanently-skipped uuids from the enumerated list', () => {
+    expect(filterSkippedConversations(convs, ['a']).map((c) => c.uuid)).toEqual(['b']);
+  });
+
+  it('is a no-op with an empty or missing skip list', () => {
+    expect(filterSkippedConversations(convs, []).map((c) => c.uuid)).toEqual(['a', 'b']);
+    expect(filterSkippedConversations(convs, undefined).map((c) => c.uuid)).toEqual(['a', 'b']);
+    expect(filterSkippedConversations(null, ['a'])).toEqual([]);
+  });
+});
+
+describe('skipUuids state', () => {
+  it('default state starts with an empty skip list', () => {
+    expect(defaultContinuousSyncState().skipUuids).toEqual([]);
+  });
+
+  it('a successful wake merges newly-learned tombstoned uuids, deduplicated', () => {
+    const state = Object.assign(defaultContinuousSyncState(), { skipUuids: ['old'] });
+    const s = applyResult(state, { ok: true, pushed: 1, newWatermark: '2026-07-02T00:00:00Z', addSkipUuids: ['old', 'new'] }, 1000);
+    expect(s.skipUuids.sort()).toEqual(['new', 'old']);
+  });
+
+  it('a failed wake still keeps tombstones learned before the failure', () => {
+    const state = defaultContinuousSyncState();
+    const s = applyResult(state, { ok: false, domain: 'claude', error: 'x', addSkipUuids: ['t1'] }, 1000);
+    expect(s.skipUuids).toEqual(['t1']);
+    expect(s.consecutiveFailures).toBe(1);
+  });
+
+  it('old persisted state without skipUuids is upgraded to an empty list', () => {
+    const s = applyResult({ watermark: '2026-07-01T00:00:00Z' }, { ok: true, pushed: 0 }, 1000);
+    expect(s.skipUuids).toEqual([]);
+  });
+});

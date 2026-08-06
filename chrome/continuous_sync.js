@@ -38,6 +38,8 @@ function defaultContinuousSyncState() {
     backoffMs: null,          // current claude-domain backoff amount (for escalation)
     nextAllowedAt: null,      // ms epoch; claude.ai enumeration gated until this passes
     running: null,            // ms epoch a run started, or null; guards overlapping wakes
+    skipUuids: [],            // uuids tombstoned in Scry (server-confirmed): they enumerate
+                              // at claude.ai forever but must never sync or pin the watermark
   };
 }
 
@@ -129,6 +131,9 @@ function badgeStateAfter(state) {
 //   success  — { ok: true, pushed: <n>, newWatermark?: <iso> }
 //              (newWatermark omitted, e.g. a deep reconcile, leaves watermark as-is)
 //   failure  — { ok: false, domain: 'claude' | 'scry', error: <message> }
+//   either may carry addSkipUuids: uuids newly confirmed tombstoned in Scry —
+//   merged (deduplicated) into state.skipUuids even on a failed wake, so a
+//   tombstone learned before an unrelated failure is never re-fetched.
 //
 // A success clears all failure/backoff bookkeeping. A failure increments the
 // consecutive-failure counter and records the error regardless of domain, but
@@ -147,7 +152,7 @@ function applyResult(state, result, nowMs) {
     s.lastSyncAt = nowMs;
     s.lastPushed = typeof result.pushed === 'number' ? result.pushed : 0;
     if (result.newWatermark !== undefined) s.watermark = result.newWatermark;
-    return s;
+    return _mergeSkipUuids(s, result);
   }
 
   s.consecutiveFailures = (state && state.consecutiveFailures || 0) + 1;
@@ -160,7 +165,47 @@ function applyResult(state, result, nowMs) {
     s.nextAllowedAt = nowMs + s.backoffMs;
   }
   // scry-domain failure: backoffMs / nextAllowedAt intentionally untouched.
+  return _mergeSkipUuids(s, result);
+}
+
+function _mergeSkipUuids(s, result) {
+  if (result && Array.isArray(result.addSkipUuids) && result.addSkipUuids.length) {
+    s.skipUuids = Array.from(new Set([...(s.skipUuids || []), ...result.addSkipUuids]));
+  }
   return s;
+}
+
+// The stub-guard throw from fetchConversationBody: claude.ai returned 200 with
+// an empty body for a conversation that looks like it should have content.
+function isStubFetchError(err) {
+  const msg = (err && err.message) || '';
+  return /empty body \(stub\) after retries$/.test(msg);
+}
+
+// After a stub failure, Scry's reconcile (called with just that id) is the
+// authority on whether the conversation is still wanted:
+//   'wanted'     — in to_resync: a real conversation stubbing transiently.
+//                  The failure stands and keeps pinning the watermark.
+//   'tombstoned' — deliberately deleted in Scry (reconcile counts it terminal,
+//                  never to_resync). Permanent skip: cache the uuid so it is
+//                  never fetched again.
+//   'unwanted'   — not in to_resync, not tombstoned (e.g. already complete).
+//                  Skip this wake only; no permanent cache (a later edit bumps
+//                  updated_at and must sync normally).
+// Fails safe: a malformed report reads as 'wanted' — the watermark never
+// advances past a conversation on a guess.
+function classifyStubAfterReconcile(report, uuid) {
+  if (!report || !Array.isArray(report.to_resync)) return 'wanted';
+  if (report.to_resync.includes(uuid)) return 'wanted';
+  const tombstoned = report.summary && report.summary.tombstoned;
+  return tombstoned >= 1 ? 'tombstoned' : 'unwanted';
+}
+
+// Drop permanently-skipped (tombstoned) uuids from an enumerated list before
+// planning — they list at claude.ai forever but are terminal in Scry.
+function filterSkippedConversations(conversations, skipUuids) {
+  const skip = new Set(skipUuids || []);
+  return (conversations || []).filter((c) => c && !skip.has(c.uuid));
 }
 
 // Map a reconcile report's to_resync ids onto the enumerated conversation
@@ -207,24 +252,47 @@ function _domainForError(err) {
 
 // Sync a list of conversation objects one at a time (bounded pool, reusing the
 // manual-sync concurrency setting), catching per-item failures rather than
-// aborting the whole batch — mirrors browse.js's syncCandidateList. Returns
-// { pushed, succeededUuids, firstFailure: {uuid, updatedAt, err} | null }.
+// aborting the whole batch — mirrors browse.js's syncCandidateList.
+//
+// A stub failure (claude.ai 200 with an empty body) gets a second opinion from
+// Scry's reconcile before it may pin the watermark: a conversation Scry has
+// deliberately tombstoned (or already holds complete) counts as a deliberate
+// SKIP — success for watermark purposes — not a failure. Only a
+// server-authoritative "not wanted" can do this; a reconcile error keeps the
+// failure (fail safe: never advance the watermark on a guess).
+// Returns { pushed, succeeded, firstFailure, tombstonedSkips }.
 async function _syncBatch(orgId, scry, items) {
   const concurrency = (scry.concurrency && scry.concurrency > 0) ? scry.concurrency : 4;
   let pushed = 0;
   const succeeded = [];
+  const tombstonedSkips = [];
   let firstFailure = null;
   await runPool(items, concurrency, async (c) => {
     try {
       await syncOneConversation(orgId, c.uuid, scry);
       pushed++;
       succeeded.push(c);
+      return;
     } catch (e) {
+      if (isStubFetchError(e)) {
+        try {
+          const report = await reconcileWithScry(scry, [c.uuid]);
+          const cls = classifyStubAfterReconcile(report, c.uuid);
+          if (cls !== 'wanted') {
+            console.warn('Scry continuous sync: skipping', c.uuid,
+              cls === 'tombstoned' ? '(stub at claude, tombstoned in Scry — permanent skip)'
+                                   : '(stub at claude, not wanted by Scry)');
+            succeeded.push(c);
+            if (cls === 'tombstoned') tombstonedSkips.push(c.uuid);
+            return;
+          }
+        } catch (_re) { /* reconcile unreachable — keep the original failure */ }
+      }
       console.error('Scry continuous sync: failed for', c.uuid, e);
       if (!firstFailure) firstFailure = { uuid: c.uuid, updatedAt: c.updated_at, err: e };
     }
   });
-  return { pushed, succeeded, firstFailure };
+  return { pushed, succeeded, firstFailure, tombstonedSkips };
 }
 
 async function _runIncremental(orgId, scry, state) {
@@ -235,17 +303,21 @@ async function _runIncremental(orgId, scry, state) {
     return { ok: false, domain: 'claude', error: e.message || String(e) };
   }
 
-  const { toSync } = planIncremental(conversations, state.watermark, Date.now());
+  // Known-tombstoned conversations enumerate forever; drop them before planning.
+  const eligible = filterSkippedConversations(conversations, state.skipUuids);
+
+  const { toSync } = planIncremental(eligible, state.watermark, Date.now());
   if (toSync.length === 0) {
     return { ok: true, pushed: 0, newWatermark: state.watermark };
   }
 
-  const { pushed, firstFailure } = await _syncBatch(orgId, scry, toSync);
+  const { pushed, succeeded, firstFailure, tombstonedSkips } = await _syncBatch(orgId, scry, toSync);
 
-  if (pushed === 0) {
-    // Total failure — nothing to safely advance the watermark past.
+  if (pushed === 0 && succeeded.length === 0) {
+    // Total failure — nothing to safely advance the watermark past. (A wake of
+    // pure skips is a success: succeeded carries them for the watermark.)
     const err = firstFailure ? firstFailure.err : new Error('all conversations in batch failed to sync');
-    return { ok: false, domain: _domainForError(err), error: err.message || String(err) };
+    return { ok: false, domain: _domainForError(err), error: err.message || String(err), addSkipUuids: tombstonedSkips };
   }
 
   // Never advance the watermark past an item that failed to sync — toSync is
@@ -258,7 +330,7 @@ async function _runIncremental(orgId, scry, state) {
       })()
     : toSync[toSync.length - 1].updated_at;
 
-  return { ok: true, pushed, newWatermark };
+  return { ok: true, pushed, newWatermark, addSkipUuids: tombstonedSkips };
 }
 
 async function _runDeepReconcile(orgId, scry) {
@@ -279,14 +351,14 @@ async function _runDeepReconcile(orgId, scry) {
   const toSync = planDeepReconcile(conversations, report.to_resync);
   if (toSync.length === 0) return { ok: true, pushed: 0 };
 
-  const { pushed, firstFailure } = await _syncBatch(orgId, scry, toSync);
-  if (pushed === 0) {
+  const { pushed, succeeded, firstFailure, tombstonedSkips } = await _syncBatch(orgId, scry, toSync);
+  if (pushed === 0 && succeeded.length === 0) {
     const err = firstFailure ? firstFailure.err : new Error('all conversations in to_resync failed to sync');
-    return { ok: false, domain: _domainForError(err), error: err.message || String(err) };
+    return { ok: false, domain: _domainForError(err), error: err.message || String(err), addSkipUuids: tombstonedSkips };
   }
   // Deep reconcile doesn't move the incremental watermark — it's an
   // independent, exhaustive catch-up pass, not a walk from a cursor.
-  return { ok: true, pushed };
+  return { ok: true, pushed, addSkipUuids: tombstonedSkips };
 }
 
 // Run one wake of continuous sync. kind is 'incremental' or 'deep'. Safe to
@@ -334,6 +406,9 @@ if (typeof module !== 'undefined' && module.exports) {
     badgeStateAfter,
     applyResult,
     planDeepReconcile,
+    isStubFetchError,
+    classifyStubAfterReconcile,
+    filterSkippedConversations,
     runContinuousSync,
     CONTINUOUS_STORAGE_KEY,
     RUNNING_STALE_MS,
