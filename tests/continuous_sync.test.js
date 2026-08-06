@@ -376,3 +376,76 @@ describe('skipUuids state', () => {
     expect(s.skipUuids).toEqual([]);
   });
 });
+
+// --- reconcile-first incremental: see what's already there before pushing ---
+// The incremental walk used to push everything newer than the watermark and
+// let idempotent ingest discard re-pushes — fine in steady state, wasteful in
+// catch-up (re-fetching weeks of already-captured conversations 50 per wake).
+// Now the wake reconciles its pending set first: items Scry already holds
+// complete are PASSED by the watermark without fetching; the batch cap applies
+// only to genuinely wanted syncs. Reconcile unreachable → sync everything
+// pending (the old behavior): never skip on a guess.
+
+const {
+  selectWantedToSync,
+  computeWatermarkAfter,
+} = require('../chrome/continuous_sync.js');
+
+describe('selectWantedToSync', () => {
+  const pending = [
+    conv('a', '2026-07-01T00:00:00Z'),
+    conv('b', '2026-07-02T00:00:00Z'),
+    conv('c', '2026-07-03T00:00:00Z'),
+  ];
+
+  it('keeps only conversations the server wants, oldest-first, capped', () => {
+    expect(selectWantedToSync(pending, ['c', 'a'], 10).map((c) => c.uuid)).toEqual(['a', 'c']);
+    expect(selectWantedToSync(pending, ['c', 'a'], 1).map((c) => c.uuid)).toEqual(['a']);
+  });
+
+  it('null to_resync (reconcile unavailable) → everything pending is wanted (old behavior), still capped', () => {
+    expect(selectWantedToSync(pending, null, 10).map((c) => c.uuid)).toEqual(['a', 'b', 'c']);
+    expect(selectWantedToSync(pending, null, 2).map((c) => c.uuid)).toEqual(['a', 'b']);
+  });
+
+  it('empty want-list with a real report → nothing to sync', () => {
+    expect(selectWantedToSync(pending, [], 10)).toEqual([]);
+  });
+});
+
+describe('computeWatermarkAfter', () => {
+  const pending = [
+    conv('a', '2026-07-01T00:00:00Z'),
+    conv('b', '2026-07-02T00:00:00Z'),
+    conv('c', '2026-07-03T00:00:00Z'),
+    conv('d', '2026-07-04T00:00:00Z'),
+  ];
+  const prior = '2026-06-30T00:00:00Z';
+
+  it('advances over unwanted (already-in-Scry) items without them being synced', () => {
+    // Only 'c' wanted and synced: a, b are passable because Scry has them.
+    expect(computeWatermarkAfter(pending, ['c'], ['c'], prior)).toBe('2026-07-04T00:00:00Z');
+  });
+
+  it('stops just before the earliest wanted item that did not sync', () => {
+    // b and d wanted, only d synced → cannot pass b; watermark lands on a.
+    expect(computeWatermarkAfter(pending, ['b', 'd'], ['d'], prior)).toBe('2026-07-01T00:00:00Z');
+  });
+
+  it('keeps the prior watermark when the very first pending item is wanted and unsynced', () => {
+    expect(computeWatermarkAfter(pending, ['a'], [], prior)).toBe(prior);
+  });
+
+  it('advances to the end when everything wanted synced', () => {
+    expect(computeWatermarkAfter(pending, ['a', 'd'], ['a', 'd'], prior)).toBe('2026-07-04T00:00:00Z');
+  });
+
+  it('null wanted (reconcile unavailable) → every pending item is wanted (old truncation behavior)', () => {
+    expect(computeWatermarkAfter(pending, null, ['a', 'b'], prior)).toBe('2026-07-02T00:00:00Z');
+    expect(computeWatermarkAfter(pending, null, [], prior)).toBe(prior);
+  });
+
+  it('empty pending → prior watermark unchanged', () => {
+    expect(computeWatermarkAfter([], ['x'], [], prior)).toBe(prior);
+  });
+});

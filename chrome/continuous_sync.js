@@ -63,7 +63,7 @@ function planIncremental(conversations, watermark, _nowMs) {
     const newest = (conversations || [])
       .filter((c) => !Number.isNaN(Date.parse(c && c.updated_at)))
       .sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at))[0];
-    return { toSync: [], newWatermark: newest ? newest.updated_at : null, overflow: false };
+    return { toSync: [], pending: [], newWatermark: newest ? newest.updated_at : null, overflow: false };
   }
 
   const wm = Date.parse(watermark);
@@ -82,7 +82,37 @@ function planIncremental(conversations, watermark, _nowMs) {
     ? toSync[toSync.length - 1].updated_at
     : (watermark == null ? null : watermark);
 
-  return { toSync, newWatermark, overflow };
+  // `pending` is the FULL ascending eligible list (uncapped) — the
+  // reconcile-first path needs it to pass already-captured items for free.
+  return { toSync, pending, newWatermark, overflow };
+}
+
+// Reconcile-first selection: of the pending (ascending) list, keep only what
+// Scry actually wants (to_resync), oldest-first, capped. A null want-list
+// means reconcile was unreachable — every pending item is wanted (the old
+// push-everything behavior; never skip on a guess).
+function selectWantedToSync(pending, toResyncIds, cap) {
+  const wanted = toResyncIds == null ? null : new Set(toResyncIds);
+  return (pending || [])
+    .filter((c) => c && (wanted == null || wanted.has(c.uuid)))
+    .slice(0, cap);
+}
+
+// Where the watermark may land after a wake: walk the pending list (ascending)
+// and advance over items that are either unwanted (Scry already holds them
+// complete — passable without syncing) or synced this wake; stop just before
+// the earliest wanted item that didn't sync (failed or beyond the cap). A null
+// want-list treats everything as wanted (old truncation behavior).
+function computeWatermarkAfter(pending, wantedIds, syncedUuids, priorWatermark) {
+  const wanted = wantedIds == null ? null : new Set(wantedIds);
+  const synced = new Set(syncedUuids || []);
+  let last = priorWatermark;
+  for (const c of pending || []) {
+    const isWanted = wanted == null || wanted.has(c.uuid);
+    if (isWanted && !synced.has(c.uuid)) break;
+    last = c.updated_at;
+  }
+  return last;
 }
 
 // Next backoff delay (ms) given the previous one: 15m -> 30m -> 60m, capped.
@@ -306,9 +336,28 @@ async function _runIncremental(orgId, scry, state) {
   // Known-tombstoned conversations enumerate forever; drop them before planning.
   const eligible = filterSkippedConversations(conversations, state.skipUuids);
 
-  const { toSync } = planIncremental(eligible, state.watermark, Date.now());
+  const plan = planIncremental(eligible, state.watermark, Date.now());
+  if (!plan.pending || plan.pending.length === 0) {
+    // Nothing pending (or first run: plan.newWatermark is the init-to-newest).
+    return { ok: true, pushed: 0, newWatermark: plan.newWatermark };
+  }
+
+  // See what's already there: ask Scry which pending items it actually needs.
+  // Items it holds complete are passed by the watermark without ever being
+  // fetched. Reconcile unreachable → null → everything pending is wanted (the
+  // old push-everything behavior; never skip on a guess).
+  let wantedIds = null;
+  try {
+    const report = await reconcileWithScry(scry, plan.pending.map((c) => c.uuid));
+    if (report && Array.isArray(report.to_resync)) wantedIds = report.to_resync;
+  } catch (_e) { /* fall back to syncing everything pending */ }
+
+  const toSync = selectWantedToSync(plan.pending, wantedIds, INCREMENTAL_BATCH_CAP);
+
   if (toSync.length === 0) {
-    return { ok: true, pushed: 0, newWatermark: state.watermark };
+    // Scry already has everything pending — pass it all.
+    const newWatermark = computeWatermarkAfter(plan.pending, wantedIds, [], state.watermark);
+    return { ok: true, pushed: 0, newWatermark };
   }
 
   const { pushed, succeeded, firstFailure, tombstonedSkips } = await _syncBatch(orgId, scry, toSync);
@@ -320,15 +369,10 @@ async function _runIncremental(orgId, scry, state) {
     return { ok: false, domain: _domainForError(err), error: err.message || String(err), addSkipUuids: tombstonedSkips };
   }
 
-  // Never advance the watermark past an item that failed to sync — toSync is
-  // ascending by updated_at, so the boundary is just before the earliest
-  // failure (or the whole batch, if everything succeeded).
-  const newWatermark = firstFailure
-    ? (() => {
-        const idx = toSync.findIndex((c) => c.uuid === firstFailure.uuid);
-        return idx > 0 ? toSync[idx - 1].updated_at : state.watermark;
-      })()
-    : toSync[toSync.length - 1].updated_at;
+  // Advance over unwanted + synced items; stop just before the earliest wanted
+  // item that didn't sync (failed or beyond the cap).
+  const newWatermark = computeWatermarkAfter(
+    plan.pending, wantedIds, succeeded.map((c) => c.uuid), state.watermark);
 
   return { ok: true, pushed, newWatermark, addSkipUuids: tombstonedSkips };
 }
@@ -409,6 +453,8 @@ if (typeof module !== 'undefined' && module.exports) {
     isStubFetchError,
     classifyStubAfterReconcile,
     filterSkippedConversations,
+    selectWantedToSync,
+    computeWatermarkAfter,
     runContinuousSync,
     CONTINUOUS_STORAGE_KEY,
     RUNNING_STALE_MS,
