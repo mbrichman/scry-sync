@@ -58,7 +58,57 @@ document.addEventListener('DOMContentLoaded', () => {
   const manifest = chrome.runtime.getManifest();
   document.getElementById('header-title').textContent = manifest.name;
   document.getElementById('header-version').textContent = `v${manifest.version}`;
+  renderAutoSyncStatus();
 });
+
+// --- continuous background sync status line ---
+// Sourced from chrome.storage.local "continuousSync" (written by
+// continuous_sync.js's runContinuousSync, driven by the alarms in
+// background.js). Purely a read/render of persisted state — no sync logic
+// here, matching the split between the engine and the UI everywhere else in
+// this popup.
+
+function formatRelativeTime(ms) {
+  const diffMin = Math.round((Date.now() - ms) / 60000);
+  if (diffMin < 1) return 'just now';
+  if (diffMin < 60) return `${diffMin} min ago`;
+  const diffHr = Math.round(diffMin / 60);
+  if (diffHr < 24) return `${diffHr} hr ago`;
+  return `${Math.round(diffHr / 24)} d ago`;
+}
+
+function getContinuousSyncState() {
+  return new Promise((resolve) =>
+    chrome.storage.local.get(['continuousSync'], (r) => resolve(r.continuousSync || null)));
+}
+
+async function renderAutoSyncStatus() {
+  const el = document.getElementById('autoSyncStatus');
+  if (!el) return;
+  const state = await getContinuousSyncState();
+
+  if (!state || (!state.lastSyncAt && !state.lastError)) {
+    el.textContent = ''; // never woken yet (e.g. just installed)
+    el.className = 'auto-sync-status';
+    return;
+  }
+
+  if ((state.consecutiveFailures || 0) >= 3 && state.lastError) {
+    const since = state.lastSyncAt ? formatRelativeTime(state.lastSyncAt) : 'install';
+    const shortError = state.lastError.length > 60 ? `${state.lastError.slice(0, 57)}…` : state.lastError;
+    el.textContent = `Auto-sync failing since ${since} — ${shortError}`;
+    el.className = 'auto-sync-status error';
+    return;
+  }
+
+  if (state.lastSyncAt) {
+    el.textContent = `Auto-sync: ${formatRelativeTime(state.lastSyncAt)} · ${state.lastPushed || 0} pushed`;
+    el.className = 'auto-sync-status';
+    return;
+  }
+
+  el.textContent = '';
+}
 
 // Sync the conversation currently open in the claude.ai tab.
 document.getElementById('syncCurrent').addEventListener('click', async () => {

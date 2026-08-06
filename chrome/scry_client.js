@@ -19,6 +19,34 @@ function setScrySyncedMap(map) {
   return new Promise((resolve) => chrome.storage.local.set({ scrySyncedMap: map }, resolve));
 }
 
+// --- background/service-worker enumeration (no content-script relay) ---
+//
+// browse.js's loadOrgId/loadConversations enumerate via a message relay to an
+// open claude.ai tab's content script (sendMessageToClaudeTab). The background
+// service worker that drives continuous sync has no guaranteed tab to relay
+// through, so these fetch claude.ai directly — the same credentialed pattern
+// fetchConversationBody already uses below, which works from ANY extension
+// context (popup, background, dashboard) because host_permissions grants
+// https://claude.ai/*; no open tab is required for that fetch to carry the
+// browser's claude.ai session cookies.
+
+// Last-detected org id (chrome.storage.sync 'organizationId'), written by the
+// popup/dashboard's tab-based auto-detect. Continuous sync reads it rather
+// than re-running auto-detect, since it has no tab to detect from.
+function readOrgIdFromStorage() {
+  return new Promise((resolve) =>
+    chrome.storage.sync.get(['organizationId'], (r) => resolve(r.organizationId || null)));
+}
+
+// List all of the account's conversations. Mirrors content.js's
+// fetchAllConversations, minus the tab-relay requirement.
+async function listClaudeConversations(orgId) {
+  const url = `https://claude.ai/api/organizations/${orgId}/chat_conversations`;
+  const resp = await fetch(url, { credentials: 'include', headers: { 'Accept': 'application/json' } });
+  if (!resp.ok) throw new Error(`fetch conversation list ${resp.status}`);
+  return resp.json();
+}
+
 // --- helpers ---
 
 function scryOriginPattern(url) {
