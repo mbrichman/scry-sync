@@ -747,11 +747,14 @@ async function reconcileAndSync() {
   if (!(await ensureScryPermission(scry.url))) { showToast('Host permission for Scry was declined', true); return; }
   if (!orgId) { showToast('Organization not detected yet — try again in a moment', true); return; }
 
-  const sourceIds = allConversations.map((c) => c.uuid).filter(Boolean);
+  // Pass full objects (uuid + updated_at) so reconcile detects staleness —
+  // a conversation Scry holds "complete" but that grew at the source must
+  // re-sync. Bare ids here left the manual path blind to continued chats.
+  const items = allConversations.filter((c) => c && c.uuid);
   let report;
   try {
-    showToast(`Reconciling ${sourceIds.length} conversations with Scry…`);
-    report = await reconcileWithScry(scry, sourceIds);
+    showToast(`Reconciling ${items.length} conversations with Scry…`);
+    report = await reconcileWithScry(scry, items);
   } catch (e) {
     console.error('Reconcile failed', e);
     showToast(`Reconcile failed: ${e.message}`, true);
@@ -769,7 +772,7 @@ async function reconcileAndSync() {
 
   const candidates = allConversations.filter((c) => resync.has(c.uuid));
   const r = await syncCandidateList(candidates, scry,
-    `Reconcile: ${s.missing} missing + ${s.incomplete} incomplete → re-syncing ${candidates.length}…`);
+    `Reconcile: ${s.missing} missing + ${s.incomplete} incomplete + ${s.stale || 0} stale → re-syncing ${candidates.length}…`);
   if (r.cancelled) return;
   showToast(
     r.failed > 0
