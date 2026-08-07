@@ -154,17 +154,36 @@ async function fetchConversationFileBlobs(convData) {
   return out;
 }
 
-// Ask Scry which of the enumerated conversation ids still need (re-)syncing.
-// Sends the full id set; gets back { to_resync: [...], summary: {...}, extra }.
-// This is the completeness gate: it catches both conversations Scry never got
-// (missing) and ones it got but couldn't fully capture (incomplete).
-async function reconcileWithScry(scry, sourceIds) {
+// Ask Scry which of the enumerated conversations still need (re-)syncing.
+// `items` may be plain id strings OR conversation objects {uuid, updated_at}.
+// When updated_at is available we send it as source_updated_ats so Scry can
+// detect STALENESS — a conversation that grew at the source since last sync.
+// Without it, a continued conversation reads as 'complete' and never re-syncs
+// (its stored copy is internally consistent, just not current). Gets back
+// { to_resync: [...], summary: {...}, extra } — to_resync = missing +
+// incomplete + stale.
+async function reconcileWithScry(scry, items) {
   const url = `${scry.url.replace(/\/+$/, '')}/api/conversations/reconcile`;
   const headers = { 'Content-Type': 'application/json' };
   if (scry.token) headers['Authorization'] = `Bearer ${scry.token}`;
+
+  const sourceIds = [];
+  const sourceUpdatedAts = {};
+  for (const it of (items || [])) {
+    if (it && typeof it === 'object') {
+      if (!it.uuid) continue;
+      sourceIds.push(it.uuid);
+      if (it.updated_at) sourceUpdatedAts[it.uuid] = it.updated_at;
+    } else if (it) {
+      sourceIds.push(it);
+    }
+  }
+
+  const body = { source_type: 'claude', source_ids: sourceIds };
+  if (Object.keys(sourceUpdatedAts).length) body.source_updated_ats = sourceUpdatedAts;
+
   const resp = await fetch(url, {
-    method: 'POST', headers,
-    body: JSON.stringify({ source_type: 'claude', source_ids: sourceIds }),
+    method: 'POST', headers, body: JSON.stringify(body),
   });
   if (!resp.ok) throw new Error(`reconcile HTTP ${resp.status}`);
   return resp.json();
@@ -248,5 +267,5 @@ async function syncOneConversation(orgId, conversationUuid, scry) {
 
 // In Node (vitest), expose the pure helpers for testing.
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { conversationBodyIsStub, partitionDeletableReport };
+  module.exports = { conversationBodyIsStub, partitionDeletableReport, reconcileWithScry };
 }

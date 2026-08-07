@@ -353,7 +353,10 @@ async function _runIncremental(orgId, scry, state) {
   // old push-everything behavior; never skip on a guess).
   let wantedIds = null;
   try {
-    const report = await reconcileWithScry(scry, plan.pending.map((c) => c.uuid));
+    // Pass full objects (uuid + updated_at) so reconcile can detect staleness —
+    // a pending item Scry holds "complete" but that grew at the source must
+    // re-sync, or continued conversations never propagate their additions.
+    const report = await reconcileWithScry(scry, plan.pending);
     if (report && Array.isArray(report.to_resync)) wantedIds = report.to_resync;
   } catch (_e) { /* fall back to syncing everything pending */ }
 
@@ -392,7 +395,7 @@ async function _runDeepReconcile(orgId, scry) {
 
   let report;
   try {
-    report = await reconcileWithScry(scry, conversations.map((c) => c.uuid));
+    report = await reconcileWithScry(scry, conversations);  // objects → staleness-aware
   } catch (e) {
     return { ok: false, domain: 'scry', error: e.message || String(e) };
   }
