@@ -13,11 +13,42 @@ const {
   chatGptMessageText,
   chatGptTimeToIso,
   extractChatGptModelSlug,
+  collectChatGptImagePointers,
   normalizeChatGptConversation,
   convertChatGptToMarkdown,
   chatGptConversationToJson,
   slugifyChatGptTitle,
 } = require('../chrome/chatgpt_adapter.js');
+
+// A conversation with a multimodal image (user upload) and a code-interpreter
+// output image (tool). current_node = out.
+function makeImageConversation() {
+  return {
+    conversation_id: 'img-1',
+    title: 'Image chat',
+    current_node: 'out',
+    mapping: {
+      root: { id: 'root', message: { author: { role: 'system' }, recipient: 'all', content: { content_type: 'text', parts: [''] }, metadata: { is_visually_hidden_from_conversation: true } }, parent: null, children: ['u'] },
+      u: {
+        id: 'u',
+        message: {
+          author: { role: 'user' }, recipient: 'all',
+          content: { content_type: 'multimodal_text', parts: ['look at this', { content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_ABC' }] },
+        },
+        parent: 'root', children: ['out'],
+      },
+      out: {
+        id: 'out',
+        message: {
+          author: { role: 'tool', name: 'python' }, recipient: 'all',
+          content: { content_type: 'execution_output', text: '' },
+          metadata: { aggregate_result: { messages: [{ message_type: 'image', image_url: 'sediment://file_PLOT' }] } },
+        },
+        parent: 'u', children: [],
+      },
+    },
+  };
+}
 
 // A realistic conversation body. Tree:
 //   root(system,hidden) -> u1(user) -> a1(assistant, OLD, superseded branch)
@@ -191,6 +222,42 @@ describe('extractChatGptModelSlug', () => {
   });
   it('returns null when none present', () => {
     expect(extractChatGptModelSlug({ mapping: {} })).toBeNull();
+  });
+});
+
+describe('collectChatGptImagePointers', () => {
+  it('collects multimodal + code-interpreter image pointers from the branch', () => {
+    expect(collectChatGptImagePointers(makeImageConversation()))
+      .toEqual(['sediment://file_ABC', 'sediment://file_PLOT']);
+  });
+  it('dedupes and returns [] when there are no images', () => {
+    expect(collectChatGptImagePointers(makeConversation())).toEqual([]);
+  });
+});
+
+describe('image byte inlining via imageMap', () => {
+  const imageMap = {
+    'sediment://file_ABC': 'data:image/png;base64,AAAA',
+    'sediment://file_PLOT': 'data:image/png;base64,BBBB',
+  };
+  it('inlines a fetched data URL for a multimodal image part', () => {
+    const msg = { content: { content_type: 'multimodal_text', parts: ['hi', { content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_ABC' }] } };
+    expect(chatGptMessageText(msg, imageMap)).toBe('hi\n![image](data:image/png;base64,AAAA)');
+  });
+  it('leaves a placeholder when the map has no entry', () => {
+    const msg = { content: { content_type: 'multimodal_text', parts: [{ content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_ABC' }] } };
+    expect(chatGptMessageText(msg, {})).toBe('![image](sediment://file_ABC)');
+  });
+  it('inlines code-interpreter output images', () => {
+    const n = normalizeChatGptConversation(makeImageConversation(), imageMap);
+    expect(n.messages[0].text).toContain('![image](data:image/png;base64,AAAA)');
+    expect(n.messages[1].text).toBe('![image](data:image/png;base64,BBBB)');
+  });
+  it('markdown embeds the data URIs end to end', () => {
+    const md = convertChatGptToMarkdown(makeImageConversation(), imageMap);
+    expect(md).toContain('data:image/png;base64,AAAA');
+    expect(md).toContain('data:image/png;base64,BBBB');
+    expect(md).not.toContain('sediment://');
   });
 });
 

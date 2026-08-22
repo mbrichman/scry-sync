@@ -1,5 +1,14 @@
 # Changelog
 
+## [2.6.1] — ChatGPT export: image byte capture (Chrome)
+
+- **Images now export as real bytes, not placeholders.** The PoC resolves each ChatGPT image asset pointer (`sediment://` / `file-service://`) via `GET backend-api/files/download/:id` → signed URL → fetches the bytes → inlines them as a data URI, so uploaded images and code-interpreter plots actually render in the exported Markdown/JSON. Covers both multimodal image parts and `aggregate_result` output images.
+  - New pure helper `collectChatGptImagePointers` (branch-scoped, deduped) + impure `fetchChatGptImageDataUrl` / `fetchChatGptImageDataUrls`. Image bytes are threaded through the renderers as an optional `imageMap` (no mutation of the source body); failures degrade to placeholders rather than aborting the export.
+  - Export page gains a **"Fetch & embed image bytes"** toggle (on by default) with per-image progress.
+  - **Manifest:** added `https://*.oaiusercontent.com/*` host permission so the extension can read the cross-origin image bytes; version 2.6.0 → 2.6.1.
+  - +6 tests (38 in the ChatGPT suite, 188 total). Still read-only; still no Scry sync.
+  - **Known limits:** signed URLs on hosts other than `*.oaiusercontent.com` will fall back to placeholders (add the host to permissions if OpenAI changes it); original non-image file bytes and Canvas/artifacts remain unsupported (see docs/TODO.md).
+
 ## [2.6.0] — ChatGPT export (read-only PoC, Chrome)
 
 - **New ChatGPT source adapter (proof of concept).** Read-only export of ChatGPT conversations to Markdown or JSON, proving the data path end-to-end without touching the Scry sync pipeline or backend.

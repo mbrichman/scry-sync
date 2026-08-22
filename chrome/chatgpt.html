@@ -109,6 +109,10 @@
         <button id="exportSelMd">Export selected → Markdown (ZIP)</button>
         <button id="exportSelJson">Export selected → JSON (ZIP)</button>
       </div>
+      <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-secondary);margin-bottom:10px;">
+        <input type="checkbox" id="includeImages" checked>
+        Fetch &amp; embed image bytes (slower — resolves each image to an inline data URI)
+      </label>
       <ul class="convs" id="convList"></ul>
     </div>
   </div>

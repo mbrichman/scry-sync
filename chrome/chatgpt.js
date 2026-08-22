@@ -99,17 +99,36 @@ function renderList() {
   }
 }
 
+function wantImages() {
+  const el = $('includeImages');
+  return el ? el.checked : false;
+}
+
+// Resolve every image pointer in a fetched body to a { pointer -> data URL } map,
+// reporting progress. Returns {} when images are disabled or there are none.
+async function buildImageMap(body, label) {
+  if (!wantImages()) return {};
+  const pointers = collectChatGptImagePointers(body);
+  if (pointers.length === 0) return {};
+  let done = 0;
+  return fetchChatGptImageDataUrls(accessToken, pointers, null, () => {
+    done++;
+    setStatus(`${label}: fetching images ${done}/${pointers.length}…`);
+  });
+}
+
 async function exportOne(conv, format) {
   setStatus(`Fetching "${conv.title || conv.id}"…`);
   try {
     await ensureToken();
     const body = await fetchChatGptConversation(accessToken, conv.id);
+    const imageMap = await buildImageMap(body, conv.title || conv.id);
     const slug = slugifyChatGptTitle(body.title || conv.title);
     if (format === 'md') {
-      const md = convertChatGptToMarkdown(body);
+      const md = convertChatGptToMarkdown(body, imageMap);
       triggerDownload(new Blob([md], { type: 'text/markdown' }), `${slug}.md`);
     } else {
-      const json = chatGptConversationToJson(body);
+      const json = chatGptConversationToJson(body, imageMap);
       triggerDownload(new Blob([json], { type: 'application/json' }), `${slug}.json`);
     }
     setStatus('Exported ✓');
@@ -139,13 +158,16 @@ async function exportSelected(format) {
       const conv = byId.get(id);
       setStatus(`Fetching ${done + 1}/${ids.length}: "${(conv && conv.title) || id}"…`);
       const body = await fetchChatGptConversation(accessToken, id);
+      const imageMap = await buildImageMap(body, `${done + 1}/${ids.length}`);
       let name = slugifyChatGptTitle(body.title || (conv && conv.title));
       // Guarantee unique zip entries when titles collide or repeat.
       let entry = `${name}.${format === 'md' ? 'md' : 'json'}`;
       let n = 2;
       while (usedNames.has(entry)) entry = `${name}-${n++}.${format === 'md' ? 'md' : 'json'}`;
       usedNames.add(entry);
-      const content = format === 'md' ? convertChatGptToMarkdown(body) : chatGptConversationToJson(body);
+      const content = format === 'md'
+        ? convertChatGptToMarkdown(body, imageMap)
+        : chatGptConversationToJson(body, imageMap);
       zip.file(entry, content);
       done++;
     }

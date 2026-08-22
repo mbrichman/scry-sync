@@ -141,10 +141,19 @@ function isDisplayableChatGptMessage(message) {
   return chatGptMessageText(message).trim().length > 0;
 }
 
+// Render one image pointer to a markdown image. When `imageMap` has a fetched
+// data URL for the pointer, that is inlined (so the image actually displays);
+// otherwise the raw pointer is left as a placeholder.
+function _renderImage(pointer, imageMap) {
+  const src = (imageMap && imageMap[pointer]) || pointer || 'image';
+  return `![image](${src})`;
+}
+
 // Extract displayable text from a ChatGPT message's content, across the content
-// types the web app produces. Image parts are rendered as markdown placeholders
-// (this PoC does not fetch image bytes — see collectChatGptImagePointers).
-function chatGptMessageText(message) {
+// types the web app produces. Pass `imageMap` ({ pointer -> data URL }, from
+// fetchChatGptImageDataUrls) to inline fetched image bytes; omit it to leave
+// images as `sediment://` placeholders.
+function chatGptMessageText(message, imageMap = {}) {
   const content = message && message.content;
   if (!content) return '';
 
@@ -156,7 +165,7 @@ function chatGptMessageText(message) {
       if (typeof part === 'string') return part;
       if (part && typeof part === 'object') {
         if (part.content_type === 'image_asset_pointer' || part.asset_pointer) {
-          return `![image](${part.asset_pointer || 'image'})`;
+          return _renderImage(part.asset_pointer, imageMap);
         }
         if (part.content_type === 'audio_transcription' && typeof part.text === 'string') {
           return `[audio] ${part.text}`;
@@ -178,7 +187,7 @@ function chatGptMessageText(message) {
     if (_hasExecutionImages(message)) {
       return message.metadata.aggregate_result.messages
         .filter((m) => m && m.message_type === 'image')
-        .map((m) => `![image](${m.image_url})`)
+        .map((m) => _renderImage(m.image_url, imageMap))
         .join('\n');
     }
     if (typeof content.text === 'string') return content.text;
@@ -191,6 +200,33 @@ function chatGptMessageText(message) {
   if (typeof content.text === 'string') return content.text;
 
   return '';
+}
+
+// Collect every unique image asset pointer in the visible branch that would be
+// rendered: multimodal image parts (`image_asset_pointer`) and code-interpreter
+// output images (`aggregate_result.messages[].image_url`). These are the pointers
+// fetchChatGptImageDataUrls resolves to bytes. Pure/testable.
+function collectChatGptImagePointers(data) {
+  const out = [];
+  const seen = new Set();
+  const push = (p) => { if (p && !seen.has(p)) { seen.add(p); out.push(p); } };
+
+  for (const message of getChatGptBranch(data)) {
+    const content = message && message.content;
+    if (content && content.content_type === 'multimodal_text' && Array.isArray(content.parts)) {
+      for (const part of content.parts) {
+        if (part && typeof part === 'object' && part.content_type === 'image_asset_pointer') {
+          push(part.asset_pointer);
+        }
+      }
+    }
+    if (_hasExecutionImages(message)) {
+      for (const m of message.metadata.aggregate_result.messages) {
+        if (m && m.message_type === 'image') push(m.image_url);
+      }
+    }
+  }
+  return out;
 }
 
 // ===== PURE: normalization =====
@@ -228,13 +264,13 @@ function extractChatGptModelSlug(data) {
 // adapter's contract: whatever the source, we produce { id, title, created_at,
 // updated_at, model, messages: [{ role, text, model, created_at }] }. That shape
 // is what a future buildIngestPayload-style step (or the exporter below) consumes.
-function normalizeChatGptConversation(data) {
+function normalizeChatGptConversation(data, imageMap = {}) {
   const branch = getChatGptBranch(data).filter(isDisplayableChatGptMessage);
   const convModel = extractChatGptModelSlug(data);
 
   const messages = branch.map((m) => ({
     role: m.author && m.author.role ? m.author.role : 'unknown',
-    text: chatGptMessageText(m),
+    text: chatGptMessageText(m, imageMap),
     model: (m.metadata && m.metadata.model_slug) || convModel || null,
     created_at: chatGptTimeToIso(m.create_time),
   }));
@@ -259,11 +295,13 @@ const CHATGPT_ROLE_LABELS = {
 };
 
 // Render a normalized (or raw) conversation to Markdown. Accepts either a raw
-// ChatGPT body or an already-normalized object (duck-typed on `messages`).
-function convertChatGptToMarkdown(dataOrNormalized) {
+// ChatGPT body or an already-normalized object (duck-typed on `messages`). When
+// given a raw body, pass `imageMap` to inline fetched image bytes; an
+// already-normalized object has its image sources baked in already.
+function convertChatGptToMarkdown(dataOrNormalized, imageMap = {}) {
   const conv = Array.isArray(dataOrNormalized && dataOrNormalized.messages)
     ? dataOrNormalized
-    : normalizeChatGptConversation(dataOrNormalized);
+    : normalizeChatGptConversation(dataOrNormalized, imageMap);
 
   const lines = [];
   lines.push(`# ${conv.title}`);
@@ -291,9 +329,10 @@ function convertChatGptToMarkdown(dataOrNormalized) {
   return lines.join('\n').trimEnd() + '\n';
 }
 
-// The normalized JSON export — pretty-printed, source-agnostic shape.
-function chatGptConversationToJson(data) {
-  return JSON.stringify(normalizeChatGptConversation(data), null, 2);
+// The normalized JSON export — pretty-printed, source-agnostic shape. Pass
+// `imageMap` to inline fetched image bytes into message text.
+function chatGptConversationToJson(data, imageMap = {}) {
+  return JSON.stringify(normalizeChatGptConversation(data, imageMap), null, 2);
 }
 
 // Filesystem-safe slug from a title, for export filenames.
@@ -391,6 +430,56 @@ async function fetchChatGptConversation(token, conversationId, accountId) {
   return chatGptApiGet(url, token, accountId);
 }
 
+// ===== IMPURE: image byte capture =====
+
+function _blobToDataUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
+
+// Resolve a single asset pointer (sediment:// or file-service://) to a data URL.
+// Two hops, mirroring chatgpt-exporter's fetchImageFromPointer:
+//   1. GET backend-api/files/download/:id  -> a short-lived signed download_url
+//   2. fetch(download_url)                 -> the actual bytes
+// The bytes host (e.g. *.oaiusercontent.com) must be in host_permissions for the
+// extension to read the cross-origin response. Returns null on any failure so the
+// renderer falls back to a placeholder rather than aborting the export.
+async function fetchChatGptImageDataUrl(token, pointer, accountId) {
+  const id = String(pointer || '').replace(/^\w[\w+.-]*:\/\//, ''); // strip scheme://
+  if (!id) return null;
+  const meta = await chatGptApiGet(
+    `${CHATGPT_API}/files/download/${encodeURIComponent(id)}?inline=false`, token, accountId);
+  if (!meta || meta.status !== 'success' || !meta.download_url) return null;
+  const resp = await fetch(meta.download_url, { credentials: 'omit' });
+  if (!resp.ok) throw new Error(`image bytes ${resp.status}`);
+  const dataUrl = await _blobToDataUrl(await resp.blob());
+  // Prefer the real content-type over FileReader's guess.
+  const ct = resp.headers.get('content-type') || meta.mime_type;
+  return ct ? dataUrl.replace(/^data:[^;,]*/, `data:${ct}`) : dataUrl;
+}
+
+// Resolve many pointers concurrently into a { pointer -> data URL } map. Failures
+// are logged and omitted (those images stay placeholders). `onEach()` fires after
+// each pointer settles so the UI can show progress.
+async function fetchChatGptImageDataUrls(token, pointers, accountId, onEach) {
+  const map = {};
+  await Promise.all((pointers || []).map(async (pointer) => {
+    try {
+      const url = await fetchChatGptImageDataUrl(token, pointer, accountId);
+      if (url) map[pointer] = url;
+    } catch (e) {
+      console.warn('ChatGPT export: image resolve failed for', pointer, e);
+    } finally {
+      if (onEach) onEach();
+    }
+  }));
+  return map;
+}
+
 // Node (vitest): expose the PURE surface for testing. Browser: these are globals.
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -401,6 +490,7 @@ if (typeof module !== 'undefined' && module.exports) {
     chatGptMessageText,
     chatGptTimeToIso,
     extractChatGptModelSlug,
+    collectChatGptImagePointers,
     normalizeChatGptConversation,
     convertChatGptToMarkdown,
     chatGptConversationToJson,
