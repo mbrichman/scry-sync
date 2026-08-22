@@ -74,6 +74,11 @@ document.getElementById('backupBtn').addEventListener('click', () => {
   });
 });
 
+// Open the ChatGPT export proof-of-concept page in a new tab.
+document.getElementById('openChatGptExportBtn').addEventListener('click', () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL('chatgpt.html') });
+});
+
 // Restore extension data from a backup file. Flow: click → mode-choice modal
 // → file picker → import. The mode is held in pendingImportMode across the
 // async file-picker boundary.

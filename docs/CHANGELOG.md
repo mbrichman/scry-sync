@@ -1,5 +1,14 @@
 # Changelog
 
+## [2.6.0] — ChatGPT export (read-only PoC, Chrome)
+
+- **New ChatGPT source adapter (proof of concept).** Read-only export of ChatGPT conversations to Markdown or JSON, proving the data path end-to-end without touching the Scry sync pipeline or backend.
+  - **`chatgpt_adapter.js`** — the ChatGPT counterpart to the Claude-specific layer (content.js + utils.js). Pure, unit-tested transforms: walk ChatGPT's `mapping` tree from `current_node` to root (the analog of Claude's `getCurrentBranch`), drop system/hidden/empty turns, extract text across content types (text, multimodal_text with image placeholders, code, execution_output), normalize to a source-agnostic `{ id, title, created_at, updated_at, model, messages[] }` shape, and render Markdown/JSON. Plus browser-side fetchers for chatgpt.com's `backend-api` (bearer-token auth via `/api/auth/session`, paginated conversation list, conversation body).
+  - **`chatgpt.html` / `chatgpt.js`** — a standalone PoC page: load your ChatGPT conversation list, export any conversation (or a multi-select ZIP) to Markdown/JSON. Reachable from Options → *ChatGPT Export (Beta)*.
+  - **Manifest** — added `chatgpt.com` / `chat.openai.com` host permissions and exposed `chatgpt.html` as a web-accessible resource.
+  - **Tests** — 22 new unit tests (`tests/chatgpt_adapter.test.js`) covering branch reconstruction (including superseded-branch exclusion and leaf fallback), message filtering, text extraction, timestamp normalization, and rendering.
+  - **Scope note:** this is the *adapter + export* half only. A true ChatGPT *sync* additionally needs the Scry backend to learn `source_type: 'chatgpt'` (ingest / reconcile / verify-deletable), which lives outside this repo. Firefox mirror is pending (Chrome-first PoC).
+
 ## [2.0.1]
 
 - **Retry transient sync failures.** A single image-heavy conversation could fail with `TypeError: Failed to fetch` when Scry's Flask dev server dropped the large POST mid-flight. The sync loop now retries each ingest POST up to 2× with linear backoff (via a new tested `withRetry` in `scry_sync.js`), retrying on a thrown network error or a 5xx — but not on 4xx/auth. Failures that still exhaust retries continue to be caught per-conversation and picked up on the next run (they're never marked synced). 5 new unit tests.

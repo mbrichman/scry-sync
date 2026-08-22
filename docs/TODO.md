@@ -6,6 +6,12 @@
 
 ### High Priority 🟠
 
+- **ChatGPT support — follow-ups to the read-only PoC** (v2.6.0 shipped the Chrome adapter + export page)
+  - **Firefox mirror** — port `chatgpt_adapter.js`, `chatgpt.html`, `chatgpt.js`, and the manifest host-permission/web-accessible-resource additions into `firefox/` (MV2). The adapter is DOM/fetch-only, so it should port cleanly; verify credentialed cross-origin fetch to chatgpt.com works under MV2.
+  - **Wire into the real sync pipeline** — refactor the engine (`continuous_sync.js` / `scry_sync.js` / `scry_client.js`) to be multi-source, add a `chatgpt` adapter path alongside `claude`, and map `normalizeChatGptConversation` output onto `buildIngestPayload`. Requires the Scry backend to learn `source_type: 'chatgpt'` for ingest / reconcile / verify-deletable (outside this repo).
+  - **Image + file bytes** — the PoC renders image parts as placeholders. Full-fidelity capture needs resolving ChatGPT `file-service://` asset pointers via `backend-api/files/{id}/download` and bundling the bytes (the Claude adapter's `collectAllFiles` analog).
+  - **Auth hardening** — `/api/auth/session` token can expire mid-run; add refresh/retry. Watch for Cloudflare / rate-limit (429) handling on bulk enumeration.
+
 - **Prepare for new model families (e.g. Mythos)**
   - Source of truth: [Anthropic model IDs and versions docs](https://platform.claude.com/docs/en/about-claude/models/model-ids-and-versions)
   - Current `formatModelName` regex in [chrome/utils.js](../chrome/utils.js) hardcodes family ∈ `{sonnet, opus, haiku}` — anything else (e.g. expected `claude-mythos-preview`) falls through to raw-ID display and gets no badge color

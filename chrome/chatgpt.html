@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Scry Sync — ChatGPT Export (PoC)</title>
+  <style>
+    :root {
+      --bg-body: #f6f7f9;
+      --bg-card: #ffffff;
+      --text-primary: #2c313a;
+      --text-secondary: #666666;
+      --text-muted: #999999;
+      --border-color: #e2e4e9;
+      --primary-color: #10a37f;      /* ChatGPT green, to distinguish from the Claude flow */
+      --primary-hover: #0d8c6d;
+      --secondary-bg: #f8f9fa;
+      --error-color: #d32f2f;
+      --success-bg: #d1fae5;
+      --success-text: #065f46;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg-body: #1e1e1e;
+        --bg-card: #262626;
+        --text-primary: #e0e0e0;
+        --text-secondary: #b0b0b0;
+        --text-muted: #808080;
+        --border-color: #3a3a3a;
+        --secondary-bg: #2a2a2a;
+        --success-bg: #1a4d2e;
+        --success-text: #90ee90;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      margin: 0; padding: 0;
+      background: var(--bg-body); color: var(--text-primary);
+    }
+    .wrap { max-width: 860px; margin: 0 auto; padding: 28px 20px 60px; }
+    header h1 { font-size: 22px; margin: 0 0 4px; }
+    header .sub { color: var(--text-secondary); font-size: 13px; margin-bottom: 20px; }
+    .badge {
+      display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: .4px;
+      background: var(--primary-color); color: #fff; padding: 2px 8px; border-radius: 10px;
+      vertical-align: middle; margin-left: 8px;
+    }
+    .card {
+      background: var(--bg-card); border: 1px solid var(--border-color);
+      border-radius: 10px; padding: 18px 20px; margin-bottom: 16px;
+    }
+    button {
+      background: var(--primary-color); color: #fff; border: none;
+      padding: 9px 16px; border-radius: 6px; font-size: 14px; cursor: pointer;
+      transition: background .15s;
+    }
+    button:hover { background: var(--primary-hover); }
+    button:disabled { background: var(--border-color); color: var(--text-muted); cursor: not-allowed; }
+    button.ghost {
+      background: transparent; color: var(--primary-color);
+      border: 1px solid var(--primary-color); padding: 5px 10px; font-size: 12px;
+    }
+    button.ghost:hover { background: rgba(16,163,127,0.08); }
+    .status { font-size: 13px; margin: 12px 0 0; min-height: 18px; color: var(--text-secondary); }
+    .status.error { color: var(--error-color); }
+    .toolbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+    .count { color: var(--text-secondary); font-size: 13px; }
+    ul.convs { list-style: none; margin: 0; padding: 0; }
+    ul.convs li {
+      display: flex; align-items: center; gap: 12px;
+      padding: 10px 12px; border: 1px solid var(--border-color);
+      border-radius: 8px; margin-bottom: 8px; background: var(--secondary-bg);
+    }
+    ul.convs li input[type="checkbox"] { width: 16px; height: 16px; flex: none; }
+    .conv-main { flex: 1; min-width: 0; }
+    .conv-title { font-weight: 600; font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .conv-meta { color: var(--text-muted); font-size: 12px; margin-top: 2px; }
+    .conv-actions { display: flex; gap: 6px; flex: none; }
+    .note { font-size: 12px; color: var(--text-muted); margin-top: 6px; line-height: 1.5; }
+    code { background: var(--secondary-bg); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>ChatGPT Export <span class="badge">Proof of Concept</span></h1>
+      <div class="sub">
+        Read-only export of your ChatGPT conversations to Markdown or JSON. Runs entirely
+        in your browser against <code>chatgpt.com</code>. Nothing is synced to Scry.
+      </div>
+    </header>
+
+    <div class="card">
+      <div class="toolbar">
+        <button id="loadBtn">Load my ChatGPT conversations</button>
+        <span id="count" class="count"></span>
+      </div>
+      <div class="note">
+        You must be signed in to <code>chatgpt.com</code> in this browser. The first load
+        fetches your conversation list; each export fetches that conversation's full history.
+      </div>
+      <div id="status" class="status"></div>
+    </div>
+
+    <div class="card" id="listCard" style="display:none;">
+      <div class="toolbar">
+        <button id="selectAll" class="ghost">Select all</button>
+        <button id="selectNone" class="ghost">Select none</button>
+        <button id="exportSelMd">Export selected → Markdown (ZIP)</button>
+        <button id="exportSelJson">Export selected → JSON (ZIP)</button>
+      </div>
+      <ul class="convs" id="convList"></ul>
+    </div>
+  </div>
+
+  <script src="jszip.min.js"></script>
+  <script src="chatgpt_adapter.js"></script>
+  <script src="chatgpt.js"></script>
+</body>
+</html>
