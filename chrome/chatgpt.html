@@ -108,6 +108,11 @@
         <button id="selectNone" class="ghost">Select none</button>
         <button id="exportSelMd">Export selected → Markdown (ZIP)</button>
         <button id="exportSelJson">Export selected → JSON (ZIP)</button>
+        <button id="pushScry">Push selected → Scry</button>
+      </div>
+      <div style="font-size:12px;color:var(--text-secondary);margin-bottom:10px;">
+        Pushing sends each conversation to Scry verbatim; Scry decides the visible
+        branch and archives the full tree. Image bytes are not yet included.
       </div>
       <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-secondary);margin-bottom:10px;">
         <input type="checkbox" id="includeImages" checked>
@@ -119,6 +124,10 @@
 
   <script src="jszip.min.js"></script>
   <script src="chatgpt_adapter.js"></script>
+  <!-- loadScrySettings / ensureScryPermission / postToScry. Declarations only;
+       nothing in it runs at load, and the Claude-specific helpers it defines
+       are never called from this page. -->
+  <script src="scry_client.js"></script>
   <script src="chatgpt.js"></script>
 </body>
 </html>

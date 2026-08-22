@@ -355,3 +355,70 @@ describe('slugifyChatGptTitle', () => {
     expect(slugifyChatGptTitle('!!!')).toBe('chatgpt-conversation');
   });
 });
+
+// --- Scry ingest payload -----------------------------------------------------
+//
+// Scry expects the VERBATIM ChatGPT body: it performs the current_node -> root
+// branch walk server-side, so the import path and the fidelity-verification
+// path prune with the same code and agree by construction. The client must not
+// prune, and must not inline image bytes into message text.
+
+const { buildChatGptIngestPayload } = require('../chrome/chatgpt_adapter.js');
+
+describe('buildChatGptIngestPayload', () => {
+  const body = () => ({
+    conversation_id: 'c-1',
+    title: 'Fixture',
+    create_time: 1700000000,
+    update_time: 1700000100,
+    current_node: 'a1',
+    mapping: {
+      root: { id: 'root', parent: null, children: ['u1'], message: null },
+      u1: {
+        id: 'u1', parent: 'root', children: ['a0', 'a1'],
+        message: { author: { role: 'user' }, recipient: 'all',
+                   content: { content_type: 'text', parts: ['hi'] } },
+      },
+      a0: {
+        id: 'a0', parent: 'u1', children: [],
+        message: { author: { role: 'assistant' }, recipient: 'all',
+                   content: { content_type: 'text', parts: ['dead branch'] } },
+      },
+      a1: {
+        id: 'a1', parent: 'u1', children: [],
+        message: { author: { role: 'assistant' }, recipient: 'all',
+                   content: { content_type: 'text', parts: ['live branch'] } },
+      },
+    },
+  });
+
+  it('sends the body verbatim — no client-side pruning', () => {
+    const out = buildChatGptIngestPayload(body());
+    // The dead sibling MUST still be there: Scry decides what the branch is,
+    // and the archive it writes has to be the full tree.
+    expect(Object.keys(out.mapping).sort()).toEqual(['a0', 'a1', 'root', 'u1']);
+    expect(out.current_node).toBe('a1');
+    expect(out.conversation_id).toBe('c-1');
+  });
+
+  it("does not mutate the caller's body", () => {
+    const original = body();
+    buildChatGptIngestPayload(original, [{ file_uuid: 'f1', data: 'x' }]);
+    expect(original.files).toBeUndefined();
+  });
+
+  it('attaches files[] only when there are blobs', () => {
+    expect(buildChatGptIngestPayload(body()).files).toBeUndefined();
+    const withFiles = buildChatGptIngestPayload(body(), [
+      { file_uuid: 'f1', file_name: 'a.png', file_type: 'image/png',
+        file_variant: 'original', data: 'data:image/png;base64,AAAA' },
+    ]);
+    expect(withFiles.files).toHaveLength(1);
+    expect(withFiles.files[0].file_uuid).toBe('f1');
+  });
+
+  it('returns null for a non-object body rather than posting junk', () => {
+    expect(buildChatGptIngestPayload(null)).toBeNull();
+    expect(buildChatGptIngestPayload('nope')).toBeNull();
+  });
+});

@@ -480,11 +480,37 @@ async function fetchChatGptImageDataUrls(token, pointers, accountId, onEach) {
   return map;
 }
 
+// ===== PURE: the Scry ingest contract =====
+
+// Build the payload POSTed to Scry's /api/conversations/ingest.
+//
+// Scry expects the VERBATIM ChatGPT body. It performs the current_node -> root
+// branch walk SERVER-SIDE, so the import path and the fidelity-verification
+// path prune with the same code and agree by construction. That is why this
+// deliberately does NOT prune, and does not reuse normalizeChatGptConversation
+// (which is for the export/preview renderers): a client that pruned would put a
+// second branch rule in a second language, and any drift between the two would
+// read as a permanent capture gap on the server.
+//
+// It also does NOT inline image bytes into message text the way the export path
+// does — that would push base64 into Scry's message content AND into the
+// archived raw_json. Image bytes travel separately as fileBlobs, matching the
+// Claude path's files[] contract:
+//   [{ file_uuid, file_name, file_type, file_variant, data }]
+// (not yet populated for ChatGPT — images are a known gap in this first pass).
+function buildChatGptIngestPayload(body, fileBlobs = []) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const payload = { ...body };
+  if (Array.isArray(fileBlobs) && fileBlobs.length) payload.files = fileBlobs;
+  return payload;
+}
+
 // Node (vitest): expose the PURE surface for testing. Browser: these are globals.
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     getChatGptBranch,
     findDeepestLeaf,
+    buildChatGptIngestPayload,
     shouldSkipChatGptMessage,
     isDisplayableChatGptMessage,
     chatGptMessageText,

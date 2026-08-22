@@ -182,8 +182,71 @@ async function exportSelected(format) {
   }
 }
 
+// Push the selected conversations into Scry as first-class conversations.
+//
+// Each body goes VERBATIM — Scry walks current_node -> root itself, so the
+// client never decides what the visible branch is. One conversation failing
+// does not abort the run; failures are collected and reported, because a single
+// unreadable conversation shouldn't cost you the other forty.
+async function pushSelectedToScry() {
+  const ids = selectedIds();
+  if (ids.length === 0) { setStatus('Select at least one conversation first.', true); return; }
+
+  const scry = await loadScrySettings();
+  if (!scry.url) {
+    setStatus('Set your Scry URL and service token in the extension options first.', true);
+    return;
+  }
+  if (!(await ensureScryPermission(scry.url))) {
+    setStatus(`Permission to reach ${scry.url} was denied.`, true);
+    return;
+  }
+
+  const byId = new Map(conversations.map((c) => [c.id, c]));
+  const btn = $('pushScry');
+  btn.disabled = true;
+  let pushed = 0;
+  const failures = [];
+
+  try {
+    await ensureToken();
+    for (const id of ids) {
+      const conv = byId.get(id);
+      const label = (conv && conv.title) || id;
+      setStatus(`Pushing ${pushed + failures.length + 1}/${ids.length}: "${label}"…`);
+      try {
+        const body = await fetchChatGptConversation(accessToken, id);
+        const resp = await postToScry(scry, buildChatGptIngestPayload(body));
+        if (!resp.ok || !resp.body || !resp.body.success) {
+          throw new Error((resp.body && resp.body.error) || `HTTP ${resp.status}`);
+        }
+        pushed++;
+      } catch (err) {
+        console.error('Scry push failed for', id, err);
+        failures.push(`"${label}": ${err.message || err}`);
+      }
+    }
+
+    if (failures.length === 0) {
+      setStatus(`Pushed ${pushed} conversation${pushed === 1 ? '' : 's'} to Scry ✓`);
+    } else {
+      setStatus(
+        `Pushed ${pushed}/${ids.length}. ${failures.length} failed — ${failures.join('; ')}`,
+        true
+      );
+    }
+  } catch (err) {
+    // Only auth/setup failures reach here; per-conversation errors are caught above.
+    console.error(err);
+    setStatus(err.message || String(err), true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   $('loadBtn').addEventListener('click', loadConversations);
+  $('pushScry').addEventListener('click', pushSelectedToScry);
   $('selectAll').addEventListener('click', () =>
     document.querySelectorAll('.conv-check').forEach((cb) => { cb.checked = true; }));
   $('selectNone').addEventListener('click', () =>
