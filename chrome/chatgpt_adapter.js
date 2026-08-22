@@ -22,6 +22,7 @@
 // ===== Constants =====
 
 const CHATGPT_ORIGIN = 'https://chatgpt.com';
+const CHATGPT_API = 'https://chatgpt.com/backend-api';
 
 // ===== PURE: branch reconstruction =====
 
@@ -83,26 +84,66 @@ function findDeepestLeaf(mapping) {
 
 // ===== PURE: message classification + text extraction =====
 
-// Should this message appear in an export? Drops system prompts, visually
-// hidden scaffolding, and empty/zero-weight turns. Tool messages are kept only
-// when they carry visible text (e.g. DALL·E / code output shown to the user).
-function isDisplayableChatGptMessage(message) {
-  if (!message || !message.author) return false;
-  const role = message.author.role;
-  if (role === 'system') return false;
+// Does a tool `execution_output` message carry rendered images (code-interpreter
+// plots)? Those live in metadata.aggregate_result.messages[].image_url.
+function _hasExecutionImages(message) {
+  const msgs = message && message.metadata && message.metadata.aggregate_result
+    && message.metadata.aggregate_result.messages;
+  return Array.isArray(msgs) && msgs.some((m) => m && m.message_type === 'image');
+}
+
+// Does a multimodal_text message contain an image part?
+function _hasMultimodalImage(message) {
+  const parts = message && message.content && message.content.parts;
+  return Array.isArray(parts) && parts.some((p) =>
+    p && typeof p === 'object' && p.content_type === 'image_asset_pointer');
+}
+
+// Port of chatgpt-exporter's shouldSkipMessageInExport (pionxzh/chatgpt-exporter,
+// src/api.ts) plus the system/context skips it applies during the branch walk.
+// This is the authority on what NEVER belongs in an export:
+//   - no content
+//   - recipient !== 'all'  → the message is addressed to a tool, not the user
+//     (assistant calling python/browser/dalle). THE key filter my first pass missed.
+//   - thoughts / reasoning_recap → hidden chain-of-thought
+//   - is_visually_hidden_from_conversation → internal system scaffolding
+//   - system role, model_editable_context, user_editable_context → prompts/memory
+//   - tool role: only kept when it actually renders an image to the user
+function shouldSkipChatGptMessage(message) {
+  if (!message || !message.content || !message.author) return true;
+
+  // Addressed to a tool, not shown to the user.
+  if (message.recipient && message.recipient !== 'all') return true;
+
+  const type = message.content.content_type;
+  if (type === 'thoughts' || type === 'reasoning_recap') return true;
 
   const meta = message.metadata || {};
-  if (meta.is_visually_hidden_from_conversation === true) return false;
+  if (meta.is_visually_hidden_from_conversation === true) return true;
 
-  // weight 0 marks a superseded/■ pruned turn in some payloads.
-  if (message.weight === 0) return false;
+  const role = message.author.role;
+  if (role === 'system') return true;
+  if (type === 'model_editable_context' || type === 'user_editable_context') return true;
 
+  if (role === 'tool') {
+    if (message.author.name === 'file_search') return true;
+    if (!_hasExecutionImages(message) && !_hasMultimodalImage(message)) return true;
+  }
+
+  return false;
+}
+
+// Should this message appear in an export? Applies the skip rules above, then
+// drops anything that renders to empty text (a bare zero-weight/blank turn).
+function isDisplayableChatGptMessage(message) {
+  if (shouldSkipChatGptMessage(message)) return false;
+  if (message.weight === 0) return false; // superseded/pruned turn
   return chatGptMessageText(message).trim().length > 0;
 }
 
 // Extract displayable text from a ChatGPT message's content, across the content
-// types the web app produces. Image parts in multimodal_text are rendered as a
-// markdown placeholder (this PoC does not fetch image bytes).
+// types the web app produces. Image parts are rendered as markdown placeholders
+// (this PoC does not fetch image bytes — see collectChatGptImagePointers).
 function chatGptMessageText(message) {
   const content = message && message.content;
   if (!content) return '';
@@ -114,9 +155,11 @@ function chatGptMessageText(message) {
     return content.parts.map((part) => {
       if (typeof part === 'string') return part;
       if (part && typeof part === 'object') {
-        // image_asset_pointer and friends — render a stable placeholder.
         if (part.content_type === 'image_asset_pointer' || part.asset_pointer) {
           return `![image](${part.asset_pointer || 'image'})`;
+        }
+        if (part.content_type === 'audio_transcription' && typeof part.text === 'string') {
+          return `[audio] ${part.text}`;
         }
         if (typeof part.text === 'string') return part.text;
       }
@@ -124,13 +167,27 @@ function chatGptMessageText(message) {
     }).filter(Boolean).join('\n');
   }
 
-  // code: the source lives on content.text; wrap it fenced.
+  // code (plugin/tool source): wrap fenced.
   if (type === 'code' && typeof content.text === 'string') {
     const lang = content.language && content.language !== 'unknown' ? content.language : '';
     return '```' + lang + '\n' + content.text + '\n```';
   }
 
-  // execution_output / tether_* and other text-bearing types.
+  // execution_output: prefer rendered images (code-interpreter plots) over text.
+  if (type === 'execution_output') {
+    if (_hasExecutionImages(message)) {
+      return message.metadata.aggregate_result.messages
+        .filter((m) => m && m.message_type === 'image')
+        .map((m) => `![image](${m.image_url})`)
+        .join('\n');
+    }
+    if (typeof content.text === 'string') return content.text;
+  }
+
+  // tether_browsing_display / other result-bearing types.
+  if (typeof content.result === 'string') return content.result;
+
+  // tether_quote and any other text-bearing type.
   if (typeof content.text === 'string') return content.text;
 
   return '';
@@ -154,13 +211,26 @@ function chatGptTimeToIso(t) {
   return null;
 }
 
+// Determine the conversation's model slug. ChatGPT rarely sets a top-level
+// default_model_slug, so — like chatgpt-exporter — fall back to the first
+// message metadata that carries one.
+function extractChatGptModelSlug(data) {
+  if (data && data.default_model_slug) return data.default_model_slug;
+  const mapping = (data && data.mapping) || {};
+  for (const node of Object.values(mapping)) {
+    const slug = node && node.message && node.message.metadata && node.message.metadata.model_slug;
+    if (slug) return slug;
+  }
+  return null;
+}
+
 // Reduce a raw ChatGPT conversation body to a source-agnostic shape. This is the
 // adapter's contract: whatever the source, we produce { id, title, created_at,
 // updated_at, model, messages: [{ role, text, model, created_at }] }. That shape
 // is what a future buildIngestPayload-style step (or the exporter below) consumes.
 function normalizeChatGptConversation(data) {
   const branch = getChatGptBranch(data).filter(isDisplayableChatGptMessage);
-  const convModel = data.default_model_slug || null;
+  const convModel = extractChatGptModelSlug(data);
 
   const messages = branch.map((m) => ({
     role: m.author && m.author.role ? m.author.role : 'unknown',
@@ -242,6 +312,17 @@ function slugifyChatGptTitle(title) {
 // These are only exercised in the browser (the PoC page). They reference the
 // global `fetch`, so they are intentionally excluded from the Node export block.
 
+// Thrown on HTTP 429, carrying the server's Retry-After (ms). Mirrors
+// chatgpt-exporter's RateLimitError so callers can back off instead of failing.
+class ChatGptRateLimitError extends Error {
+  constructor(retryAfterHeader) {
+    super('ChatGPT rate limit (429) — wait and retry.');
+    this.name = 'ChatGptRateLimitError';
+    const secs = retryAfterHeader != null ? parseInt(retryAfterHeader, 10) : NaN;
+    this.retryAfterMs = Number.isFinite(secs) && secs > 0 ? secs * 1000 : 30000;
+  }
+}
+
 // Pull the session access token. Every backend-api read needs it as a bearer.
 // Relies on the browser's chatgpt.com session cookies (host_permissions grants
 // credentialed cross-origin fetch from the extension page).
@@ -256,26 +337,44 @@ async function getChatGptAccessToken() {
   return data.accessToken;
 }
 
-function chatGptAuthHeaders(token) {
-  return { 'Accept': 'application/json', 'Authorization': `Bearer ${token}` };
+// ChatGPT's edge expects the bearer under BOTH Authorization and X-Authorization
+// (chatgpt-exporter sends both). accountId, when known, targets a team workspace
+// via Chatgpt-Account-Id. Note: this PoC page runs off-origin, so it cannot read
+// the `_account` cookie to auto-detect a team workspace — team support is a
+// follow-up (see docs/TODO.md); personal accounts work with token alone.
+function chatGptAuthHeaders(token, accountId) {
+  const h = {
+    'Accept': 'application/json',
+    'Authorization': `Bearer ${token}`,
+    'X-Authorization': `Bearer ${token}`,
+  };
+  if (accountId) h['Chatgpt-Account-Id'] = accountId;
+  return h;
 }
 
-// One page of the conversation list.
-async function listChatGptConversations(token, { offset = 0, limit = 28 } = {}) {
-  const url = `${CHATGPT_ORIGIN}/backend-api/conversations?offset=${offset}&limit=${limit}&order=updated`;
-  const resp = await fetch(url, { credentials: 'include', headers: chatGptAuthHeaders(token) });
-  if (!resp.ok) throw new Error(`conversations list ${resp.status}`);
+// Credentialed backend-api GET with 429 awareness.
+async function chatGptApiGet(url, token, accountId) {
+  const resp = await fetch(url, { credentials: 'include', headers: chatGptAuthHeaders(token, accountId) });
+  if (resp.status === 429) throw new ChatGptRateLimitError(resp.headers.get('Retry-After'));
+  if (!resp.ok) throw new Error(`${url}: ${resp.status}`);
   return resp.json();
 }
 
+// One page of the conversation list.
+async function listChatGptConversations(token, { offset = 0, limit = 28, accountId = null } = {}) {
+  const url = `${CHATGPT_API}/conversations?offset=${offset}&limit=${limit}`;
+  return chatGptApiGet(url, token, accountId);
+}
+
 // Enumerate ALL conversations by paginating until exhausted. `onProgress(count)`
-// is called after each page so the UI can show progress.
-async function listAllChatGptConversations(token, onProgress) {
+// is called after each page so the UI can show progress. A 429 is surfaced to the
+// caller (with retryAfterMs) rather than silently retried.
+async function listAllChatGptConversations(token, onProgress, accountId) {
   const limit = 100;
   let offset = 0;
   const all = [];
   for (;;) {
-    const page = await listChatGptConversations(token, { offset, limit });
+    const page = await listChatGptConversations(token, { offset, limit, accountId });
     const items = (page && page.items) || [];
     all.push(...items);
     if (onProgress) onProgress(all.length);
@@ -287,11 +386,9 @@ async function listAllChatGptConversations(token, onProgress) {
 }
 
 // Fetch one conversation's full body (the mapping tree).
-async function fetchChatGptConversation(token, conversationId) {
-  const url = `${CHATGPT_ORIGIN}/backend-api/conversation/${conversationId}`;
-  const resp = await fetch(url, { credentials: 'include', headers: chatGptAuthHeaders(token) });
-  if (!resp.ok) throw new Error(`conversation ${conversationId}: ${resp.status}`);
-  return resp.json();
+async function fetchChatGptConversation(token, conversationId, accountId) {
+  const url = `${CHATGPT_API}/conversation/${conversationId}`;
+  return chatGptApiGet(url, token, accountId);
 }
 
 // Node (vitest): expose the PURE surface for testing. Browser: these are globals.
@@ -299,9 +396,11 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     getChatGptBranch,
     findDeepestLeaf,
+    shouldSkipChatGptMessage,
     isDisplayableChatGptMessage,
     chatGptMessageText,
     chatGptTimeToIso,
+    extractChatGptModelSlug,
     normalizeChatGptConversation,
     convertChatGptToMarkdown,
     chatGptConversationToJson,

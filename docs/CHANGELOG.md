@@ -7,7 +7,8 @@
   - **`chatgpt.html` / `chatgpt.js`** — a standalone PoC page: load your ChatGPT conversation list, export any conversation (or a multi-select ZIP) to Markdown/JSON. Reachable from Options → *ChatGPT Export (Beta)*.
   - **Manifest** — added `chatgpt.com` / `chat.openai.com` host permissions and exposed `chatgpt.html` as a web-accessible resource.
   - **Tests** — 22 new unit tests (`tests/chatgpt_adapter.test.js`) covering branch reconstruction (including superseded-branch exclusion and leaf fallback), message filtering, text extraction, timestamp normalization, and rendering.
-  - **Scope note:** this is the *adapter + export* half only. A true ChatGPT *sync* additionally needs the Scry backend to learn `source_type: 'chatgpt'` (ingest / reconcile / verify-deletable), which lives outside this repo. Firefox mirror is pending (Chrome-first PoC).
+  - **Hardened against the reference implementation** (pionxzh/chatgpt-exporter). Cross-checked the adapter against their `src/api.ts` and fixed real gaps: skip messages addressed to a tool (`recipient !== 'all'`) so tool-call payloads no longer leak into exports; skip hidden `thoughts`/`reasoning_recap` and `model_editable_context`/`user_editable_context`; keep tool messages only when they render an image; send `X-Authorization` alongside `Authorization` (and plumb `Chatgpt-Account-Id` for team accounts); add `ChatGptRateLimitError` (429 + `Retry-After`); render code-interpreter images from `aggregate_result`; derive the model by scanning message `model_slug` when `default_model_slug` is absent. +10 tests (32 in the ChatGPT suite, 182 total).
+  - **Scope note:** this is the *adapter + export* half only. A true ChatGPT *sync* additionally needs the Scry backend to learn `source_type: 'chatgpt'` (ingest / reconcile / verify-deletable), which lives outside this repo. Firefox mirror, image-byte capture, and team-account auto-detection are pending (Chrome-first PoC) — see docs/TODO.md.
 
 ## [2.0.1]
 

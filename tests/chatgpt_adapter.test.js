@@ -8,9 +8,11 @@ import { describe, it, expect } from 'vitest';
 
 const {
   getChatGptBranch,
+  shouldSkipChatGptMessage,
   isDisplayableChatGptMessage,
   chatGptMessageText,
   chatGptTimeToIso,
+  extractChatGptModelSlug,
   normalizeChatGptConversation,
   convertChatGptToMarkdown,
   chatGptConversationToJson,
@@ -126,6 +128,69 @@ describe('isDisplayableChatGptMessage', () => {
     expect(isDisplayableChatGptMessage({
       author: { role: 'assistant' }, weight: 0, content: { content_type: 'text', parts: ['x'] },
     })).toBe(false);
+  });
+});
+
+describe('shouldSkipChatGptMessage (ported from chatgpt-exporter)', () => {
+  const base = { author: { role: 'assistant' }, recipient: 'all', content: { content_type: 'text', parts: ['x'] } };
+  it('skips messages addressed to a tool (recipient !== all)', () => {
+    expect(shouldSkipChatGptMessage({ ...base, recipient: 'python' })).toBe(true);
+    expect(shouldSkipChatGptMessage({ ...base, recipient: 'browser' })).toBe(true);
+  });
+  it('skips hidden reasoning content types', () => {
+    expect(shouldSkipChatGptMessage({ ...base, content: { content_type: 'thoughts', thoughts: [] } })).toBe(true);
+    expect(shouldSkipChatGptMessage({ ...base, content: { content_type: 'reasoning_recap', content: 'x' } })).toBe(true);
+  });
+  it('skips memory/custom-instruction context', () => {
+    expect(shouldSkipChatGptMessage({ ...base, content: { content_type: 'model_editable_context', model_set_context: 'x' } })).toBe(true);
+    expect(shouldSkipChatGptMessage({ ...base, content: { content_type: 'user_editable_context', user_profile: 'x', user_instructions: 'y' } })).toBe(true);
+  });
+  it('skips system and visually-hidden', () => {
+    expect(shouldSkipChatGptMessage({ ...base, author: { role: 'system' } })).toBe(true);
+    expect(shouldSkipChatGptMessage({ ...base, metadata: { is_visually_hidden_from_conversation: true } })).toBe(true);
+  });
+  it('skips file_search tool and text-only tool messages, keeps tool image output', () => {
+    expect(shouldSkipChatGptMessage({ author: { role: 'tool', name: 'file_search' }, recipient: 'all', content: { content_type: 'text', parts: ['x'] } })).toBe(true);
+    expect(shouldSkipChatGptMessage({ author: { role: 'tool' }, recipient: 'all', content: { content_type: 'execution_output', text: 'log' } })).toBe(true);
+    const toolImage = {
+      author: { role: 'tool' }, recipient: 'all',
+      content: { content_type: 'execution_output', text: '' },
+      metadata: { aggregate_result: { messages: [{ message_type: 'image', image_url: 'sediment://x' }] } },
+    };
+    expect(shouldSkipChatGptMessage(toolImage)).toBe(false);
+  });
+  it('keeps a normal assistant text message', () => {
+    expect(shouldSkipChatGptMessage(base)).toBe(false);
+  });
+});
+
+describe('recipient filtering in the branch', () => {
+  it('excludes a tool-call node (recipient python) from normalized output', () => {
+    const conv = {
+      conversation_id: 'c',
+      current_node: 'a',
+      mapping: {
+        root: { id: 'root', message: { author: { role: 'system' }, content: { content_type: 'text', parts: [''] } }, parent: null, children: ['u'] },
+        u: { id: 'u', message: { author: { role: 'user' }, recipient: 'all', content: { content_type: 'text', parts: ['do it'] } }, parent: 'root', children: ['tc'] },
+        tc: { id: 'tc', message: { author: { role: 'assistant' }, recipient: 'python', content: { content_type: 'code', text: 'run()' } }, parent: 'u', children: ['a'] },
+        a: { id: 'a', message: { author: { role: 'assistant' }, recipient: 'all', content: { content_type: 'text', parts: ['done'] } }, parent: 'tc', children: [] },
+      },
+    };
+    const n = normalizeChatGptConversation(conv);
+    expect(n.messages.map((m) => m.text)).toEqual(['do it', 'done']);
+  });
+});
+
+describe('extractChatGptModelSlug', () => {
+  it('prefers default_model_slug', () => {
+    expect(extractChatGptModelSlug({ default_model_slug: 'gpt-4o', mapping: {} })).toBe('gpt-4o');
+  });
+  it('falls back to the first message model_slug', () => {
+    const data = { mapping: { n: { message: { metadata: { model_slug: 'gpt-5-1-thinking' } } } } };
+    expect(extractChatGptModelSlug(data)).toBe('gpt-5-1-thinking');
+  });
+  it('returns null when none present', () => {
+    expect(extractChatGptModelSlug({ mapping: {} })).toBeNull();
   });
 });
 
