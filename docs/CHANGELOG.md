@@ -1,5 +1,27 @@
 # Changelog
 
+## [2.7.2] — ChatGPT push: image bytes travel with the conversation
+
+- **Images now come over on push.** With the image toggle on, *Push selected → Scry* resolves every image asset in the conversation (whole tree, deduped) via `GET backend-api/files/download/:id` → signed URL → bytes, and sends them in the ingest body's `files[]` — the same contract the Claude path uses: `{ file_uuid, file_name, file_type, file_variant: 'original', data }`. Message text stays verbatim; no base64 is inlined into content or the archive.
+  - **`file_uuid` is the asset id** (`sediment://file_<hex>` → `file_<hex>`, `file-service://file-<b62>` → `file-<b62>`), extracted by `chatGptAssetId` with the same "after `://`" anchoring as Scry's `extract_asset_id`, because that id is what Scry stores the bytes under and links the message's image record to. Requires the matching Scry change (scry PR #107) that keeps tool-rendered image turns and stamps image records with their asset id.
+  - New pure helpers `chatGptAssetId`, `buildChatGptFileBlob`; `collectChatGptImagePointers(data, { wholeTree })`; impure `fetchChatGptFileBlobs` (per-pointer failures logged and skipped, 429-aware). Per-image progress in the status line.
+  - +8 tests (57 in the ChatGPT suite, 207 total). Non-image uploads (PDFs, docs) are still not fetched — see docs/TODO.md.
+
+## [2.7.1] — ChatGPT push: live-run hardening
+
+- **Identity fallback.** `buildChatGptIngestPayload(body, files, fallbackConversationId)` fills `conversation_id` from the list endpoint's id when the fetched body carries none. Scry keys both the conversation row and its verbatim archive on that id; without it a push would import with no source id and skip fidelity capture entirely. A body's own id always wins.
+- **Rate-limit backoff in the push loop.** New `withChatGptRateLimitRetry(fn, {maxRetries, sleep, onRetry})` waits chatgpt.com's `Retry-After` and retries (2×) on a 429 instead of failing that conversation; the page shows "Rate limited — waiting Ns". Non-429 errors propagate untouched. Body fetches in *Push selected → Scry* now go through it.
+- **Copy.** The export page and the Options section no longer claim "nothing is synced to Scry"; they now say reads are read-only and nothing is ever deleted at the source.
+- +7 tests (49 in the ChatGPT suite, 199 total). Image bytes are still not sent on push (known gap, see docs/TODO.md).
+
+## [2.7.0] — Push ChatGPT conversations to Scry (Chrome)
+
+- **The PoC page can now push selected conversations into Scry** via the same `/api/conversations/ingest` the Claude sync uses (*Push selected → Scry*). Reuses `loadScrySettings` / `ensureScryPermission` / `postToScry` from `scry_client.js`; no manifest permission change — `optional_host_permissions` already covers any Scry origin.
+  - **The body goes VERBATIM.** Scry walks `current_node → root` server-side, so import and fidelity verification prune with the same code and agree by construction. `buildChatGptIngestPayload` deliberately does not reuse `normalizeChatGptConversation` (that stays for the exporters): a client-side prune would be a second branch rule in a second language, and any drift would read on the server as a permanent capture gap.
+  - One conversation failing does not abort the run; failures are collected and reported per conversation.
+  - **Known gap:** image bytes are not sent. The export path inlines them as data URIs into message text, which for a sync would push base64 into Scry's content and archived raw_json; they need the Claude path's separate `files[]` blob contract. Until then a pushed conversation carries its text, not its images.
+  - Requires Scry's ingest to accept `mapping` bodies (scry PR #46, live). +4 tests (192 total).
+
 ## [2.6.1] — ChatGPT export: image byte capture (Chrome)
 
 - **Images now export as real bytes, not placeholders.** The PoC resolves each ChatGPT image asset pointer (`sediment://` / `file-service://`) via `GET backend-api/files/download/:id` → signed URL → fetches the bytes → inlines them as a data URI, so uploaded images and code-interpreter plots actually render in the exported Markdown/JSON. Covers both multimodal image parts and `aggregate_result` output images.

@@ -206,12 +206,20 @@ function chatGptMessageText(message, imageMap = {}) {
 // rendered: multimodal image parts (`image_asset_pointer`) and code-interpreter
 // output images (`aggregate_result.messages[].image_url`). These are the pointers
 // fetchChatGptImageDataUrls resolves to bytes. Pure/testable.
-function collectChatGptImagePointers(data) {
+//
+// By default only the visible branch is walked (what the exporters render).
+// Pass { wholeTree: true } to walk EVERY node — the Scry push uses that so the
+// bytes travel with the verbatim, unpruned archive Scry keeps: an image on a
+// regenerated-away sibling is still part of the record Scry holds.
+function collectChatGptImagePointers(data, { wholeTree = false } = {}) {
   const out = [];
   const seen = new Set();
   const push = (p) => { if (p && !seen.has(p)) { seen.add(p); out.push(p); } };
 
-  for (const message of getChatGptBranch(data)) {
+  const messages = wholeTree
+    ? Object.values((data && data.mapping) || {}).map((n) => n && n.message).filter(Boolean)
+    : getChatGptBranch(data);
+  for (const message of messages) {
     const content = message && message.content;
     if (content && content.content_type === 'multimodal_text' && Array.isArray(content.parts)) {
       for (const part of content.parts) {
@@ -430,6 +438,42 @@ async function fetchChatGptConversation(token, conversationId, accountId) {
   return chatGptApiGet(url, token, accountId);
 }
 
+// ===== PURE: asset ids + the files[] record =====
+
+// The id token after the pointer's scheme: `sediment://file_<hex>` -> file_<hex>,
+// `file-service://file-<b62>` -> file-<b62>. MUST agree with Scry's
+// extract_asset_id (db/services/chatgpt_media_resolver.py): that id is the
+// file_uuid Scry stores the bytes under AND the key attach_download_urls links
+// a message's image record to. Anchored after "://" on purpose — the scheme
+// name "file-service" itself matches file[-_][A-Za-z0-9]+ and must not win.
+const _ASSET_ID_AFTER_SCHEME_RE = /:\/\/(file[-_][A-Za-z0-9]+)/;
+function chatGptAssetId(pointer) {
+  if (typeof pointer !== 'string' || !pointer) return null;
+  const m = _ASSET_ID_AFTER_SCHEME_RE.exec(pointer);
+  return m ? m[1] : null;
+}
+
+const _MIME_EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' };
+
+// One entry of Scry's ingest files[] contract (the same shape the Claude path
+// sends): { file_uuid, file_name, file_type, file_variant, data }. `meta` is the
+// files/download response (file_name, mime_type); `dataUrl` the fetched bytes.
+function buildChatGptFileBlob(pointer, meta, dataUrl) {
+  const id = chatGptAssetId(pointer);
+  if (!id || typeof dataUrl !== 'string' || !dataUrl) return null;
+  const m = meta || {};
+  const urlMime = (/^data:([^;,]+)/.exec(dataUrl) || [])[1] || null;
+  const fileType = m.mime_type || urlMime || 'application/octet-stream';
+  const ext = _MIME_EXT[fileType] || (fileType.split('/')[1] || 'bin');
+  return {
+    file_uuid: id,
+    file_name: m.file_name || `${id}.${ext}`,
+    file_type: fileType,
+    file_variant: 'original',
+    data: dataUrl,
+  };
+}
+
 // ===== IMPURE: image byte capture =====
 
 function _blobToDataUrl(blob) {
@@ -448,7 +492,7 @@ function _blobToDataUrl(blob) {
 // The bytes host (e.g. *.oaiusercontent.com) must be in host_permissions for the
 // extension to read the cross-origin response. Returns null on any failure so the
 // renderer falls back to a placeholder rather than aborting the export.
-async function fetchChatGptImageDataUrl(token, pointer, accountId) {
+async function _fetchChatGptAsset(token, pointer, accountId) {
   const id = String(pointer || '').replace(/^\w[\w+.-]*:\/\//, ''); // strip scheme://
   if (!id) return null;
   const meta = await chatGptApiGet(
@@ -456,10 +500,38 @@ async function fetchChatGptImageDataUrl(token, pointer, accountId) {
   if (!meta || meta.status !== 'success' || !meta.download_url) return null;
   const resp = await fetch(meta.download_url, { credentials: 'omit' });
   if (!resp.ok) throw new Error(`image bytes ${resp.status}`);
-  const dataUrl = await _blobToDataUrl(await resp.blob());
+  const raw = await _blobToDataUrl(await resp.blob());
   // Prefer the real content-type over FileReader's guess.
   const ct = resp.headers.get('content-type') || meta.mime_type;
-  return ct ? dataUrl.replace(/^data:[^;,]*/, `data:${ct}`) : dataUrl;
+  const dataUrl = ct ? raw.replace(/^data:[^;,]*/, `data:${ct.split(';')[0].trim()}`) : raw;
+  return { meta: { ...meta, mime_type: (ct || meta.mime_type || '').split(';')[0].trim() || meta.mime_type }, dataUrl };
+}
+
+async function fetchChatGptImageDataUrl(token, pointer, accountId) {
+  const got = await _fetchChatGptAsset(token, pointer, accountId);
+  return got ? got.dataUrl : null;
+}
+
+// Fetch the ORIGINAL bytes of every image asset in the conversation (whole tree)
+// as Scry files[] records — the ChatGPT analog of the Claude path's
+// fetchConversationFileBlobs. Failures are logged and skipped so one dead
+// signed URL never costs the push; `onEach()` fires per pointer for progress.
+async function fetchChatGptFileBlobs(token, body, accountId, onEach) {
+  const pointers = collectChatGptImagePointers(body, { wholeTree: true });
+  const out = [];
+  await Promise.all(pointers.map(async (pointer) => {
+    try {
+      const got = await withChatGptRateLimitRetry(() => _fetchChatGptAsset(token, pointer, accountId));
+      const rec = got ? buildChatGptFileBlob(pointer, got.meta, got.dataUrl) : null;
+      if (rec) out.push(rec);
+      else console.warn('ChatGPT push: no bytes for', pointer);
+    } catch (e) {
+      console.warn('ChatGPT push: file fetch failed for', pointer, e);
+    } finally {
+      if (onEach) onEach();
+    }
+  }));
+  return out;
 }
 
 // Resolve many pointers concurrently into a { pointer -> data URL } map. Failures
@@ -497,12 +569,38 @@ async function fetchChatGptImageDataUrls(token, pointers, accountId, onEach) {
 // archived raw_json. Image bytes travel separately as fileBlobs, matching the
 // Claude path's files[] contract:
 //   [{ file_uuid, file_name, file_type, file_variant, data }]
-// (not yet populated for ChatGPT — images are a known gap in this first pass).
-function buildChatGptIngestPayload(body, fileBlobs = []) {
+// Populated for ChatGPT by fetchChatGptFileBlobs (image assets, whole tree).
+//
+// `fallbackConversationId` is the id the LIST endpoint gave us for this body.
+// Scry keys the row and the archive on `conversation_id`; a body without one
+// would import with no source id and skip fidelity capture entirely (the
+// archive is only written when there is an id to attach it to). The fallback
+// is only used when the body carries none — a body's own id always wins.
+function buildChatGptIngestPayload(body, fileBlobs = [], fallbackConversationId = null) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
   const payload = { ...body };
+  if (!payload.conversation_id && fallbackConversationId) {
+    payload.conversation_id = fallbackConversationId;
+  }
   if (Array.isArray(fileBlobs) && fileBlobs.length) payload.files = fileBlobs;
   return payload;
+}
+
+// Run `fn` and, on a ChatGptRateLimitError, wait the server's Retry-After and
+// try again (up to `maxRetries` more times). Any other error propagates
+// untouched. `sleep`/`onRetry` are injectable so this is testable in Node and
+// so the page can show "rate limited, waiting Ns" instead of going quiet.
+async function withChatGptRateLimitRetry(fn, { maxRetries = 2, sleep = null, onRetry = null } = {}) {
+  const doSleep = sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await fn();
+    } catch (e) {
+      if (!(e instanceof ChatGptRateLimitError) || attempt >= maxRetries) throw e;
+      if (onRetry) onRetry(e.retryAfterMs);
+      await doSleep(e.retryAfterMs);
+    }
+  }
 }
 
 // Node (vitest): expose the PURE surface for testing. Browser: these are globals.
@@ -511,6 +609,10 @@ if (typeof module !== 'undefined' && module.exports) {
     getChatGptBranch,
     findDeepestLeaf,
     buildChatGptIngestPayload,
+    withChatGptRateLimitRetry,
+    ChatGptRateLimitError,
+    chatGptAssetId,
+    buildChatGptFileBlob,
     shouldSkipChatGptMessage,
     isDisplayableChatGptMessage,
     chatGptMessageText,

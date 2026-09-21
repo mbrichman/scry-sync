@@ -422,3 +422,147 @@ describe('buildChatGptIngestPayload', () => {
     expect(buildChatGptIngestPayload('nope')).toBeNull();
   });
 });
+
+// ===== live-push hardening =====
+
+describe('buildChatGptIngestPayload — identity fallback', () => {
+  const { buildChatGptIngestPayload } = require('../chrome/chatgpt_adapter.js');
+  const body = () => ({
+    title: 'No id on the body',
+    create_time: 1700000000,
+    current_node: 'a1',
+    mapping: { a1: { id: 'a1', parent: null, children: [], message: null } },
+  });
+
+  it('fills conversation_id from the list id when the body lacks one', () => {
+    // Scry keys the row AND the archive on conversation_id; a body without it
+    // would import with no source id and skip fidelity capture entirely.
+    const out = buildChatGptIngestPayload(body(), [], 'list-id-9');
+    expect(out.conversation_id).toBe('list-id-9');
+  });
+
+  it("never overrides a conversation_id the body already carries", () => {
+    const b = { ...body(), conversation_id: 'body-id' };
+    expect(buildChatGptIngestPayload(b, [], 'list-id-9').conversation_id).toBe('body-id');
+  });
+
+  it('leaves the body untouched when no fallback is given', () => {
+    expect(buildChatGptIngestPayload(body()).conversation_id).toBeUndefined();
+  });
+});
+
+describe('withChatGptRateLimitRetry', () => {
+  const { withChatGptRateLimitRetry, ChatGptRateLimitError } = require('../chrome/chatgpt_adapter.js');
+
+  it('returns the value when the call succeeds first time', async () => {
+    const sleeps = [];
+    const out = await withChatGptRateLimitRetry(async () => 'ok', { sleep: (ms) => { sleeps.push(ms); } });
+    expect(out).toBe('ok');
+    expect(sleeps).toEqual([]);
+  });
+
+  it('waits Retry-After and retries on a 429, then succeeds', async () => {
+    let calls = 0;
+    const sleeps = [];
+    const retries = [];
+    const out = await withChatGptRateLimitRetry(async () => {
+      calls++;
+      if (calls === 1) throw new ChatGptRateLimitError('7');
+      return 'second';
+    }, { sleep: (ms) => { sleeps.push(ms); }, onRetry: (ms) => retries.push(ms) });
+    expect(out).toBe('second');
+    expect(calls).toBe(2);
+    expect(sleeps).toEqual([7000]);
+    expect(retries).toEqual([7000]);
+  });
+
+  it('gives up after maxRetries and rethrows the rate-limit error', async () => {
+    let calls = 0;
+    const sleeps = [];
+    await expect(withChatGptRateLimitRetry(async () => {
+      calls++;
+      throw new ChatGptRateLimitError(null); // no header -> 30s default
+    }, { maxRetries: 2, sleep: (ms) => { sleeps.push(ms); } })).rejects.toBeInstanceOf(ChatGptRateLimitError);
+    expect(calls).toBe(3);
+    expect(sleeps).toEqual([30000, 30000]);
+  });
+
+  it('does not retry non-rate-limit errors', async () => {
+    let calls = 0;
+    await expect(withChatGptRateLimitRetry(async () => {
+      calls++;
+      throw new Error('500');
+    }, { sleep: () => {} })).rejects.toThrow('500');
+    expect(calls).toBe(1);
+  });
+});
+
+// ===== image bytes on push: files[] contract =====
+
+describe('chatGptAssetId', () => {
+  const { chatGptAssetId } = require('../chrome/chatgpt_adapter.js');
+  it('extracts the id token after the scheme for both pointer schemes', () => {
+    // Must match Scry's extract_asset_id (db/services/chatgpt_media_resolver.py)
+    // exactly — that is the key attach_download_urls links on.
+    expect(chatGptAssetId('sediment://file_00000000433071f5a7944f9cdd26ddcd')).toBe('file_00000000433071f5a7944f9cdd26ddcd');
+    expect(chatGptAssetId('file-service://file-AbC123xyz')).toBe('file-AbC123xyz');
+  });
+  it('is not fooled by the scheme name itself', () => {
+    // "file-service" also matches file[-_][A-Za-z0-9]+ — the id must come from after "://".
+    expect(chatGptAssetId('file-service://file-Q')).toBe('file-Q');
+  });
+  it('returns null for junk', () => {
+    expect(chatGptAssetId(null)).toBeNull();
+    expect(chatGptAssetId('')).toBeNull();
+    expect(chatGptAssetId('https://example.com/x.png')).toBeNull();
+    expect(chatGptAssetId('sediment://')).toBeNull();
+  });
+});
+
+describe('collectChatGptImagePointers — whole tree option', () => {
+  const { collectChatGptImagePointers } = require('../chrome/chatgpt_adapter.js');
+  const img = (ptr) => ({ content_type: 'image_asset_pointer', asset_pointer: ptr });
+  const data = {
+    current_node: 'a1',
+    mapping: {
+      root: { id: 'root', parent: null, children: ['u1'], message: null },
+      u1: { id: 'u1', parent: 'root', children: ['a0', 'a1'],
+            message: { author: { role: 'user' }, recipient: 'all',
+                       content: { content_type: 'multimodal_text', parts: [img('sediment://file_u'), 'hi'] } } },
+      a0: { id: 'a0', parent: 'u1', children: [],
+            message: { author: { role: 'tool', name: 't2uay3k.sj1i4kz' }, recipient: 'all',
+                       content: { content_type: 'multimodal_text', parts: [img('sediment://file_dead')] } } },
+      a1: { id: 'a1', parent: 'u1', children: [],
+            message: { author: { role: 'tool', name: 't2uay3k.sj1i4kz' }, recipient: 'all',
+                       content: { content_type: 'multimodal_text', parts: [img('sediment://file_live')] } } },
+    },
+  };
+  it('defaults to the visible branch', () => {
+    expect(collectChatGptImagePointers(data)).toEqual(['sediment://file_u', 'sediment://file_live']);
+  });
+  it('walks every node when wholeTree is set, still deduped', () => {
+    const all = collectChatGptImagePointers(data, { wholeTree: true }).sort();
+    expect(all).toEqual(['sediment://file_dead', 'sediment://file_live', 'sediment://file_u']);
+  });
+});
+
+describe('buildChatGptFileBlob', () => {
+  const { buildChatGptFileBlob } = require('../chrome/chatgpt_adapter.js');
+  it('produces the Scry files[] record keyed by asset id', () => {
+    const out = buildChatGptFileBlob('sediment://file_abc', { file_name: 'dragons.png', mime_type: 'image/png' }, 'data:image/png;base64,AAAA');
+    expect(out).toEqual({
+      file_uuid: 'file_abc', file_name: 'dragons.png', file_type: 'image/png',
+      file_variant: 'original', data: 'data:image/png;base64,AAAA',
+    });
+  });
+  it('falls back to a name derived from the id and the data URL mime when meta is thin', () => {
+    const out = buildChatGptFileBlob('file-service://file-Zz9', {}, 'data:image/webp;base64,BBBB');
+    expect(out.file_uuid).toBe('file-Zz9');
+    expect(out.file_type).toBe('image/webp');
+    expect(out.file_name).toBe('file-Zz9.webp');
+  });
+  it('returns null when the pointer has no id or there is no data', () => {
+    expect(buildChatGptFileBlob('nope', {}, 'data:image/png;base64,AA')).toBeNull();
+    expect(buildChatGptFileBlob('sediment://file_a', {}, null)).toBeNull();
+  });
+});

@@ -85,8 +85,9 @@
     <header>
       <h1>ChatGPT Export <span class="badge">Proof of Concept</span></h1>
       <div class="sub">
-        Read-only export of your ChatGPT conversations to Markdown or JSON. Runs entirely
-        in your browser against <code>chatgpt.com</code>. Nothing is synced to Scry.
+        Export your ChatGPT conversations to Markdown or JSON, or push them into Scry.
+        Runs entirely in your browser against <code>chatgpt.com</code>. Reads are
+        read-only; nothing is ever deleted at the source.
       </div>
     </header>
 
@@ -112,11 +113,12 @@
       </div>
       <div style="font-size:12px;color:var(--text-secondary);margin-bottom:10px;">
         Pushing sends each conversation to Scry verbatim; Scry decides the visible
-        branch and archives the full tree. Image bytes are not yet included.
+        branch and archives the full tree. With the image toggle below on, the
+        original image bytes travel alongside so Scry can show them.
       </div>
       <label style="display:flex;align-items:center;gap:6px;font-size:13px;color:var(--text-secondary);margin-bottom:10px;">
         <input type="checkbox" id="includeImages" checked>
-        Fetch &amp; embed image bytes (slower — resolves each image to an inline data URI)
+        Include image bytes (slower — exports inline them; pushes send them to Scry as files)
       </label>
       <ul class="convs" id="convList"></ul>
     </div>

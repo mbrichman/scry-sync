@@ -215,8 +215,20 @@ async function pushSelectedToScry() {
       const label = (conv && conv.title) || id;
       setStatus(`Pushing ${pushed + failures.length + 1}/${ids.length}: "${label}"…`);
       try {
-        const body = await fetchChatGptConversation(accessToken, id);
-        const resp = await postToScry(scry, buildChatGptIngestPayload(body));
+        const body = await withChatGptRateLimitRetry(
+          () => fetchChatGptConversation(accessToken, id),
+          { onRetry: (ms) => setStatus(`Rate limited by chatgpt.com — waiting ${Math.ceil(ms / 1000)}s before retrying "${label}"…`) }
+        );
+        let fileBlobs = [];
+        if (wantImages()) {
+          const total = collectChatGptImagePointers(body, { wholeTree: true }).length;
+          let done = 0;
+          fileBlobs = await fetchChatGptFileBlobs(accessToken, body, null, () => {
+            done++;
+            setStatus(`Pushing ${pushed + failures.length + 1}/${ids.length}: "${label}" — images ${done}/${total}…`);
+          });
+        }
+        const resp = await postToScry(scry, buildChatGptIngestPayload(body, fileBlobs, id));
         if (!resp.ok || !resp.body || !resp.body.success) {
           throw new Error((resp.body && resp.body.error) || `HTTP ${resp.status}`);
         }
