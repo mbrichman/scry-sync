@@ -265,7 +265,19 @@
   <div class="section">
     <h3>ChatGPT Export <span style="font-size:11px;font-weight:600;background:#10a37f;color:#fff;padding:1px 7px;border-radius:9px;vertical-align:middle;">Beta</span></h3>
     <p>Export your ChatGPT conversations to Markdown or JSON, or push them into Scry. Runs in your browser against chatgpt.com; reads are read-only and nothing is ever deleted at the source. You must be signed in to chatgpt.com.</p>
-    <button id="openChatGptExportBtn">Open ChatGPT Export</button>
+    <label for="scryChatGptEnabled" style="display: flex; align-items: center; gap: 8px;">
+      <input type="checkbox" id="scryChatGptEnabled" style="margin: 0;">
+      Enable ChatGPT
+    </label>
+    <div class="example">Off by default. Turn this on if you use ChatGPT — it unlocks export and background sync below.</div>
+    <div id="chatGptEnabledFields">
+      <label for="scryChatGptContinuous" style="margin-top: 12px; display: flex; align-items: center; gap: 8px;">
+        <input type="checkbox" id="scryChatGptContinuous" checked style="margin: 0;">
+        Continuous background sync for ChatGPT
+      </label>
+      <div class="example">Every 15 minutes, push new/changed chatgpt.com conversations to Scry (when signed in to chatgpt.com in this browser), plus a daily deep reconcile. Shares the same "!" failure badge as Claude sync.</div>
+      <button id="openChatGptExportBtn" style="margin-top: 10px;">Open ChatGPT Export</button>
+    </div>
   </div>
 
   <div class="section">

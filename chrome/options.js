@@ -181,6 +181,14 @@ function scryOriginPattern(url) {
   }
 }
 
+// Show/hide the ChatGPT continuous-sync checkbox + "Open ChatGPT Export"
+// button based on the "Enable ChatGPT" checkbox. Elements stay in the DOM
+// (just display:none) so their values/listeners are unaffected.
+function syncChatGptFieldsVisibility() {
+  const enabled = document.getElementById('scryChatGptEnabled').checked;
+  document.getElementById('chatGptEnabledFields').style.display = enabled ? '' : 'none';
+}
+
 // Load saved Scry settings into the form.
 document.addEventListener('DOMContentLoaded', () => {
   chrome.storage.local.get(['scry'], (result) => {
@@ -190,8 +198,16 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('scryConcurrency').value = scry.concurrency || 4;
     // Absent = enabled (default-on): only an explicit false unchecks.
     document.getElementById('scryContinuous').checked = scry.continuousSync !== false;
+    // ChatGPT is the OPPOSITE default: absent/undefined = OFF, so an existing
+    // install never starts hitting chatgpt.com just because this shipped.
+    // Only an explicit true turns it on.
+    document.getElementById('scryChatGptEnabled').checked = scry.chatgptEnabled === true;
+    document.getElementById('scryChatGptContinuous').checked = scry.chatgptContinuousSync !== false;
+    syncChatGptFieldsVisibility();
   });
 });
+
+document.getElementById('scryChatGptEnabled').addEventListener('change', syncChatGptFieldsVisibility);
 
 document.getElementById('saveScryBtn').addEventListener('click', () => {
   const url = document.getElementById('scryUrl').value.trim().replace(/\/+$/, '');
@@ -213,15 +229,19 @@ document.getElementById('saveScryBtn').addEventListener('click', () => {
   concurrency = Math.max(1, Math.min(concurrency, 12));
 
   const continuousSync = document.getElementById('scryContinuous').checked;
+  const chatgptEnabled = document.getElementById('scryChatGptEnabled').checked;
+  const chatgptContinuousSync = document.getElementById('scryChatGptContinuous').checked;
 
   // Pre-request the host permission so the later sync fetch isn't blocked.
   chrome.permissions.request({ origins: [scryOriginPattern(url)] }, (granted) => {
-    chrome.storage.local.set({ scry: { url, token, concurrency, continuousSync } }, () => {
-      showStatus('scryStatus',
-        granted ? 'Scry settings saved.' : 'Saved, but host permission was declined — sync will fail until granted.',
-        granted ? 'success' : 'error');
-      setTimeout(() => hideStatus('scryStatus'), 4000);
-    });
+    chrome.storage.local.set(
+      { scry: { url, token, concurrency, continuousSync, chatgptEnabled, chatgptContinuousSync } },
+      () => {
+        showStatus('scryStatus',
+          granted ? 'Scry settings saved.' : 'Saved, but host permission was declined — sync will fail until granted.',
+          granted ? 'success' : 'error');
+        setTimeout(() => hideStatus('scryStatus'), 4000);
+      });
   });
 });
 
