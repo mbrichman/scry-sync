@@ -607,6 +607,21 @@ describe('_fetchChatGptAsset — endpoint fallback and loud failure', () => {
     expect(out.failures).toHaveLength(1);
     expect(out.failures[0].pointer).toBe('sediment://file_abc');
     expect(out.failures[0].error).toMatch(/403/);
+    expect(out.failures[0].onBranch).toBe(true);
+  });
+
+  it('marks a dead-sibling pointer as off-branch so the page can report it softly', async () => {
+    install(() => jsonResp(404, {}));
+    const img = (ptr) => ({ content_type: 'image_asset_pointer', asset_pointer: ptr });
+    const body = { conversation_id: 'conv-1', current_node: 'live', mapping: {
+      root: { id: 'root', parent: null, children: ['dead', 'live'], message: null },
+      dead: { id: 'dead', parent: 'root', children: [], message: { author: { role: 'tool' }, recipient: 'all',
+              content: { content_type: 'multimodal_text', parts: [img('sediment://file_dead')] } } },
+      live: { id: 'live', parent: 'root', children: [], message: { author: { role: 'tool' }, recipient: 'all',
+              content: { content_type: 'multimodal_text', parts: [img('sediment://file_live')] } } } } };
+    const out = await fetchChatGptFileBlobs('tok', body, null);
+    const byPtr = Object.fromEntries(out.failures.map((f) => [f.pointer, f.onBranch]));
+    expect(byPtr).toEqual({ 'sediment://file_dead': false, 'sediment://file_live': true });
   });
 });
 

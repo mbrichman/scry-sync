@@ -1,5 +1,9 @@
 # Changelog
 
+## [2.7.6] — ChatGPT push: off-branch images reported softly
+
+- Live result from v2.7.5: **2 of 3 images stored** (verified on Scry: real PNGs by magic bytes, ~2.3 MB each, linked in the view). The third was a regenerated-away attempt on a dead sibling node that chatgpt.com no longer serves (404 on every route). Failures now carry `onBranch`; the status line reports visible-image failures as errors and dead-sibling misses as "N regenerated-away image(s) no longer served by chatgpt.com, skipped". +1 test (214).
+
 ## [2.7.5] — ChatGPT push: credentialed byte fetch on chatgpt.com
 
 - Live result from v2.7.4: a metadata route now yields a signed URL, and the bytes fetch returned **403 from chatgpt.com** — the signed URL is on chatgpt.com itself, which wants the session. `_bytesFetchOptions` now sends cookies + bearer when the download host is chatgpt.com / openai.com, and stays anonymous for the separate media host (`*.oaiusercontent.com`), which is signature-authorised. +3 tests (213).

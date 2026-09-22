@@ -586,21 +586,29 @@ async function fetchChatGptImageDataUrl(token, pointer, accountId, conversationI
 // fetchConversationFileBlobs. Returns { blobs, failures }: a failure never
 // aborts the push, but it is RETURNED (pointer + reason), not just logged, so
 // the page can say "2 of 3 images failed: ..." instead of "Pushed ✓".
+//
+// Each failure carries `onBranch`: an image on the VISIBLE branch that cannot
+// be fetched is a real problem; an image on a dead sibling (a regenerated-away
+// attempt) that chatgpt.com no longer serves is ordinary -- measured live
+// 2026-09-21: every route 404s for such a pointer while the on-branch images
+// fetch fine. The page reports the two differently.
 async function fetchChatGptFileBlobs(token, body, accountId, onEach) {
   const pointers = collectChatGptImagePointers(body, { wholeTree: true });
+  const branchPointers = new Set(collectChatGptImagePointers(body));
   const conversationId = body && (body.conversation_id || body.id) || null;
   const blobs = [];
   const failures = [];
   await Promise.all(pointers.map(async (pointer) => {
+    const onBranch = branchPointers.has(pointer);
     try {
       const got = await withChatGptRateLimitRetry(
         () => _fetchChatGptAsset(token, pointer, accountId, conversationId));
       const rec = buildChatGptFileBlob(pointer, got.meta, got.dataUrl);
       if (rec) blobs.push(rec);
-      else failures.push({ pointer, error: 'could not build files[] record (no asset id or empty bytes)' });
+      else failures.push({ pointer, onBranch, error: 'could not build files[] record (no asset id or empty bytes)' });
     } catch (e) {
-      console.warn('ChatGPT push: file fetch failed for', pointer, e);
-      failures.push({ pointer, error: e.message || String(e) });
+      if (onBranch) console.warn('ChatGPT push: file fetch failed for', pointer, e);
+      failures.push({ pointer, onBranch, error: e.message || String(e) });
     } finally {
       if (onEach) onEach();
     }

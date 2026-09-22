@@ -207,6 +207,7 @@ async function pushSelectedToScry() {
   btn.disabled = true;
   let pushed = 0;
   let filesStored = 0;
+  let discardedImages = 0;
   const failures = [];
   const imageFailures = [];
 
@@ -230,10 +231,13 @@ async function pushSelectedToScry() {
             setStatus(`Pushing ${pushed + failures.length + 1}/${ids.length}: "${label}" — images ${done}/${total}…`);
           });
           fileBlobs = got.blobs;
-          if (got.failures.length) {
+          const real = got.failures.filter((f) => f.onBranch);
+          const dead = got.failures.length - real.length;
+          if (real.length) {
             // Surface it. A push whose images silently vanished reads as success.
-            imageFailures.push(`"${label}": ${got.failures.length}/${total} image(s) not fetched — ${got.failures[0].error}`);
+            imageFailures.push(`"${label}": ${real.length}/${total} visible image(s) not fetched — ${real[0].error}`);
           }
+          if (dead) discardedImages += dead; // regenerated-away attempts chatgpt.com no longer serves
         }
         const resp = await postToScry(scry, buildChatGptIngestPayload(body, fileBlobs, id));
         if (resp.body && typeof resp.body.files_stored === 'number') filesStored += resp.body.files_stored;
@@ -247,7 +251,8 @@ async function pushSelectedToScry() {
       }
     }
 
-    const filesNote = wantImages() ? ` (${filesStored} image file${filesStored === 1 ? '' : 's'} stored)` : '';
+    const deadNote = discardedImages ? `; ${discardedImages} regenerated-away image${discardedImages === 1 ? '' : 's'} no longer served by chatgpt.com, skipped` : '';
+    const filesNote = wantImages() ? ` (${filesStored} image file${filesStored === 1 ? '' : 's'} stored${deadNote})` : '';
     if (failures.length === 0 && imageFailures.length === 0) {
       setStatus(`Pushed ${pushed} conversation${pushed === 1 ? '' : 's'} to Scry ✓${filesNote}`);
     } else if (failures.length === 0) {
