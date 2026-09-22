@@ -294,6 +294,19 @@ function mergeStorageData(current, backup) {
   return result;
 }
 
+// Merge ONE changed key into the existing 'scry' settings blob, preserving
+// every other key untouched. Backs options.js's per-checkbox immediate-persist
+// (Sources block: Claude continuous sync, ChatGPT enable, ChatGPT continuous
+// sync) — each writes its own key via this rather than the Save button's old
+// whole-object replace. That replace is exactly how a real bug shipped in
+// v2.8.0: only the Scry-connection section's Save button ever wrote `scry`,
+// so ticking "Enable ChatGPT" without also hitting Save was silently never
+// persisted — the checkbox looked checked but chrome.storage still held the
+// old value, and continuous sync kept not running.
+function mergeScrySetting(existing, key, value) {
+  return { ...(existing || {}), [key]: value };
+}
+
 // Show a modal letting the user choose merge vs replace BEFORE the OS file
 // picker opens. onConfirm(mode) fires with 'merge' / 'replace' when the user
 // commits, or null on Cancel / Esc / overlay click. The caller is responsible
@@ -615,6 +628,7 @@ if (typeof module !== 'undefined' && module.exports) {
     backupExtensionData,
     importBackup,
     mergeStorageData,
+    mergeScrySetting,
     sanitizeForDiagnostics,
   };
 }

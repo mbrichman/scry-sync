@@ -216,31 +216,10 @@
 </head>
 <body>
   <h1>Scry Sync Settings</h1>
-  
-  <div class="instructions">
-    <h3>How to find your Organization ID:</h3>
-    <ol>
-      <li>Go to <a href="https://claude.ai/settings/account" target="_blank">claude.ai/settings/account</a></li>
-      <li>Copy your Organization ID (e.g., <code>xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</code>) </li>
-      <li>Paste it below and click Save</li>
-    </ol>
-  </div>
 
   <div class="section">
-    <label for="orgId">Organization ID:</label>
-    <input type="text" id="orgId" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
-    <div class="example">This is a UUID that looks like: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</div>
-    <div class="button-row">
-      <button id="saveBtn">Save Settings</button>
-      <button id="testBtn">Test Connection</button>
-    </div>
-    <div id="status" class="status"></div>
-    <div id="testStatus" class="status"></div>
-  </div>
-
-  <div class="section">
-    <h3>Scry Sync</h3>
-    <p>Push your Claude.ai conversations (with images) into <a href="https://github.com/mbrichman/scry" target="_blank" rel="noopener">Scry</a>. Set your Scry server URL and service token, then use the Sync controls on the Browse page.</p>
+    <h3>Scry Connection</h3>
+    <p>Push your conversations into <a href="https://github.com/mbrichman/scry" target="_blank" rel="noopener">Scry</a>. Set your Scry server URL and service token here, then use the Sync controls on the dashboard.</p>
     <label for="scryUrl">Scry URL:</label>
     <input type="text" id="scryUrl" placeholder="http://localhost:5001">
     <div class="example">Base URL of your Scry server, e.g. http://localhost:5001 or http://your-host.tailnet:5001</div>
@@ -249,34 +228,53 @@
     <div class="example">Must match <code>SCRY_SERVICE_TOKEN</code> in your Scry .env (min 16 chars).</div>
     <label for="scryConcurrency" style="margin-top: 10px; display: block;">Sync concurrency:</label>
     <input type="number" id="scryConcurrency" min="1" max="12" step="1" value="4" style="width: 80px;">
-    <div class="example">How many conversations to sync at once (1–12). Higher = faster full sync; lower if claude.ai rate-limits. Default 4.</div>
-    <label for="scryContinuous" style="margin-top: 12px; display: flex; align-items: center; gap: 8px;">
-      <input type="checkbox" id="scryContinuous" checked style="margin: 0;">
-      Continuous background sync
-    </label>
-    <div class="example">Every 15 minutes, push new/changed claude.ai conversations to Scry, plus a daily deep reconcile. A red "!" badge appears after repeated failures. Unchecking stops the background wakes; manual sync from the Browse page still works.</div>
+    <div class="example">How many conversations to sync at once (1–12). Higher = faster full sync; lower if the source rate-limits. Default 4.</div>
     <div class="button-row">
-      <button id="saveScryBtn">Save Scry Settings</button>
+      <button id="saveScryBtn">Save</button>
       <button id="testScryBtn">Test Connection</button>
     </div>
     <div id="scryStatus" class="status"></div>
   </div>
 
   <div class="section">
-    <h3>ChatGPT Export <span style="font-size:11px;font-weight:600;background:#10a37f;color:#fff;padding:1px 7px;border-radius:9px;vertical-align:middle;">Beta</span></h3>
-    <p>Push your ChatGPT conversations into Scry. Runs in your browser against chatgpt.com; reads are read-only and nothing is ever deleted at the source. Deleting from ChatGPT is not offered: Scry cannot yet prove a ChatGPT capture completely enough to delete against. You must be signed in to chatgpt.com.</p>
-    <label for="scryChatGptEnabled" style="display: flex; align-items: center; gap: 8px;">
-      <input type="checkbox" id="scryChatGptEnabled" style="margin: 0;">
-      Enable ChatGPT
-    </label>
-    <div class="example">Off by default. Turn this on if you use ChatGPT — it unlocks export and background sync below.</div>
-    <div id="chatGptEnabledFields">
-      <label for="scryChatGptContinuous" style="margin-top: 12px; display: flex; align-items: center; gap: 8px;">
-        <input type="checkbox" id="scryChatGptContinuous" checked style="margin: 0;">
-        Continuous background sync for ChatGPT
+    <h3>Sources</h3>
+    <p>Each source below persists its own checkboxes immediately — no separate Save step for these.</p>
+
+    <div style="padding: 14px 0; border-bottom: 1px solid var(--border-color);">
+      <label for="scryContinuous" style="display: flex; align-items: center; gap: 8px;">
+        <input type="checkbox" id="scryContinuous" checked style="margin: 0;">
+        <strong>Claude.ai</strong> — continuous background sync
       </label>
-      <div class="example">Every 15 minutes, push new/changed chatgpt.com conversations to Scry (when signed in to chatgpt.com in this browser), plus a daily deep reconcile. Shares the same "!" failure badge as Claude sync.</div>
-      <button id="openChatGptExportBtn" style="margin-top: 10px;">Open ChatGPT sync page</button>
+      <div class="example">Every 15 minutes, push new/changed claude.ai conversations to Scry, plus a daily deep reconcile. A red "!" badge appears after repeated failures. Unchecking stops the background wakes; manual sync from the dashboard still works.</div>
+      <span class="settings-saved" id="scryContinuousSaved" style="font-size: 12px; color: var(--success-text); display: none;">Saved</span>
+
+      <label for="orgId" style="margin-top: 14px; display: block;">Organization ID:</label>
+      <input type="text" id="orgId" placeholder="Auto-detected — xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+      <div class="example">Auto-detected from claude.ai on the dashboard's first load each session. Set it here only to override — e.g. from <a href="https://claude.ai/settings/account" target="_blank">claude.ai/settings/account</a>.</div>
+      <div class="button-row">
+        <button id="saveBtn">Save Org ID</button>
+        <button id="testBtn">Test Connection</button>
+      </div>
+      <div id="status" class="status"></div>
+      <div id="testStatus" class="status"></div>
+    </div>
+
+    <div style="padding: 14px 0;">
+      <label for="scryChatGptEnabled" style="display: flex; align-items: center; gap: 8px;">
+        <input type="checkbox" id="scryChatGptEnabled" style="margin: 0;">
+        <strong>ChatGPT</strong> — enable
+      </label>
+      <span class="settings-saved" id="scryChatGptEnabledSaved" style="font-size: 12px; color: var(--success-text); display: none;">Saved</span>
+      <div class="example">Off by default. Turning this on adds a ChatGPT tab to the dashboard (hidden again automatically if you're signed out of chatgpt.com) and unlocks continuous sync below.</div>
+      <div id="chatGptEnabledFields">
+        <label for="scryChatGptContinuous" style="margin-top: 12px; display: flex; align-items: center; gap: 8px;">
+          <input type="checkbox" id="scryChatGptContinuous" checked style="margin: 0;">
+          Continuous background sync for ChatGPT
+        </label>
+        <span class="settings-saved" id="scryChatGptContinuousSaved" style="font-size: 12px; color: var(--success-text); display: none;">Saved</span>
+        <div class="example">Every 15 minutes, push new/changed chatgpt.com conversations to Scry (when signed in to chatgpt.com in this browser), plus a daily deep reconcile. Shares the same "!" failure badge as Claude sync.</div>
+        <div class="example">Deleting from ChatGPT is not offered: Scry cannot yet prove a ChatGPT capture completely enough to delete against.</div>
+      </div>
     </div>
   </div>
 
@@ -312,8 +310,8 @@
   </div>
 
   <div class="section">
-    <h3>Model Display</h3>
-    <p>Which model name to show in the browse view's Model column. Bounced chats (where the model has changed) get a small "*" marker either way — the tooltip shows the other model.</p>
+    <h3>Model Display <span style="font-size: 12px; font-weight: normal; color: var(--text-secondary);">(Claude only)</span></h3>
+    <p>Which model name to show in the dashboard's Model column for Claude conversations. Bounced chats (where the model has changed) get a small "*" marker either way — the tooltip shows the other model. ChatGPT conversations don't show a model in the dashboard table (not available without fetching each conversation's full body).</p>
     <label class="radio-option">
       <input type="radio" name="modelDisplay" value="original">
       <strong>Original</strong>

@@ -46,7 +46,7 @@
   "options_page": "options.html",
   "web_accessible_resources": [
     {
-      "resources": ["browse.html", "chatgpt.html"],
+      "resources": ["browse.html"],
       "matches": ["<all_urls>"]
     }
   ]
