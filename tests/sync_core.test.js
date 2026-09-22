@@ -226,6 +226,45 @@ describe('syncBatch', () => {
     const result = await syncBatch(fakeSource(), {}, {}, []);
     expect(result).toEqual({ pushed: 0, succeeded: [], failed: [], firstFailure: null, tombstonedSkips: [] });
   });
+
+  describe('opts.onStatus pass-through', () => {
+    it('attaches onStatus to ctx so a source\'s syncOne can call it', async () => {
+      const seen = [];
+      const source = fakeSource({
+        syncOne: async (ctx, it) => {
+          if (ctx.onStatus) ctx.onStatus(`working on ${it.uuid}`);
+          return { status: 'ok' };
+        },
+      });
+      const ctx = {};
+      await syncBatch(source, ctx, {}, [item('a')], {
+        onStatus: (text) => seen.push(text),
+      });
+      expect(seen).toEqual(['working on a']);
+    });
+
+    it('restores ctx.onStatus to its PRIOR value after the batch (ctx can outlive one call)', async () => {
+      const priorOnStatus = () => {};
+      const ctx = { onStatus: priorOnStatus };
+      const source = fakeSource({ syncOne: async () => ({ status: 'ok' }) });
+      await syncBatch(source, ctx, {}, [item('a')], { onStatus: () => {} });
+      expect(ctx.onStatus).toBe(priorOnStatus);
+    });
+
+    it('deletes ctx.onStatus after the batch when ctx had none before', async () => {
+      const ctx = {};
+      const source = fakeSource({ syncOne: async () => ({ status: 'ok' }) });
+      await syncBatch(source, ctx, {}, [item('a')], { onStatus: () => {} });
+      expect(Object.prototype.hasOwnProperty.call(ctx, 'onStatus')).toBe(false);
+    });
+
+    it('no opts.onStatus given → ctx is left untouched (no onStatus key added)', async () => {
+      const ctx = {};
+      const source = fakeSource({ syncOne: async () => ({ status: 'ok' }) });
+      await syncBatch(source, ctx, {}, [item('a')]);
+      expect(Object.prototype.hasOwnProperty.call(ctx, 'onStatus')).toBe(false);
+    });
+  });
 });
 
 describe('reconcileAndSync', () => {

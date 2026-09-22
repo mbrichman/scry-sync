@@ -66,18 +66,31 @@ function _mapToResync(conversations, toResyncIds) {
 // optional hook fired right after a stub's reconcile-based classification is
 // decided, for callers that want visibility into that path specifically.
 //
+// `onStatus(text)`, if given, is attached to `ctx.onStatus` for the DURATION
+// of the batch, so a source's syncOne can report a SUB-item status ("images
+// 3/12", "rate limited — waiting 8s" — SOURCES.chatgpt.syncOne is the one
+// caller today) without this file knowing anything about what a source's
+// internal steps look like. It is restored to whatever ctx.onStatus was
+// before the call once the batch finishes (undefined if it wasn't set),
+// rather than left on ctx permanently — ctx can be reused across calls (the
+// continuous engine keeps one ctx per source across its whole run).
+//
 // Returns { pushed, succeeded: [{item, result}], failed: [{item, error}],
 // firstFailure, tombstonedSkips }. `succeeded` carries `source.syncOne`'s
 // return value per item (null for a stub-skip, which never called syncOne
 // successfully) so a caller can summarize source-specific per-item detail —
 // e.g. the ChatGPT page's "K image files stored" report.
 async function syncBatch(source, ctx, scry, items, opts = {}) {
-  const { onProgress, signal, onStubReconcile } = opts;
+  const { onProgress, signal, onStubReconcile, onStatus } = opts;
   const pool = _runPool();
   const classify = _classifyStubAfterReconcile();
   const concurrency = (opts.concurrency && opts.concurrency > 0)
     ? opts.concurrency
     : ((scry && scry.concurrency && scry.concurrency > 0) ? scry.concurrency : 4);
+
+  const hadOwnOnStatus = Object.prototype.hasOwnProperty.call(ctx || {}, 'onStatus');
+  const priorOnStatus = ctx ? ctx.onStatus : undefined;
+  if (onStatus && ctx) ctx.onStatus = onStatus;
 
   const list = items || [];
   const total = list.length;
@@ -88,44 +101,55 @@ async function syncBatch(source, ctx, scry, items, opts = {}) {
   const tombstonedSkips = [];
   let firstFailure = null;
 
-  await pool(list, concurrency, async (item) => {
-    // Checked before each item starts: an abort mid-batch leaves everything
-    // not-yet-started out of both succeeded and failed.
-    if (signal && signal.aborted) return;
+  try {
+    await pool(list, concurrency, async (item) => {
+      // Checked before each item starts: an abort mid-batch leaves everything
+      // not-yet-started out of both succeeded and failed.
+      if (signal && signal.aborted) return;
 
-    try {
-      const result = await source.syncOne(ctx, item, scry);
-      pushed++;
-      succeeded.push({ item, result });
-      done++;
-      if (onProgress) await onProgress({ done, total, item, ok: true });
-      return;
-    } catch (e) {
-      if (source.isStubError(e)) {
-        try {
-          const report = await source.reconcile(scry, [item.uuid]);
-          const cls = classify(report, item.uuid);
-          if (onStubReconcile) onStubReconcile({ item, report, classification: cls });
-          if (cls !== 'wanted') {
-            console.warn(`Scry sync (${source.name}): skipping`, item.uuid,
-              cls === 'tombstoned' ? '(stub at source, tombstoned in Scry — permanent skip)'
-                                   : '(stub at source, not wanted by Scry)');
-            succeeded.push({ item, result: null });
-            if (cls === 'tombstoned') tombstonedSkips.push(item.uuid);
-            done++;
-            if (onProgress) await onProgress({ done, total, item, ok: true });
-            return;
-          }
-        } catch (_re) { /* reconcile unreachable — keep the original failure */ }
+      try {
+        const result = await source.syncOne(ctx, item, scry);
+        pushed++;
+        succeeded.push({ item, result });
+        done++;
+        if (onProgress) await onProgress({ done, total, item, ok: true });
+        return;
+      } catch (e) {
+        if (source.isStubError(e)) {
+          try {
+            const report = await source.reconcile(scry, [item.uuid]);
+            const cls = classify(report, item.uuid);
+            if (onStubReconcile) onStubReconcile({ item, report, classification: cls });
+            if (cls !== 'wanted') {
+              console.warn(`Scry sync (${source.name}): skipping`, item.uuid,
+                cls === 'tombstoned' ? '(stub at source, tombstoned in Scry — permanent skip)'
+                                     : '(stub at source, not wanted by Scry)');
+              succeeded.push({ item, result: null });
+              if (cls === 'tombstoned') tombstonedSkips.push(item.uuid);
+              done++;
+              if (onProgress) await onProgress({ done, total, item, ok: true });
+              return;
+            }
+          } catch (_re) { /* reconcile unreachable — keep the original failure */ }
+        }
+        console.error(`Scry sync (${source.name}): failed for`, item.uuid, e);
+        const failure = { item, error: e };
+        failed.push(failure);
+        if (!firstFailure) firstFailure = failure;
+        done++;
+        if (onProgress) await onProgress({ done, total, item, ok: false });
       }
-      console.error(`Scry sync (${source.name}): failed for`, item.uuid, e);
-      const failure = { item, error: e };
-      failed.push(failure);
-      if (!firstFailure) firstFailure = failure;
-      done++;
-      if (onProgress) await onProgress({ done, total, item, ok: false });
+    });
+  } finally {
+    // Restore ctx.onStatus to whatever it was before this call — ctx can
+    // outlive a single syncBatch call (the continuous engine keeps one ctx
+    // per source across its whole run), so this must not leak a status
+    // callback into a later, unrelated call that passed none.
+    if (onStatus && ctx) {
+      if (hadOwnOnStatus) ctx.onStatus = priorOnStatus;
+      else delete ctx.onStatus;
     }
-  });
+  }
 
   return { pushed, succeeded, failed, firstFailure, tombstonedSkips };
 }

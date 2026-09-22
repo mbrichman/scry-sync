@@ -155,14 +155,29 @@ const SOURCES = {
     // this function. A per-image fetch failure is recorded on the returned
     // `imageFailures` but never fails the push — capture-fidelity gaps on
     // images are reported, not treated as a reason to drop the conversation.
+    //
+    // `ctx.onStatus(text)`, when present (set by sync_core.js's syncBatch from
+    // its `opts.onStatus`), gets the SUB-item status the phase-2 refactor into
+    // the shared sync core dropped: "rate limited — waiting Ns" while
+    // fetchChatGptConversation backs off a 429, and "images N/M" while each
+    // image is fetched. Both are best-effort UI hints — never called when no
+    // caller asked for them.
     syncOne: async (ctx, item, scry) => {
       const token = ctx.token || await getChatGptAccessToken();
-      const body = await withChatGptRateLimitRetry(() => fetchChatGptConversation(token, item.uuid));
+      const body = await withChatGptRateLimitRetry(
+        () => fetchChatGptConversation(token, item.uuid),
+        ctx.onStatus ? { onRetry: (ms) => ctx.onStatus(`rate limited — waiting ${Math.round(ms / 1000)}s`) } : {}
+      );
       const wantImages = ctx.wantImages !== false;
       let blobs = [];
       let imageFailures = [];
       if (wantImages) {
-        const got = await fetchChatGptFileBlobs(token, body, null);
+        const total = collectChatGptImagePointers(body, { wholeTree: true }).length;
+        let done = 0;
+        const onEach = ctx.onStatus
+          ? () => { done++; ctx.onStatus(`images ${done}/${total}`); }
+          : undefined;
+        const got = await fetchChatGptFileBlobs(token, body, null, onEach);
         blobs = got.blobs;
         imageFailures = got.failures;
       }
