@@ -1,112 +1,15 @@
 # Installation Guide
 
-Complete installation instructions for Claude Exporter on Chrome and Firefox.
+Scry Sync is a Chrome (MV3) extension, installed from source. It is not published to a browser store, and the Firefox build was retired in v2.8.0.
 
-## Install from Browser Store (Recommended)
+## Install from source (Chrome and Chromium-based browsers)
 
-The simplest way to install Claude Exporter and receive automatic updates:
+1. Clone the repository.
+2. Open `chrome://extensions`, enable **Developer mode**.
+3. Click **Load unpacked** and select the repository's `chrome/` folder.
+4. Pin the extension. Open its **Options** to configure Scry (below) and to enable the sources you use.
 
-- **Chrome/Chromium-based browsers:** [Chrome Web Store](https://chromewebstore.google.com/detail/claude-exporter/niicpkfpebcmikhdmmjnlamoljlabkni?hl=en)
-- **Firefox:** [Firefox Add-ons](https://addons.mozilla.org/en-US/firefox/addon/claude-exporter/)
-
-After installing, proceed to [Configuration](#configuration).
-
----
-
-## Install from Releases (.zip / .xpi)
-
-For users who want to install manually without the browser stores.
-
-### Chrome (and Chromium-based browsers)
-
-1. Download the `claude-exporter-chrome-vX.X.X.zip` from the [Releases page](https://github.com/agoramachina/claude-exporter/releases)
-2. Extract the zip into a safe folder (this will be the permanent location - don't move or delete it!)
-3. Open Chrome and navigate to `chrome://extensions/`
-4. Enable **Developer mode** (toggle in top right)
-5. Click **Load unpacked** and select the extracted `claude-exporter-chrome` folder
-6. Done! Proceed to [Configuration](#configuration)
-
-### Firefox
-
-1. Download the latest `.xpi` file from the [Releases page](https://github.com/agoramachina/claude-exporter/releases)
-2. Drag and drop the `.xpi` file into Firefox
-3. Click **Add** when Firefox asks for permission
-4. Done! Proceed to [Configuration](#configuration)
-
----
-
-## Install from Source
-
-For developers or those who want to build from source:
-
-### Prerequisites
-- **Chrome**: Google Chrome browser (or Chromium-based browser like Edge, Brave, etc.)
-- **Firefox**: Mozilla Firefox (version 58 or later)
-- Git (optional, for cloning)
-- A Claude.ai account
-
-### Chrome Installation from Source
-
-1. **Clone or Download the Repository**
-   ```bash
-   git clone https://github.com/agoramachina/claude-exporter.git
-   cd claude-exporter
-   ```
-
-2. **Open Chrome Extensions Page**
-   - Navigate to `chrome://extensions/`
-   - Or click the three dots menu → More Tools → Extensions
-
-3. **Enable Developer Mode**
-   - Toggle the "Developer mode" switch in the top right corner
-
-4. **Load the Extension**
-   - Click "Load unpacked"
-   - Select the `chrome` folder (inside the repository)
-   - The extension icon should appear in your toolbar
-
-5. **Proceed to [Configuration](#configuration)**
-
-### Firefox Installation from Source
-
-#### Option 1: Temporary Installation (For Development)
-
-1. **Clone or Download the Repository** (if not already done)
-   ```bash
-   git clone https://github.com/agoramachina/claude-exporter.git
-   cd claude-exporter
-   ```
-
-2. **Load in Firefox**
-   - Open Firefox and navigate to `about:debugging`
-   - Click "This Firefox" in the left sidebar
-   - Click "Load Temporary Add-on..."
-   - Navigate to the `firefox` folder (inside the repository)
-   - Select the `manifest.json` file
-   - Extension loads until you restart Firefox
-
-3. **Proceed to [Configuration](#configuration)**
-
-#### Option 2: Developer Installation (Unsigned, Permanent)
-
-**Not recommended** - only for advanced development:
-
-1. Clone the repository (see Option 1)
-2. Open Firefox and navigate to `about:config`
-3. Search for `xpinstall.signatures.required`
-4. Set it to `false` (this allows unsigned extensions)
-5. Package the extension:
-   ```bash
-   cd firefox
-   zip -r ../claude-exporter-firefox.zip *
-   ```
-6. Go to `about:addons`
-7. Click the gear icon → "Install Add-on From File..."
-8. Select the `claude-exporter-firefox.zip` file
-
-**Warning**: Setting `xpinstall.signatures.required` to `false` disables important security protections. Only use for development.
-
----
+To update: pull, click the extension's **reload** button on `chrome://extensions`, then terminate its service worker (click the *service worker* link → *terminate*) or toggle the extension off and on. An MV3 reload alone does not refresh the running background worker.
 
 ## Configuration
 

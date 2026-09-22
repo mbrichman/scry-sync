@@ -408,13 +408,14 @@ const SOURCES = {
     // chatgpt.com session is the SEPARATE signed-out path (point 3), checked
     // per wake by enumerate() below, not a persistent configuration gate.
     configure: async (scry) => ({ configured: Boolean(scry && scry.url), ctx: {} }),
-    enumerate: async () => {
+    enumerate: async (ctx) => {
       const token = await getChatGptAccessToken();
+      ctx.token = token; // one auth/session call per wake; syncOne reuses it
       const items = await listAllChatGptConversations(token);
       return items.map(normalizeChatGptListItem);
     },
     syncOne: async (ctx, item, scry) => {
-      const token = await getChatGptAccessToken();
+      const token = ctx.token || await getChatGptAccessToken();
       const body = await withChatGptRateLimitRetry(() => fetchChatGptConversation(token, item.uuid));
       // Images always included on continuous pushes. A file-blob failure is
       // recorded but never fails the push — capture-fidelity gaps on images

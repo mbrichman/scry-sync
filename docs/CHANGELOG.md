@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.8.0] — ChatGPT continuous sync; one engine, two sources; Chrome-only
+
+- **Continuous background sync for ChatGPT**, mirroring Claude decision for decision: the same 15-minute incremental alarm and daily deep reconcile, a watermark that initialises to the newest conversation and syncs nothing on first run, reconcile-first selection against Scry, 15/30/60-minute backoff on chatgpt.com-side failures only, badge `!` after three failed wakes. Image bytes always ride along. Capture only — no delete path.
+  - **One engine.** `continuous_sync.js` now holds a `SOURCES` registry (`claude`, `chatgpt`): each source supplies enumerate / syncOne / reconcile / errorDomain; every pure planning helper is reused unchanged. Sources run **sequentially** on the same alarms (`runAllContinuousSyncs`); each keeps its own state blob (`continuousSync` for Claude, unchanged, so nothing on an installed machine moves; `continuousSync:chatgpt` for ChatGPT). `reconcileWithScry(scry, items, sourceType='claude')`.
+  - **Signed-out is not a failure.** If you are not signed in to chatgpt.com, the wake records "not signed in" and does nothing: no failure count, no badge, no backoff.
+  - **Sources are opt-in.** Options gains **Enable ChatGPT** (default **off**, so existing installs never start hitting chatgpt.com on their own) with a nested continuous-sync toggle; a disabled source shows nothing in the popup. Claude stays on by default.
+  - Popup status line shows both sources: `Claude: synced 12 min ago · ChatGPT: not signed in`.
+- **Export removed.** Per the owner: the extension is sync-only for every source — Scry is the archive. The ChatGPT page loses Markdown/JSON export and the ZIP path; it is now "ChatGPT → Scry". (Pure renderers in `chatgpt_adapter.js` are retained until the page folds into the dashboard.)
+- **Chrome-only.** The `firefox/` tree, frozen at the July v2.0 snapshot with none of the sync engine, is deleted. README rewritten to describe Scry Sync as it is.
+- +34 tests (248 total).
+
 ## [2.7.6] — ChatGPT push: off-branch images reported softly
 
 - Live result from v2.7.5: **2 of 3 images stored** (verified on Scry: real PNGs by magic bytes, ~2.3 MB each, linked in the view). The third was a regenerated-away attempt on a dead sibling node that chatgpt.com no longer serves (404 on every route). Failures now carry `onBranch`; the status line reports visible-image failures as errors and dead-sibling misses as "N regenerated-away image(s) no longer served by chatgpt.com, skipped". +1 test (214).
