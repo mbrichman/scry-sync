@@ -492,6 +492,21 @@ function _blobToDataUrl(blob) {
 // The bytes host (e.g. *.oaiusercontent.com) must be in host_permissions for the
 // extension to read the cross-origin response. Returns null on any failure so the
 // renderer falls back to a placeholder rather than aborting the export.
+// Fetch options for a signed download_url: session-credentialed when the URL
+// is on chatgpt.com/openai.com, anonymous otherwise (see _fetchChatGptAsset).
+function _bytesFetchOptions(downloadUrl, token, accountId) {
+  let host = '';
+  try { host = new URL(downloadUrl).host.toLowerCase(); } catch { /* fall through */ }
+  const sameSite = host === 'chatgpt.com' || host.endsWith('.chatgpt.com')
+    || host === 'chat.openai.com' || host.endsWith('.openai.com');
+  if (sameSite) {
+    const headers = chatGptAuthHeaders(token, accountId);
+    delete headers['Accept']; // bytes, not JSON
+    return { credentials: 'include', headers };
+  }
+  return { credentials: 'omit' };
+}
+
 // Resolve one asset pointer to { meta, dataUrl }. Two endpoints are tried,
 // because chatgpt.com serves the two pointer schemes differently and the
 // reference implementation (pionxzh/chatgpt-exporter) uses BOTH:
@@ -532,9 +547,16 @@ async function _fetchChatGptAsset(token, pointer, accountId, conversationId) {
     }
   }
   if (!meta) throw new Error(`no signed URL (${errors.join(' | ')})`);
+  // The signed download_url lives on one of two kinds of host. A separate media
+  // host (*.oaiusercontent.com) is authorised by the signature alone and
+  // rejects cookies/headers -> credentials omitted. chatgpt.com itself (the
+  // estuary/content route, measured live 2026-09-21: 403 with credentials
+  // omitted) wants the session -> cookies + bearer, like every other
+  // backend-api call.
   let resp;
+  const fetchOpts = _bytesFetchOptions(meta.download_url, token, accountId);
   try {
-    resp = await fetch(meta.download_url, { credentials: 'omit' });
+    resp = await fetch(meta.download_url, fetchOpts);
   } catch (e) {
     let host = '?';
     try { host = new URL(meta.download_url).host; } catch { /* leave ? */ }
@@ -649,6 +671,7 @@ if (typeof module !== 'undefined' && module.exports) {
     buildChatGptFileBlob,
     _fetchChatGptAsset,
     fetchChatGptFileBlobs,
+    _bytesFetchOptions,
     shouldSkipChatGptMessage,
     isDisplayableChatGptMessage,
     chatGptMessageText,

@@ -1,5 +1,9 @@
 # Changelog
 
+## [2.7.5] — ChatGPT push: credentialed byte fetch on chatgpt.com
+
+- Live result from v2.7.4: a metadata route now yields a signed URL, and the bytes fetch returned **403 from chatgpt.com** — the signed URL is on chatgpt.com itself, which wants the session. `_bytesFetchOptions` now sends cookies + bearer when the download host is chatgpt.com / openai.com, and stays anonymous for the separate media host (`*.oaiusercontent.com`), which is signature-authorised. +3 tests (213).
+
 ## [2.7.4] — ChatGPT push: try files/:id/download first
 
 - Live result from v2.7.3's status line: `files/download/:id` AND `conversation/:convId/attachment/:id/download` both returned **404** for every image_gen `sediment://` asset on a personal account. Added `files/:id/download` (the route the reference implementation's `fetchImageFromPointer` uses) as the first attempt, plus a `?conversation_id=` variant; all four are tried and every miss is reported in the status line.

@@ -609,3 +609,20 @@ describe('_fetchChatGptAsset — endpoint fallback and loud failure', () => {
     expect(out.failures[0].error).toMatch(/403/);
   });
 });
+
+describe('_bytesFetchOptions', () => {
+  const { _bytesFetchOptions } = require('../chrome/chatgpt_adapter.js');
+  it('sends the session (cookies + bearer) when the signed URL is on chatgpt.com', () => {
+    const o = _bytesFetchOptions('https://chatgpt.com/backend-api/estuary/content?id=file_x&sig=abc', 'tok', null);
+    expect(o.credentials).toBe('include');
+    expect(o.headers.Authorization).toBe('Bearer tok');
+    expect(o.headers.Accept).toBeUndefined();
+  });
+  it('stays anonymous for the separate media host', () => {
+    const o = _bytesFetchOptions('https://files.oaiusercontent.com/file-x?sig=abc', 'tok', null);
+    expect(o).toEqual({ credentials: 'omit' });
+  });
+  it('is anonymous for junk URLs rather than leaking the token', () => {
+    expect(_bytesFetchOptions('not a url', 'tok', null)).toEqual({ credentials: 'omit' });
+  });
+});
