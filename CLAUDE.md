@@ -5,13 +5,19 @@ Chrome extension (MV3, `chrome/`) that pushes Claude.ai and ChatGPT conversation
 ## Layout
 
 - `chrome/manifest.json` — the only manifest. Bump `"version"` on every user-visible change.
-- `chrome/utils.js` — pure Claude helpers (branch walk, model names, file collection).
+- `chrome/utils.js` — pure Claude helpers (branch walk, model names, file collection) + shared pure utilities (`mergeStorageData`, `mergeScrySetting`) + backup/restore + diagnostics.
 - `chrome/scry_sync.js` — pure sync helpers: `buildIngestPayload`, `withRetry`, `runPool`, selection.
-- `chrome/scry_client.js` — impure: Scry HTTP (`postToScry`, `reconcileWithScry(scry, items, sourceType)`, `verifyDeletableWithScry`) and Claude fetchers.
-- `chrome/chatgpt_adapter.js` — ChatGPT source: pure transforms + impure chatgpt.com fetchers (`getChatGptAccessToken`, `listAllChatGptConversations`, `fetchChatGptConversation`, `fetchChatGptFileBlobs`, `buildChatGptIngestPayload`).
-- `chrome/continuous_sync.js` — the background engine: pure planning/state machine + the `SOURCES` registry (`claude`, `chatgpt`) + `runAllContinuousSyncs`. Loaded by `background.js` via `importScripts` (order matters: `utils`, `scry_sync`, `scry_client`, `chatgpt_adapter`, `continuous_sync`).
+- `chrome/scry_client.js` — impure: Scry HTTP (`postToScry`, `reconcileWithScry(scry, items, sourceType)`, `verifyDeletableWithScry`), Claude fetchers (`listClaudeConversations`, `fetchConversationBody`, org-id auto-detect — `detectClaudeOrgId`/`selectClaudeOrgId`, no tab relay), and the continuous-sync status-line helpers shared by the popup and the dashboard footer (`formatRelativeTime`, `formatSourceStatus`, `getContinuousSyncStates`).
+- `chrome/chatgpt_adapter.js` — ChatGPT source: pure transforms + impure chatgpt.com fetchers (`getChatGptAccessToken`, `listAllChatGptConversations`, `fetchChatGptConversation`, `fetchChatGptFileBlobs` — bounded pool, default concurrency 3 — `buildChatGptIngestPayload`). `buildChatGptFileBlob` recovers a real image mime (magic-byte sniff, then file_name extension) when chatgpt.com's byte response carries none.
+- `chrome/sources.js` — the `SOURCES` registry (`claude`, `chatgpt`): everything the shared sync core and the continuous-sync orchestrator need to enumerate / sync-one / reconcile / classify errors for a source, plus each source's error-classification helpers. `SOURCES.chatgpt.syncOne` reports sub-item status ("images N/M", "rate limited — waiting Ns") via `ctx.onStatus` when a caller sets one.
+- `chrome/sync_core.js` — the shared sync core: `syncBatch`/`reconcileAndSync`, the ONE implementation of "sync a batch for a source", used by the dashboard, the popup, and the continuous engine. `syncBatch`'s `opts.onStatus` is attached to `ctx.onStatus` for the call's duration.
+- `chrome/dashboard_model.js` — pure model behind the unified dashboard: which source tabs to show (`visibleSourceTabs`), tab labels (`tabLabel`), row mapping (`toRow`), the synced-status badge (`syncedBadge`), and the popup's site-detection helper (`detectSyncTarget`).
+- `chrome/continuous_sync.js` — the background engine: pure planning/state machine + `runAllContinuousSyncs`. Loaded by `background.js` via `importScripts` (order matters: `utils`, `scry_sync`, `scry_client`, `chatgpt_adapter`, `sources`, `sync_core`, `continuous_sync`).
 - `chrome/background.js` — alarms (15-min incremental, daily deep reconcile).
-- `chrome/popup.*`, `chrome/browse.*` (Claude dashboard), `chrome/chatgpt.*` (ChatGPT → Scry page), `chrome/options.*`.
+- `chrome/browse.*` — the unified dashboard (one page, a tab per visible source: Claude always on, ChatGPT only when enabled in Options and not signed out of chatgpt.com). Claude enumeration is a direct credentialed fetch (`listClaudeConversations`/`detectClaudeOrgId`), not a claude.ai tab relay. Load order: `utils`, `scry_sync`, `scry_client`, `chatgpt_adapter`, `sources`, `sync_core`, `dashboard_model`, `browse`.
+- `chrome/popup.*` — site-aware sync: detects claude.ai vs. chatgpt.com from the active tab (`dashboard_model.detectSyncTarget`) and syncs via `SOURCES[source].syncOne`. Load order: `popup-theme`, `utils`, `scry_sync`, `scry_client`, `chatgpt_adapter`, `sources`, `dashboard_model`, `popup`.
+- `chrome/options.*` — Scry connection (URL/token/concurrency, its own Save) + a Sources block (Claude: org id auto-detected/editable + continuous sync; ChatGPT: enable + continuous sync — each Sources checkbox persists itself immediately via `mergeScrySetting`, no separate Save step) + Backup & Restore + Model Display (Claude only).
+- The standalone ChatGPT page (`chrome/chatgpt.html`/`chrome/chatgpt.js`) was retired — folded into the dashboard's ChatGPT tab. `chrome/jszip.min.js` stays: `background.js` still injects it into claude.ai tabs alongside `content.js`, even though nothing calls into it anymore.
 - `tests/` — vitest over the pure surface. Run `npx vitest run` from the repo root.
 
 ## Rules
