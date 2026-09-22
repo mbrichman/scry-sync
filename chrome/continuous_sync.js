@@ -1,16 +1,25 @@
 // Continuous background sync — chrome.alarms-driven incremental push (every 15
-// minutes) + a daily deep reconcile, on top of the existing manual sync engine
-// (scry_sync.js / scry_client.js). This file holds:
+// minutes) + a daily deep reconcile, on top of the existing manual sync engines
+// for both sources (scry_sync.js / scry_client.js for Claude; chatgpt_adapter.js
+// for ChatGPT). This file holds:
 //   - the PURE planning/state-machine helpers (unit-tested, no chrome.* calls)
-//   - the impure orchestrator runContinuousSync(kind) that wires them to
-//     chrome.storage.local, claude.ai enumeration, and Scry's ingest/reconcile
-//     endpoints.
+//   - SOURCES: a small registry describing how each source enumerates, syncs
+//     one conversation, reconciles, and classifies its own errors, so the
+//     planning helpers above (which only ever look at {uuid, updated_at}) and
+//     the orchestrator below are shared verbatim across sources
+//   - the impure orchestrator runContinuousSync(kind, sourceName) that wires a
+//     single source to chrome.storage.local + its enumeration/ingest/reconcile
+//     endpoints, and runAllContinuousSyncs(kind) that runs every source in
+//     SOURCES sequentially
 //
-// All persistent state lives under chrome.storage.local key "continuousSync" —
-// the service worker is ephemeral (MV3), so nothing here relies on module-level
-// mutable state surviving between wakes.
+// Each source persists its own state under its own chrome.storage.local key
+// (see SOURCES[*].stateKey) — Claude keeps the original "continuousSync" key
+// unchanged so nothing on already-installed machines resets. The service
+// worker is ephemeral (MV3), so nothing here relies on module-level mutable
+// state surviving between wakes.
 
 const CONTINUOUS_STORAGE_KEY = 'continuousSync';
+const CONTINUOUS_STORAGE_KEY_CHATGPT = 'continuousSync:chatgpt';
 
 // A wake that finds `running` younger than this is treated as still in flight
 // and no-ops; older than this, a prior run is assumed crashed/killed and this
@@ -172,9 +181,13 @@ function badgeStateAfter(state) {
 //
 // A success clears all failure/backoff bookkeeping. A failure increments the
 // consecutive-failure counter and records the error regardless of domain, but
-// only a 'claude' domain failure touches backoffMs/nextAllowedAt — a Scry-side
-// failure (mini unreachable) must not throttle claude.ai enumeration, since
-// claude.ai itself is fine. `running` is always cleared: the wake is over.
+// only a SOURCE-domain failure (anything other than 'scry' — 'claude',
+// 'chatgpt', or any future source name) touches backoffMs/nextAllowedAt — a
+// Scry-side failure (mini unreachable) must not throttle the source's own
+// enumeration, since the source itself is fine. `running` is always cleared:
+// the wake is over. `result.domain` defaults to 'claude' when omitted, which
+// preserves every pre-existing caller/test that only ever set 'claude' or
+// 'scry'.
 function applyResult(state, result, nowMs) {
   const s = Object.assign({}, defaultContinuousSyncState(), state, { running: null });
 
@@ -192,9 +205,9 @@ function applyResult(state, result, nowMs) {
 
   s.consecutiveFailures = (state && state.consecutiveFailures || 0) + 1;
   s.lastError = (result && result.error) || 'unknown error';
-  const domain = result && result.domain === 'scry' ? 'scry' : 'claude';
+  const domain = (result && result.domain) || 'claude';
   s.errorDomain = domain;
-  if (domain === 'claude') {
+  if (domain !== 'scry') {
     const priorBackoff = state && state.backoffMs;
     s.backoffMs = nextBackoff(priorBackoff);
     s.nextAllowedAt = nowMs + s.backoffMs;
@@ -252,26 +265,101 @@ function planDeepReconcile(conversations, toResyncIds) {
   return (conversations || []).filter((c) => c && idSet.has(c.uuid));
 }
 
+// --- ChatGPT-specific pure helpers --------------------------------------
+// Resolve two functions that live in chatgpt_adapter.js: a global in the
+// browser (importScripts loads chatgpt_adapter.js before this file — see
+// background.js), required by module in Node. Mirrors scry_sync.js's
+// _currentBranch, which resolves getCurrentBranch the same way.
+function _chatGptTimeToIso() {
+  return (typeof chatGptTimeToIso !== 'undefined')
+    ? chatGptTimeToIso
+    : require('./chatgpt_adapter.js').chatGptTimeToIso;
+}
+function _ChatGptRateLimitErrorCtor() {
+  return (typeof ChatGptRateLimitError !== 'undefined')
+    ? ChatGptRateLimitError
+    : require('./chatgpt_adapter.js').ChatGptRateLimitError;
+}
+
+// Normalize one item from ChatGPT's conversation-list endpoint to the
+// {uuid, updated_at, title} shape the planning helpers above share with
+// Claude (they only ever look at uuid/updated_at). The list endpoint's
+// update_time has been observed as both an ISO string and epoch seconds —
+// chatGptTimeToIso tolerates both.
+function normalizeChatGptListItem(item) {
+  const toIso = _chatGptTimeToIso();
+  return {
+    uuid: item && item.id,
+    updated_at: toIso(item && item.update_time),
+    title: (item && item.title) || null,
+  };
+}
+
+// Pure classification: does this error mean "not signed in to chatgpt.com" —
+// getChatGptAccessToken's two failure modes (non-OK auth/session, including
+// 401/403; or a 200 with no accessToken in the body) — rather than a real
+// sync failure? A signed-out wake is NOT a failure (no consecutiveFailures
+// bump, no badge, no backoff): the user simply hasn't opened chatgpt.com in
+// this browser profile, which is an everyday state, not an error condition.
+function isChatGptSignedOutError(err) {
+  const msg = (err && err.message) || String(err || '');
+  return /^auth\/session \d+/.test(msg) || /^No access token in session/.test(msg);
+}
+
+// Which side a ChatGPT-domain failure is on: the SOURCES.chatgpt.errorDomain
+// implementation. A rate limit (429) is always chatgpt-domain (worth backing
+// off claude.ai-style); otherwise classify by message prefix — every error
+// chatgpt_adapter.js/this file throw for a chatgpt.com-side failure starts
+// with one of these. Anything else (ingest HTTP …, ingest rejected) is Scry's
+// side, matching the Claude path's _domainForError default.
+function chatgptErrorDomain(err) {
+  const RateLimitCtor = _ChatGptRateLimitErrorCtor();
+  if (err instanceof RateLimitCtor) return 'chatgpt';
+  const msg = (err && err.message) || String(err || '');
+  if (/^https:\/\/chatgpt\.com/.test(msg)) return 'chatgpt';
+  if (/^auth\/session/.test(msg)) return 'chatgpt';
+  if (/^fetch conversation/.test(msg)) return 'chatgpt';
+  if (/^chatgpt/i.test(msg)) return 'chatgpt';
+  return 'scry';
+}
+
 // --- impure orchestrator -----------------------------------------------
 
-// Read/write the single continuousSync state blob.
-function _getState() {
+// Read/write a continuous-sync state blob under `key` (defaults to the
+// original single "continuousSync" key, so any existing caller that doesn't
+// pass one keeps working unchanged). `storage` defaults to chrome.storage.local
+// but is an explicit parameter so it can be swapped for an in-memory stub in
+// tests — no global chrome.* needed to unit-test state-key isolation.
+function _getState(key = CONTINUOUS_STORAGE_KEY, storage = (typeof chrome !== 'undefined' ? chrome.storage.local : null)) {
   return new Promise((resolve) =>
-    chrome.storage.local.get([CONTINUOUS_STORAGE_KEY], (r) =>
-      resolve(Object.assign(defaultContinuousSyncState(), r[CONTINUOUS_STORAGE_KEY] || {}))));
+    storage.get([key], (r) =>
+      resolve(Object.assign(defaultContinuousSyncState(), r[key] || {}))));
 }
-function _setState(state) {
-  return new Promise((resolve) => chrome.storage.local.set({ [CONTINUOUS_STORAGE_KEY]: state }, resolve));
+function _setState(state, key = CONTINUOUS_STORAGE_KEY, storage = (typeof chrome !== 'undefined' ? chrome.storage.local : null)) {
+  return new Promise((resolve) => storage.set({ [key]: state }, resolve));
 }
 
-function _applyBadge(state) {
-  const b = badgeStateAfter(state);
+// Apply an already-computed badge descriptor ({clear:true} or {text,color}).
+function _renderBadge(b) {
   if (b.clear) {
     chrome.action.setBadgeText({ text: '' });
   } else {
     chrome.action.setBadgeBackgroundColor({ color: b.color });
     chrome.action.setBadgeText({ text: b.text });
   }
+}
+function _applyBadge(state) {
+  _renderBadge(badgeStateAfter(state));
+}
+
+// Badge across ALL sources: '!' if ANY source's persisted state has >=3
+// consecutive failures, regardless of which source ran most recently. Reuses
+// badgeStateAfter (single-state) by folding to the worst consecutiveFailures
+// seen, so the failure-count → badge decision stays defined in exactly one
+// place.
+function badgeStateAfterAll(states) {
+  const maxFailures = Math.max(0, ...(states || []).map((s) => (s && s.consecutiveFailures) || 0));
+  return badgeStateAfter({ consecutiveFailures: maxFailures });
 }
 
 // A thrown Error's message tells us which side failed: fetchConversationBody /
@@ -285,18 +373,87 @@ function _domainForError(err) {
   return /^fetch conversation/.test(msg) ? 'claude' : 'scry';
 }
 
+// --- source registry -----------------------------------------------------
+// Everything the shared orchestrator needs to know to run a wake for one
+// source. The pure planning helpers above (planIncremental, selectWantedToSync,
+// computeWatermarkAfter, applyResult, shouldRun, badgeStateAfter, nextBackoff,
+// planDeepReconcile, filterSkippedConversations) are reused UNCHANGED by every
+// source — they only ever look at {uuid, updated_at}.
+const SOURCES = {
+  claude: {
+    name: 'claude',
+    stateKey: CONTINUOUS_STORAGE_KEY,
+    isEnabled: (scry) => scry.continuousSync !== false,
+    configure: async (scry) => {
+      const orgId = await readOrgIdFromStorage();
+      return { configured: Boolean(scry && scry.url && orgId), ctx: { orgId } };
+    },
+    enumerate: (ctx) => listClaudeConversations(ctx.orgId),
+    syncOne: (ctx, item, scry) => syncOneConversation(ctx.orgId, item.uuid, scry),
+    reconcile: (scry, items) => reconcileWithScry(scry, items),
+    errorDomain: _domainForError,
+    isStubError: isStubFetchError,
+    // No isSignedOutError: claude.ai auth is cookie-based and has no
+    // "signed out" state distinct from an ordinary claude-domain failure.
+  },
+  chatgpt: {
+    name: 'chatgpt',
+    stateKey: CONTINUOUS_STORAGE_KEY_CHATGPT,
+    // Two gates, unlike claude's single default-on toggle: chatgptEnabled
+    // (DEFAULT FALSE when absent — an existing install must not start hitting
+    // chatgpt.com on its next wake just because this shipped) AND the
+    // continuous-sync sub-toggle (default-on once the source itself is on).
+    isEnabled: (scry) => scry.chatgptEnabled === true && scry.chatgptContinuousSync !== false,
+    // Unlike claude, "configured" here does NOT check auth — a missing/expired
+    // chatgpt.com session is the SEPARATE signed-out path (point 3), checked
+    // per wake by enumerate() below, not a persistent configuration gate.
+    configure: async (scry) => ({ configured: Boolean(scry && scry.url), ctx: {} }),
+    enumerate: async () => {
+      const token = await getChatGptAccessToken();
+      const items = await listAllChatGptConversations(token);
+      return items.map(normalizeChatGptListItem);
+    },
+    syncOne: async (ctx, item, scry) => {
+      const token = await getChatGptAccessToken();
+      const body = await withChatGptRateLimitRetry(() => fetchChatGptConversation(token, item.uuid));
+      // Images always included on continuous pushes. A file-blob failure is
+      // recorded but never fails the push — capture-fidelity gaps on images
+      // are reported, not treated as a reason to drop the whole conversation.
+      const { blobs, failures } = await fetchChatGptFileBlobs(token, body, null);
+      const payload = buildChatGptIngestPayload(body, blobs, item.uuid);
+      const resp = await withRetry(
+        () => postToScry(scry, payload),
+        { retries: 2, delayMs: 500, shouldRetry: ({ threw, result }) => threw || (result && result.status >= 500) }
+      );
+      if (!resp.ok) throw new Error(`ingest HTTP ${resp.status}`);
+      if (!resp.body || !resp.body.success) {
+        throw new Error((resp.body && resp.body.error) || 'ingest rejected');
+      }
+      return { status: resp.body.status, imagesFailed: failures.length };
+    },
+    reconcile: (scry, items) => reconcileWithScry(scry, items, 'chatgpt'),
+    errorDomain: chatgptErrorDomain,
+    isStubError: () => false, // ChatGPT has no soft-empty-stub concept.
+    isSignedOutError: isChatGptSignedOutError,
+  },
+};
+const SOURCE_ORDER = ['claude', 'chatgpt'];
+
 // Sync a list of conversation objects one at a time (bounded pool, reusing the
 // manual-sync concurrency setting), catching per-item failures rather than
-// aborting the whole batch — mirrors browse.js's syncCandidateList.
+// aborting the whole batch — mirrors browse.js's syncCandidateList. Generic
+// over `source` (SOURCES.claude / SOURCES.chatgpt) via source.syncOne/
+// isStubError/reconcile.
 //
 // A stub failure (claude.ai 200 with an empty body) gets a second opinion from
 // Scry's reconcile before it may pin the watermark: a conversation Scry has
 // deliberately tombstoned (or already holds complete) counts as a deliberate
 // SKIP — success for watermark purposes — not a failure. Only a
 // server-authoritative "not wanted" can do this; a reconcile error keeps the
-// failure (fail safe: never advance the watermark on a guess).
+// failure (fail safe: never advance the watermark on a guess). ChatGPT's
+// isStubError is always false, so this path never triggers for it.
 // Returns { pushed, succeeded, firstFailure, tombstonedSkips }.
-async function _syncBatch(orgId, scry, items) {
+async function _syncBatch(source, ctx, scry, items) {
   const concurrency = (scry.concurrency && scry.concurrency > 0) ? scry.concurrency : 4;
   let pushed = 0;
   const succeeded = [];
@@ -304,38 +461,49 @@ async function _syncBatch(orgId, scry, items) {
   let firstFailure = null;
   await runPool(items, concurrency, async (c) => {
     try {
-      await syncOneConversation(orgId, c.uuid, scry);
+      await source.syncOne(ctx, c, scry);
       pushed++;
       succeeded.push(c);
       return;
     } catch (e) {
-      if (isStubFetchError(e)) {
+      if (source.isStubError(e)) {
         try {
-          const report = await reconcileWithScry(scry, [c.uuid]);
+          const report = await source.reconcile(scry, [c.uuid]);
           const cls = classifyStubAfterReconcile(report, c.uuid);
           if (cls !== 'wanted') {
-            console.warn('Scry continuous sync: skipping', c.uuid,
-              cls === 'tombstoned' ? '(stub at claude, tombstoned in Scry — permanent skip)'
-                                   : '(stub at claude, not wanted by Scry)');
+            console.warn(`Scry continuous sync (${source.name}): skipping`, c.uuid,
+              cls === 'tombstoned' ? '(stub at source, tombstoned in Scry — permanent skip)'
+                                   : '(stub at source, not wanted by Scry)');
             succeeded.push(c);
             if (cls === 'tombstoned') tombstonedSkips.push(c.uuid);
             return;
           }
         } catch (_re) { /* reconcile unreachable — keep the original failure */ }
       }
-      console.error('Scry continuous sync: failed for', c.uuid, e);
+      console.error(`Scry continuous sync (${source.name}): failed for`, c.uuid, e);
       if (!firstFailure) firstFailure = { uuid: c.uuid, updatedAt: c.updated_at, err: e };
     }
   });
   return { pushed, succeeded, firstFailure, tombstonedSkips };
 }
 
-async function _runIncremental(orgId, scry, state) {
+// Classify an enumerate() failure: for chatgpt, "not signed in" is not a
+// failure at all (point 3) — it short-circuits to { signedOut: true } before
+// touching any failure/backoff bookkeeping. Shared by both the incremental
+// and deep-reconcile wakes, since both start by enumerating.
+function _classifyEnumerateError(source, e) {
+  if (source.isSignedOutError && source.isSignedOutError(e)) {
+    return { signedOut: true, error: e.message || String(e) };
+  }
+  return { ok: false, domain: source.errorDomain(e), error: e.message || String(e) };
+}
+
+async function _runIncremental(source, ctx, scry, state) {
   let conversations;
   try {
-    conversations = await listClaudeConversations(orgId);
+    conversations = await source.enumerate(ctx);
   } catch (e) {
-    return { ok: false, domain: 'claude', error: e.message || String(e) };
+    return _classifyEnumerateError(source, e);
   }
 
   // Known-tombstoned conversations enumerate forever; drop them before planning.
@@ -356,7 +524,7 @@ async function _runIncremental(orgId, scry, state) {
     // Pass full objects (uuid + updated_at) so reconcile can detect staleness —
     // a pending item Scry holds "complete" but that grew at the source must
     // re-sync, or continued conversations never propagate their additions.
-    const report = await reconcileWithScry(scry, plan.pending);
+    const report = await source.reconcile(scry, plan.pending);
     if (report && Array.isArray(report.to_resync)) wantedIds = report.to_resync;
   } catch (_e) { /* fall back to syncing everything pending */ }
 
@@ -368,13 +536,13 @@ async function _runIncremental(orgId, scry, state) {
     return { ok: true, pushed: 0, newWatermark };
   }
 
-  const { pushed, succeeded, firstFailure, tombstonedSkips } = await _syncBatch(orgId, scry, toSync);
+  const { pushed, succeeded, firstFailure, tombstonedSkips } = await _syncBatch(source, ctx, scry, toSync);
 
   if (pushed === 0 && succeeded.length === 0) {
     // Total failure — nothing to safely advance the watermark past. (A wake of
     // pure skips is a success: succeeded carries them for the watermark.)
     const err = firstFailure ? firstFailure.err : new Error('all conversations in batch failed to sync');
-    return { ok: false, domain: _domainForError(err), error: err.message || String(err), addSkipUuids: tombstonedSkips };
+    return { ok: false, domain: source.errorDomain(err), error: err.message || String(err), addSkipUuids: tombstonedSkips };
   }
 
   // Advance over unwanted + synced items; stop just before the earliest wanted
@@ -385,17 +553,17 @@ async function _runIncremental(orgId, scry, state) {
   return { ok: true, pushed, newWatermark, addSkipUuids: tombstonedSkips };
 }
 
-async function _runDeepReconcile(orgId, scry) {
+async function _runDeepReconcile(source, ctx, scry) {
   let conversations;
   try {
-    conversations = await listClaudeConversations(orgId);
+    conversations = await source.enumerate(ctx);
   } catch (e) {
-    return { ok: false, domain: 'claude', error: e.message || String(e) };
+    return _classifyEnumerateError(source, e);
   }
 
   let report;
   try {
-    report = await reconcileWithScry(scry, conversations);  // objects → staleness-aware
+    report = await source.reconcile(scry, conversations);  // objects → staleness-aware
   } catch (e) {
     return { ok: false, domain: 'scry', error: e.message || String(e) };
   }
@@ -403,51 +571,94 @@ async function _runDeepReconcile(orgId, scry) {
   const toSync = planDeepReconcile(conversations, report.to_resync);
   if (toSync.length === 0) return { ok: true, pushed: 0 };
 
-  const { pushed, succeeded, firstFailure, tombstonedSkips } = await _syncBatch(orgId, scry, toSync);
+  const { pushed, succeeded, firstFailure, tombstonedSkips } = await _syncBatch(source, ctx, scry, toSync);
   if (pushed === 0 && succeeded.length === 0) {
     const err = firstFailure ? firstFailure.err : new Error('all conversations in to_resync failed to sync');
-    return { ok: false, domain: _domainForError(err), error: err.message || String(err), addSkipUuids: tombstonedSkips };
+    return { ok: false, domain: source.errorDomain(err), error: err.message || String(err), addSkipUuids: tombstonedSkips };
   }
   // Deep reconcile doesn't move the incremental watermark — it's an
   // independent, exhaustive catch-up pass, not a walk from a cursor.
   return { ok: true, pushed, addSkipUuids: tombstonedSkips };
 }
 
-// Run one wake of continuous sync. kind is 'incremental' or 'deep'. Safe to
-// call from a chrome.alarms listener — reads/writes all its state from
+// Run one wake of continuous sync for one source. kind is 'incremental' or
+// 'deep'; sourceName defaults to 'claude' so this keeps its original
+// signature/behaviour for every existing caller (background.js's old alarm
+// wiring, if anything still calls it directly). Safe to call from a
+// chrome.alarms listener — reads/writes all its state from
 // chrome.storage.local so it tolerates the service worker being recycled
 // between wakes.
-async function runContinuousSync(kind) {
+async function runContinuousSync(kind, sourceName = 'claude') {
+  const source = SOURCES[sourceName];
+  if (!source) throw new Error(`Scry continuous sync: unknown source "${sourceName}"`);
+
   const nowMs = Date.now();
-  const state = await _getState();
+  const state = await _getState(source.stateKey);
 
   const scry = await loadScrySettings();
-  const orgId = await readOrgIdFromStorage();
-  const configured = Boolean(scry && scry.url && orgId);
+  const { configured, ctx } = await source.configure(scry);
 
   const gate = shouldRun(Object.assign({}, state, {
     configured,
-    continuousSyncEnabled: scry.continuousSync !== false,
+    continuousSyncEnabled: source.isEnabled(scry),
   }), nowMs);
   if (!gate.run) return { ran: false, reason: gate.reason };
 
-  await _setState(Object.assign({}, state, { running: nowMs }));
+  await _setState(Object.assign({}, state, { running: nowMs }), source.stateKey);
 
   let result;
   try {
     result = kind === 'deep'
-      ? await _runDeepReconcile(orgId, scry)
-      : await _runIncremental(orgId, scry, state);
+      ? await _runDeepReconcile(source, ctx, scry)
+      : await _runIncremental(source, ctx, scry, state);
   } catch (e) {
-    // Anything unexpected (a bug, not a modeled claude/scry failure) — file it
-    // under scry so it never throttles claude.ai enumeration on a guess.
+    // Anything unexpected (a bug, not a modeled source/scry failure) — file it
+    // under scry so it never throttles the source's own enumeration on a guess.
     result = { ok: false, domain: 'scry', error: e.message || String(e) };
   }
 
+  if (result && result.signedOut) {
+    // Signed-out is not a failure (point 3): leave consecutiveFailures/
+    // backoff/badge bookkeeping untouched, just clear `running` and record
+    // why, so the popup can say so without it reading as a failure streak.
+    const revertedState = Object.assign({}, state, {
+      running: null,
+      lastError: result.error || 'not signed in',
+    });
+    await _setState(revertedState, source.stateKey);
+    return { ran: false, reason: 'signed-out', state: revertedState };
+  }
+
   const newState = applyResult(state, result, nowMs);
-  await _setState(newState);
+  await _setState(newState, source.stateKey);
   _applyBadge(newState);
   return { ran: true, result, state: newState };
+}
+
+// Run every source in SOURCES, in order, SEQUENTIALLY (never concurrently —
+// two sources syncing at once have no reason to interleave their requests to
+// two unrelated vendors, and sequential keeps each wake's console output
+// readable). Returns { claude: <runContinuousSync result>, chatgpt: <...> }.
+// After both have run, recomputes the badge across BOTH sources' persisted
+// state (each individual runContinuousSync call above already applied its
+// OWN single-source badge, which would otherwise leave the badge reflecting
+// only whichever source happened to run last).
+//
+// `runOne`/`getState`/`applyBadge` are dependency-injected (default to the
+// real impure implementations) so ordering + badge-aggregation can be unit
+// tested without touching chrome.* or fetch at all.
+async function runAllContinuousSyncs(kind, {
+  runOne = runContinuousSync,
+  getState = _getState,
+  applyBadge = _renderBadge,
+} = {}) {
+  const results = {};
+  for (const name of SOURCE_ORDER) {
+    results[name] = await runOne(kind, name);
+  }
+  const states = await Promise.all(SOURCE_ORDER.map((name) => getState(SOURCES[name].stateKey)));
+  applyBadge(badgeStateAfterAll(states));
+  return results;
 }
 
 // Browser: expose globally (loaded via importScripts in the service worker).
@@ -467,8 +678,18 @@ if (typeof module !== 'undefined' && module.exports) {
     selectWantedToSync,
     computeWatermarkAfter,
     runContinuousSync,
+    runAllContinuousSyncs,
+    badgeStateAfterAll,
+    normalizeChatGptListItem,
+    isChatGptSignedOutError,
+    chatgptErrorDomain,
+    SOURCES,
+    SOURCE_ORDER,
     CONTINUOUS_STORAGE_KEY,
+    CONTINUOUS_STORAGE_KEY_CHATGPT,
     RUNNING_STALE_MS,
     INCREMENTAL_BATCH_CAP,
+    _getState,
+    _setState,
   };
 }

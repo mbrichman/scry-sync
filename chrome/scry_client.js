@@ -162,7 +162,11 @@ async function fetchConversationFileBlobs(convData) {
 // (its stored copy is internally consistent, just not current). Gets back
 // { to_resync: [...], summary: {...}, extra } — to_resync = missing +
 // incomplete + stale.
-async function reconcileWithScry(scry, items) {
+//
+// `sourceType` defaults to 'claude' so every existing caller (manual sync,
+// the claude continuous-sync engine) is untouched; the ChatGPT continuous-sync
+// engine is the one caller that passes 'chatgpt'.
+async function reconcileWithScry(scry, items, sourceType = 'claude') {
   const url = `${scry.url.replace(/\/+$/, '')}/api/conversations/reconcile`;
   const headers = { 'Content-Type': 'application/json' };
   if (scry.token) headers['Authorization'] = `Bearer ${scry.token}`;
@@ -179,7 +183,7 @@ async function reconcileWithScry(scry, items) {
     }
   }
 
-  const body = { source_type: 'claude', source_ids: sourceIds };
+  const body = { source_type: sourceType, source_ids: sourceIds };
   if (Object.keys(sourceUpdatedAts).length) body.source_updated_ats = sourceUpdatedAts;
 
   const resp = await fetch(url, {
