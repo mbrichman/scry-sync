@@ -1,5 +1,9 @@
 # Changelog
 
+## [2.7.4] — ChatGPT push: try files/:id/download first
+
+- Live result from v2.7.3's status line: `files/download/:id` AND `conversation/:convId/attachment/:id/download` both returned **404** for every image_gen `sediment://` asset on a personal account. Added `files/:id/download` (the route the reference implementation's `fetchImageFromPointer` uses) as the first attempt, plus a `?conversation_id=` variant; all four are tried and every miss is reported in the status line.
+
 ## [2.7.3] — ChatGPT push: image fetch fallback + loud failures
 
 - **Why:** the first live push with v2.7.2 stored zero image bytes and still said "Pushed ✓". Every per-image fetch failure was only `console.warn`ed. That is fixed two ways:

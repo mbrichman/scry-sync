@@ -504,9 +504,20 @@ function _blobToDataUrl(blob) {
 async function _fetchChatGptAsset(token, pointer, accountId, conversationId) {
   const id = String(pointer || '').replace(/^\w[\w+.-]*:\/\//, ''); // strip scheme://
   if (!id) throw new Error(`unusable pointer "${pointer}"`);
-  const attempts = [`${CHATGPT_API}/files/download/${encodeURIComponent(id)}?inline=false`];
+  // Order matters only for speed; all are tried until one returns a signed URL.
+  // Measured live 2026-09-21: files/download/:id and the conversation-scoped
+  // attachment route BOTH 404 for image_gen sediment:// assets on a personal
+  // account. files/:id/download is the route the reference implementation's
+  // fetchImageFromPointer uses; kept first.
+  const eid = encodeURIComponent(id);
+  const attempts = [
+    `${CHATGPT_API}/files/${eid}/download`,
+    `${CHATGPT_API}/files/download/${eid}?inline=false`,
+  ];
   if (conversationId) {
-    attempts.push(`${CHATGPT_API}/conversation/${encodeURIComponent(conversationId)}/attachment/${encodeURIComponent(id)}/download`);
+    const ecid = encodeURIComponent(conversationId);
+    attempts.push(`${CHATGPT_API}/files/${eid}/download?conversation_id=${ecid}`);
+    attempts.push(`${CHATGPT_API}/conversation/${ecid}/attachment/${eid}/download`);
   }
   let meta = null;
   const errors = [];
