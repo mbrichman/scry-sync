@@ -64,7 +64,7 @@ document.addEventListener('DOMContentLoaded', () => {
 // --- continuous background sync status line ---
 // Sourced from chrome.storage.local under each source's own state key
 // ("continuousSync" for Claude, "continuousSync:chatgpt" for ChatGPT — see
-// SOURCES in continuous_sync.js), written by runContinuousSync /
+// SOURCES in sources.js), written by runContinuousSync /
 // runAllContinuousSyncs, driven by the alarms in background.js. Purely a
 // read/render of persisted state — no sync logic here, matching the split
 // between the engine and the UI everywhere else in this popup.
@@ -116,7 +116,7 @@ async function renderAutoSyncStatus() {
   const scry = await new Promise((resolve) =>
     chrome.storage.local.get(['scry'], (r) => resolve(r.scry || {})));
   const claudeEnabled = scry.continuousSync !== false;
-  // ChatGPT has two gates (SOURCES.chatgpt.isEnabled in continuous_sync.js):
+  // ChatGPT has two gates (SOURCES.chatgpt.isEnabled in sources.js):
   // the source itself (default OFF) and its continuous sub-toggle.
   const chatgptSourceEnabled = scry.chatgptEnabled === true;
   const chatgptSyncEnabled = chatgptSourceEnabled && scry.chatgptContinuousSync !== false;

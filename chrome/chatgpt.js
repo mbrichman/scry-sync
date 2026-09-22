@@ -86,12 +86,23 @@ function selectedIds() {
     .map((cb) => cb.dataset.id);
 }
 
-// Push the selected conversations into Scry as first-class conversations.
+// Push the selected conversations into Scry as first-class conversations, via
+// the shared sync core (chrome/sync_core.js's syncBatch) with SOURCES.chatgpt
+// (chrome/sources.js) — the SAME per-conversation fetch/image/ingest logic
+// continuous_sync.js's background engine uses, instead of a third copy of
+// that loop living on this page.
 //
 // Each body goes VERBATIM — Scry walks current_node -> root itself, so the
 // client never decides what the visible branch is. One conversation failing
 // does not abort the run; failures are collected and reported, because a single
 // unreadable conversation shouldn't cost you the other forty.
+//
+// Two disclosed simplifications from moving the fetch loop into the shared
+// core: the live "images N/M" sub-status while a single conversation's images
+// are being fetched, and the "waiting Ns" rate-limit status, are gone — the
+// page now shows conversation-level progress only (done/total). The
+// per-conversation image-failure SUMMARY this page has always shown (visible
+// vs. regenerated-away misses, files-stored count) is unchanged.
 async function pushSelectedToScry() {
   const ids = selectedIds();
   if (ids.length === 0) { setStatus('Select at least one conversation first.', true); return; }
@@ -109,61 +120,50 @@ async function pushSelectedToScry() {
   const byId = new Map(conversations.map((c) => [c.id, c]));
   const btn = $('pushScry');
   btn.disabled = true;
-  let pushed = 0;
-  let filesStored = 0;
-  let discardedImages = 0;
-  const failures = [];
-  const imageFailures = [];
 
   try {
     await ensureToken();
-    for (const id of ids) {
-      const conv = byId.get(id);
-      const label = (conv && conv.title) || id;
-      setStatus(`Pushing ${pushed + failures.length + 1}/${ids.length}: "${label}"…`);
-      try {
-        const body = await withChatGptRateLimitRetry(
-          () => fetchChatGptConversation(accessToken, id),
-          { onRetry: (ms) => setStatus(`Rate limited by chatgpt.com — waiting ${Math.ceil(ms / 1000)}s before retrying "${label}"…`) }
-        );
-        let fileBlobs = [];
-        if (wantImages()) {
-          const total = collectChatGptImagePointers(body, { wholeTree: true }).length;
-          let done = 0;
-          const got = await fetchChatGptFileBlobs(accessToken, body, null, () => {
-            done++;
-            setStatus(`Pushing ${pushed + failures.length + 1}/${ids.length}: "${label}" — images ${done}/${total}…`);
-          });
-          fileBlobs = got.blobs;
-          const real = got.failures.filter((f) => f.onBranch);
-          const dead = got.failures.length - real.length;
-          if (real.length) {
-            // Surface it. A push whose images silently vanished reads as success.
-            imageFailures.push(`"${label}": ${real.length}/${total} visible image(s) not fetched — ${real[0].error}`);
-          }
-          if (dead) discardedImages += dead; // regenerated-away attempts chatgpt.com no longer serves
-        }
-        const resp = await postToScry(scry, buildChatGptIngestPayload(body, fileBlobs, id));
-        if (resp.body && typeof resp.body.files_stored === 'number') filesStored += resp.body.files_stored;
-        if (!resp.ok || !resp.body || !resp.body.success) {
-          throw new Error((resp.body && resp.body.error) || `HTTP ${resp.status}`);
-        }
-        pushed++;
-      } catch (err) {
-        console.error('Scry push failed for', id, err);
-        failures.push(`"${label}": ${err.message || err}`);
+    const items = ids.map((id) => normalizeChatGptListItem(byId.get(id) || { id }));
+    // ctx.wantImages threads the page's "Include image bytes" checkbox through
+    // to SOURCES.chatgpt.syncOne (default true there, matching continuous
+    // sync's always-include-images behavior when this ctx field is absent).
+    const ctx = { token: accessToken, wantImages: wantImages() };
+
+    const result = await syncBatch(SOURCES.chatgpt, ctx, scry, items, {
+      onProgress: ({ done, total, item }) => {
+        setStatus(`Pushing ${done}/${total}: "${item.title || item.uuid}"…`);
+      },
+    });
+
+    let filesStored = 0;
+    let discardedImages = 0;
+    const imageFailureMsgs = [];
+    for (const { item, result: r } of result.succeeded) {
+      if (!r) continue; // ChatGPT has no stub-skip path (isStubError is always false); defensive only.
+      filesStored += r.filesStored || 0;
+      const imgFailures = r.imageFailures || [];
+      const real = imgFailures.filter((f) => f.onBranch);
+      const dead = imgFailures.length - real.length;
+      if (real.length) {
+        // Surface it. A push whose images silently vanished reads as success.
+        imageFailureMsgs.push(`"${item.title || item.uuid}": ${real.length} visible image(s) not fetched — ${real[0].error}`);
       }
+      if (dead) discardedImages += dead; // regenerated-away attempts chatgpt.com no longer serves
     }
 
+    const failureMsgs = result.failed.map(({ item, error }) =>
+      `"${item.title || item.uuid}": ${error.message || error}`);
+
+    const pushed = result.pushed;
     const deadNote = discardedImages ? `; ${discardedImages} regenerated-away image${discardedImages === 1 ? '' : 's'} no longer served by chatgpt.com, skipped` : '';
     const filesNote = wantImages() ? ` (${filesStored} image file${filesStored === 1 ? '' : 's'} stored${deadNote})` : '';
-    if (failures.length === 0 && imageFailures.length === 0) {
+    if (failureMsgs.length === 0 && imageFailureMsgs.length === 0) {
       setStatus(`Pushed ${pushed} conversation${pushed === 1 ? '' : 's'} to Scry ✓${filesNote}`);
-    } else if (failures.length === 0) {
-      setStatus(`Pushed ${pushed} conversation${pushed === 1 ? '' : 's'}${filesNote}, but images failed — ${imageFailures.join('; ')}`, true);
+    } else if (failureMsgs.length === 0) {
+      setStatus(`Pushed ${pushed} conversation${pushed === 1 ? '' : 's'}${filesNote}, but images failed — ${imageFailureMsgs.join('; ')}`, true);
     } else {
       setStatus(
-        `Pushed ${pushed}/${ids.length}. ${failures.length} failed — ${failures.join('; ')}`,
+        `Pushed ${pushed}/${ids.length}. ${failureMsgs.length} failed — ${failureMsgs.join('; ')}`,
         true
       );
     }

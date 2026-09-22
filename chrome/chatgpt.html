@@ -122,11 +122,18 @@
     </div>
   </div>
 
+  <!-- utils.js / scry_sync.js: declarations only (getCurrentBranch, runPool,
+       withRetry, ...); the Claude-specific helpers they define are never
+       called from this page, but sync_core.js's syncBatch needs runPool. -->
+  <script src="utils.js"></script>
+  <script src="scry_sync.js"></script>
   <script src="chatgpt_adapter.js"></script>
   <!-- loadScrySettings / ensureScryPermission / postToScry. Declarations only;
        nothing in it runs at load, and the Claude-specific helpers it defines
        are never called from this page. -->
   <script src="scry_client.js"></script>
+  <script src="sources.js"></script>
+  <script src="sync_core.js"></script>
   <script src="chatgpt.js"></script>
 </body>
 </html>
