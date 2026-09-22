@@ -62,11 +62,12 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 // --- continuous background sync status line ---
-// Sourced from chrome.storage.local "continuousSync" (written by
-// continuous_sync.js's runContinuousSync, driven by the alarms in
-// background.js). Purely a read/render of persisted state — no sync logic
-// here, matching the split between the engine and the UI everywhere else in
-// this popup.
+// Sourced from chrome.storage.local under each source's own state key
+// ("continuousSync" for Claude, "continuousSync:chatgpt" for ChatGPT — see
+// SOURCES in continuous_sync.js), written by runContinuousSync /
+// runAllContinuousSyncs, driven by the alarms in background.js. Purely a
+// read/render of persisted state — no sync logic here, matching the split
+// between the engine and the UI everywhere else in this popup.
 
 function formatRelativeTime(ms) {
   const diffMin = Math.round((Date.now() - ms) / 60000);
@@ -77,48 +78,69 @@ function formatRelativeTime(ms) {
   return `${Math.round(diffHr / 24)} d ago`;
 }
 
-function getContinuousSyncState() {
+function getContinuousSyncStates() {
   return new Promise((resolve) =>
-    chrome.storage.local.get(['continuousSync'], (r) => resolve(r.continuousSync || null)));
+    chrome.storage.local.get(['continuousSync', 'continuousSync:chatgpt'], (r) =>
+      resolve({ claude: r.continuousSync || null, chatgpt: r['continuousSync:chatgpt'] || null })));
+}
+
+// One source's compact status fragment: "<Label>: off" / "not yet synced" /
+// "synced 12 min ago" / "failing since 2 hr ago — <error>" / a plain
+// non-failure lastError (e.g. ChatGPT's "not signed in to chatgpt.com" — see
+// continuous_sync.js's runContinuousSync 'signed-out' path, which records
+// lastError WITHOUT bumping consecutiveFailures, so it must not be rendered
+// as a failure streak).
+function formatSourceStatus(label, enabled, state) {
+  if (!enabled) return `${label}: off`;
+  if (!state || (!state.lastSyncAt && !state.lastError)) return `${label}: not yet synced`;
+
+  if ((state.consecutiveFailures || 0) >= 3 && state.lastError) {
+    const since = state.lastSyncAt ? formatRelativeTime(state.lastSyncAt) : 'install';
+    const shortError = state.lastError.length > 40 ? `${state.lastError.slice(0, 37)}…` : state.lastError;
+    return `${label}: failing since ${since} — ${shortError}`;
+  }
+
+  if (state.lastError && !(state.consecutiveFailures > 0)) {
+    return `${label}: ${state.lastError}`;
+  }
+
+  if (state.lastSyncAt) return `${label}: synced ${formatRelativeTime(state.lastSyncAt)}`;
+
+  return `${label}: —`;
 }
 
 async function renderAutoSyncStatus() {
   const el = document.getElementById('autoSyncStatus');
   if (!el) return;
 
-  // The options-page off-switch beats any state: say "off", not a stale
-  // last-sync time or error.
   const scry = await new Promise((resolve) =>
     chrome.storage.local.get(['scry'], (r) => resolve(r.scry || {})));
-  if (scry.continuousSync === false) {
-    el.textContent = 'Auto-sync: off';
+  const claudeEnabled = scry.continuousSync !== false;
+  // ChatGPT has two gates (SOURCES.chatgpt.isEnabled in continuous_sync.js):
+  // the source itself (default OFF) and its continuous sub-toggle.
+  const chatgptSourceEnabled = scry.chatgptEnabled === true;
+  const chatgptSyncEnabled = chatgptSourceEnabled && scry.chatgptContinuousSync !== false;
+
+  const states = await getContinuousSyncStates();
+
+  const claudeLine = formatSourceStatus('Claude', claudeEnabled, states.claude);
+  // ChatGPT never turned on at all → omit its line entirely rather than
+  // showing "ChatGPT: off" or a stale "not signed in".
+  const chatgptLine = chatgptSourceEnabled
+    ? formatSourceStatus('ChatGPT', chatgptSyncEnabled, states.chatgpt)
+    : null;
+
+  const parts = [claudeLine, chatgptLine].filter(Boolean);
+  if (parts.length === 0) {
+    el.textContent = '';
     el.className = 'auto-sync-status';
     return;
   }
 
-  const state = await getContinuousSyncState();
-
-  if (!state || (!state.lastSyncAt && !state.lastError)) {
-    el.textContent = ''; // never woken yet (e.g. just installed)
-    el.className = 'auto-sync-status';
-    return;
-  }
-
-  if ((state.consecutiveFailures || 0) >= 3 && state.lastError) {
-    const since = state.lastSyncAt ? formatRelativeTime(state.lastSyncAt) : 'install';
-    const shortError = state.lastError.length > 60 ? `${state.lastError.slice(0, 57)}…` : state.lastError;
-    el.textContent = `Auto-sync failing since ${since} — ${shortError}`;
-    el.className = 'auto-sync-status error';
-    return;
-  }
-
-  if (state.lastSyncAt) {
-    el.textContent = `Auto-sync: ${formatRelativeTime(state.lastSyncAt)} · ${state.lastPushed || 0} pushed`;
-    el.className = 'auto-sync-status';
-    return;
-  }
-
-  el.textContent = '';
+  const anyFailing = [states.claude, states.chatgpt].some(
+    (s) => s && (s.consecutiveFailures || 0) >= 3 && s.lastError);
+  el.textContent = parts.join(' · ');
+  el.className = 'auto-sync-status' + (anyFailing ? ' error' : '');
 }
 
 // Sync the conversation currently open in the claude.ai tab.
