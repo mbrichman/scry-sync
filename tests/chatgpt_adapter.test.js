@@ -567,6 +567,64 @@ describe('buildChatGptFileBlob', () => {
   });
 });
 
+// Mime-type recovery: chatgpt.com's byte response sometimes carries no
+// content-type at all, so buildChatGptFileBlob's mime_type/dataUrl-prefix
+// fallback resolves to application/octet-stream. Measured live on the owner's
+// bulk push: 28/88 stored image blobs arrived exactly this way (23 JPEGs, 5
+// PNGs) — correctly-fetched bytes wearing the wrong label. Fixed by sniffing
+// the actual bytes via magic-byte signatures before falling back further.
+describe('buildChatGptFileBlob — mime recovery for octet-stream bytes', () => {
+  const { buildChatGptFileBlob } = require('../chrome/chatgpt_adapter.js');
+
+  // Real magic-byte prefixes (base64 of the first few signature bytes).
+  const PNG_B64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB';
+  const JPEG_B64 = '/9j/4AAQSkZJRgABAQEAYABgAAD';
+  const WEBP_B64 = 'UklGRiYAAABXRUJQVlA4IBoAAAAwAQCdASoBAAEAAQAcJaQAA3AA';
+  const GIF_B64 = 'R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
+
+  it('sniffs a PNG signature over a mismatched file_name extension', () => {
+    const out = buildChatGptFileBlob('sediment://file_p', { file_name: 'photo.jpeg', mime_type: 'application/octet-stream' }, `data:application/octet-stream;base64,${PNG_B64}`);
+    expect(out.file_type).toBe('image/png');
+    expect(out.data).toBe(`data:image/png;base64,${PNG_B64}`);
+  });
+
+  it('sniffs a JPEG signature when mime is missing entirely', () => {
+    const out = buildChatGptFileBlob('sediment://file_j', {}, `data:application/octet-stream;base64,${JPEG_B64}`);
+    expect(out.file_type).toBe('image/jpeg');
+    expect(out.data.startsWith('data:image/jpeg;base64,')).toBe(true);
+  });
+
+  it('sniffs a WEBP signature ("RIFF")', () => {
+    const out = buildChatGptFileBlob('sediment://file_w', { mime_type: 'application/octet-stream' }, `data:application/octet-stream;base64,${WEBP_B64}`);
+    expect(out.file_type).toBe('image/webp');
+  });
+
+  it('sniffs a GIF signature', () => {
+    const out = buildChatGptFileBlob('sediment://file_g', { mime_type: 'application/octet-stream' }, `data:application/octet-stream;base64,${GIF_B64}`);
+    expect(out.file_type).toBe('image/gif');
+  });
+
+  it('falls back to the file_name extension when the bytes match no known signature', () => {
+    const out = buildChatGptFileBlob('sediment://file_e', { file_name: 'scan.jpeg', mime_type: 'application/octet-stream' }, 'data:application/octet-stream;base64,ZZZZnotarealmagicprefix');
+    expect(out.file_type).toBe('image/jpeg');
+    expect(out.data.startsWith('data:image/jpeg;base64,')).toBe(true);
+  });
+
+  it('leaves octet-stream alone when neither bytes nor file_name yield a type', () => {
+    const out = buildChatGptFileBlob('sediment://file_u', { mime_type: 'application/octet-stream' }, 'data:application/octet-stream;base64,ZZZZnotarealmagicprefix');
+    expect(out.file_type).toBe('application/octet-stream');
+  });
+
+  it('leaves a real image/png mime alone — no sniffing attempted, bytes untouched', () => {
+    // Payload deliberately does NOT match the PNG signature, to prove the
+    // already-correct mime short-circuits sniffing rather than "correcting"
+    // a fine value.
+    const out = buildChatGptFileBlob('sediment://file_ok', { mime_type: 'image/png' }, 'data:image/png;base64,ZZZZnotpngmagic');
+    expect(out.file_type).toBe('image/png');
+    expect(out.data).toBe('data:image/png;base64,ZZZZnotpngmagic');
+  });
+});
+
 describe('_fetchChatGptAsset — endpoint fallback and loud failure', () => {
   const { _fetchChatGptAsset, fetchChatGptFileBlobs } = require('../chrome/chatgpt_adapter.js');
   const jsonResp = (status, body) => ({ ok: status < 400, status, headers: { get: () => null }, json: async () => body });
@@ -622,6 +680,69 @@ describe('_fetchChatGptAsset — endpoint fallback and loud failure', () => {
     const out = await fetchChatGptFileBlobs('tok', body, null);
     const byPtr = Object.fromEntries(out.failures.map((f) => [f.pointer, f.onBranch]));
     expect(byPtr).toEqual({ 'sediment://file_dead': false, 'sediment://file_live': true });
+  });
+});
+
+// Live measurement: a 36-image conversation firing every pointer's fetch at
+// once (Promise.all) earned a 429 storm that exhausted withChatGptRateLimitRetry
+// and lost every image. fetchChatGptFileBlobs must run pointers through a
+// BOUNDED pool (default concurrency 3) instead.
+describe('fetchChatGptFileBlobs — bounded concurrency', () => {
+  const { fetchChatGptFileBlobs } = require('../chrome/chatgpt_adapter.js');
+
+  function bodyWithNImages(n) {
+    const mapping = {};
+    for (let i = 0; i < n; i++) {
+      mapping[`n${i}`] = {
+        id: `n${i}`, parent: null, children: [],
+        message: {
+          author: { role: 'tool' }, recipient: 'all',
+          content: { content_type: 'multimodal_text', parts: [{ content_type: 'image_asset_pointer', asset_pointer: `sediment://file_${i}` }] },
+        },
+      };
+    }
+    return { conversation_id: 'conv-pool', current_node: null, mapping };
+  }
+
+  afterEach(() => { delete global.fetch; delete global.FileReader; });
+
+  it('never exceeds the default concurrency (3) for 10 pointers', async () => {
+    let inFlight = 0, peak = 0;
+    global.fetch = async (url) => {
+      if (url.includes('/files/') && url.includes('/download')) {
+        inFlight++; peak = Math.max(peak, inFlight);
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight--;
+        return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ status: 'success', download_url: 'https://files.oaiusercontent.com/x', file_name: 'a.png', mime_type: 'image/png' }) };
+      }
+      if (url === 'https://files.oaiusercontent.com/x') {
+        return { ok: true, status: 200, headers: { get: (h) => (h === 'content-type' ? 'image/png' : null) }, blob: async () => ({}) };
+      }
+      throw new Error('unexpected ' + url);
+    };
+    global.FileReader = class { readAsDataURL() { this.result = 'data:image/png;base64,AAAA'; this.onloadend(); } };
+
+    const out = await fetchChatGptFileBlobs('tok', bodyWithNImages(10), null);
+    expect(out.blobs).toHaveLength(10);
+    expect(peak).toBeLessThanOrEqual(3);
+    expect(peak).toBeGreaterThan(1); // proves it's actually running concurrently, not serially
+  });
+
+  it('honors an explicit opts.concurrency', async () => {
+    let inFlight = 0, peak = 0;
+    global.fetch = async (url) => {
+      if (url.includes('/files/') && url.includes('/download')) {
+        inFlight++; peak = Math.max(peak, inFlight);
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight--;
+        return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ status: 'success', download_url: 'https://files.oaiusercontent.com/x', file_name: 'a.png', mime_type: 'image/png' }) };
+      }
+      return { ok: true, status: 200, headers: { get: (h) => (h === 'content-type' ? 'image/png' : null) }, blob: async () => ({}) };
+    };
+    global.FileReader = class { readAsDataURL() { this.result = 'data:image/png;base64,AAAA'; this.onloadend(); } };
+
+    await fetchChatGptFileBlobs('tok', bodyWithNImages(10), null, null, { concurrency: 2 });
+    expect(peak).toBeLessThanOrEqual(2);
   });
 });
 

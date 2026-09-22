@@ -24,6 +24,15 @@
 const CHATGPT_ORIGIN = 'https://chatgpt.com';
 const CHATGPT_API = 'https://chatgpt.com/backend-api';
 
+// --- resolver for scry_sync.js's runPool (browser global / Node module) ---
+// Mirrors the pattern sources.js/sync_core.js use for each other's globals.
+// scry_sync.js loads before this file everywhere (browse.html, chatgpt
+// continuous-sync via background.js) so the global is present in the browser;
+// Node (vitest) requires it directly.
+function _runPool() {
+  return (typeof runPool !== 'undefined') ? runPool : require('./scry_sync.js').runPool;
+}
+
 // ===== PURE: branch reconstruction =====
 
 // Reconstruct the visible message branch from a ChatGPT conversation body.
@@ -455,22 +464,76 @@ function chatGptAssetId(pointer) {
 
 const _MIME_EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' };
 
+// Magic-byte signatures, base64-encoded (the base64 alphabet aligns on 3-byte/
+// 4-char boundaries, so a fixed byte signature at offset 0 always maps to a
+// fixed base64 PREFIX — no decoding needed). Checked in this order; first
+// match wins.
+const _MAGIC_PREFIXES = [
+  { prefix: 'iVBORw0KGgo', mime: 'image/png' },   // 89 50 4E 47 0D 0A 1A 0A
+  { prefix: '/9j/', mime: 'image/jpeg' },          // FF D8 FF
+  { prefix: 'UklGR', mime: 'image/webp' },         // "RIFF"
+  { prefix: 'R0lGOD', mime: 'image/gif' },         // "GIF8"
+];
+
+// Sniff an image mime type from a data URL's base64 payload. Returns null if
+// the payload doesn't start with a known signature (never a false positive —
+// no signature check is a substring match, only a prefix match).
+function _sniffImageMimeFromDataUrl(dataUrl) {
+  if (typeof dataUrl !== 'string') return null;
+  const comma = dataUrl.indexOf(',');
+  if (comma === -1) return null;
+  const payload = dataUrl.slice(comma + 1);
+  for (const { prefix, mime } of _MAGIC_PREFIXES) {
+    if (payload.startsWith(prefix)) return mime;
+  }
+  return null;
+}
+
+const _EXT_MIME = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif' };
+
+// Last-resort mime guess from the file_name extension chatgpt.com's metadata
+// response carried, when the bytes themselves didn't match a known signature.
+function _mimeFromFileName(fileName) {
+  if (typeof fileName !== 'string') return null;
+  const m = /\.([a-zA-Z0-9]+)$/.exec(fileName);
+  return m ? (_EXT_MIME[m[1].toLowerCase()] || null) : null;
+}
+
 // One entry of Scry's ingest files[] contract (the same shape the Claude path
 // sends): { file_uuid, file_name, file_type, file_variant, data }. `meta` is the
 // files/download response (file_name, mime_type); `dataUrl` the fetched bytes.
+//
+// chatgpt.com's byte response sometimes carries no content-type at all, which
+// resolves to application/octet-stream here — measured live on the owner's
+// bulk push: 28/88 image blobs stored this way (23 JPEGs, 5 PNGs), all
+// correctly-fetched image bytes wearing the wrong label. When the resolved
+// mime is missing, generic (octet-stream), or not an image/* type at all,
+// recover the real type: (a) sniff the actual bytes via a magic-byte
+// signature — the most reliable signal, since it reads what was actually
+// fetched rather than trusting a header; (b) fall back to the file_name
+// extension; (c) otherwise leave it as octet-stream rather than guess wrong.
+// The data URL's own `data:<mime>` prefix is rewritten to match, so Scry's
+// decoder and the view agree with file_type on what the bytes are.
 function buildChatGptFileBlob(pointer, meta, dataUrl) {
   const id = chatGptAssetId(pointer);
   if (!id || typeof dataUrl !== 'string' || !dataUrl) return null;
   const m = meta || {};
   const urlMime = (/^data:([^;,]+)/.exec(dataUrl) || [])[1] || null;
-  const fileType = m.mime_type || urlMime || 'application/octet-stream';
+  let fileType = m.mime_type || urlMime || 'application/octet-stream';
+
+  if (!fileType.startsWith('image/') || fileType === 'application/octet-stream') {
+    const inferred = _sniffImageMimeFromDataUrl(dataUrl) || _mimeFromFileName(m.file_name);
+    if (inferred) fileType = inferred;
+  }
+
   const ext = _MIME_EXT[fileType] || (fileType.split('/')[1] || 'bin');
+  const fixedDataUrl = dataUrl.replace(/^data:[^;,]*/, `data:${fileType}`);
   return {
     file_uuid: id,
     file_name: m.file_name || `${id}.${ext}`,
     file_type: fileType,
     file_variant: 'original',
-    data: dataUrl,
+    data: fixedDataUrl,
   };
 }
 
@@ -592,13 +655,22 @@ async function fetchChatGptImageDataUrl(token, pointer, accountId, conversationI
 // attempt) that chatgpt.com no longer serves is ordinary -- measured live
 // 2026-09-21: every route 404s for such a pointer while the on-branch images
 // fetch fine. The page reports the two differently.
-async function fetchChatGptFileBlobs(token, body, accountId, onEach) {
+//
+// Pointers are run through a BOUNDED pool (default concurrency 3), not
+// Promise.all — measured live: a 36-image conversation firing all 36
+// metadata+byte fetches at once earned a 429 storm that exhausted
+// withChatGptRateLimitRetry's two retries and lost every single image.
+// `opts.concurrency` lets a caller tune it; onEach/failures/onBranch
+// semantics are unchanged.
+async function fetchChatGptFileBlobs(token, body, accountId, onEach, opts = {}) {
   const pointers = collectChatGptImagePointers(body, { wholeTree: true });
   const branchPointers = new Set(collectChatGptImagePointers(body));
   const conversationId = body && (body.conversation_id || body.id) || null;
   const blobs = [];
   const failures = [];
-  await Promise.all(pointers.map(async (pointer) => {
+  const concurrency = (opts.concurrency && opts.concurrency > 0) ? opts.concurrency : 3;
+  const pool = _runPool();
+  await pool(pointers, concurrency, async (pointer) => {
     const onBranch = branchPointers.has(pointer);
     try {
       const got = await withChatGptRateLimitRetry(
@@ -612,7 +684,7 @@ async function fetchChatGptFileBlobs(token, body, accountId, onEach) {
     } finally {
       if (onEach) onEach();
     }
-  }));
+  });
   return { blobs, failures };
 }
 
