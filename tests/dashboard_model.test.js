@@ -65,10 +65,10 @@ describe('tabLabel', () => {
 
 describe('toRow', () => {
   it('maps a Claude conversation (.name is the title)', () => {
-    const row = toRow('claude', { uuid: 'abc-123', name: 'Bear Roaring with Light', updated_at: '2026-09-20T10:00:00Z', model: 'claude-sonnet-4-5' });
+    const row = toRow('claude', { uuid: 'abc-123', name: 'Synthetic fixture: garden planning', updated_at: '2026-09-20T10:00:00Z', model: 'claude-sonnet-4-5' });
     expect(row).toEqual({
       uuid: 'abc-123',
-      title: 'Bear Roaring with Light',
+      title: 'Synthetic fixture: garden planning',
       updated_at: '2026-09-20T10:00:00Z',
       model: 'claude-sonnet-4-5',
       openUrl: 'https://claude.ai/chat/abc-123',
@@ -76,10 +76,10 @@ describe('toRow', () => {
   });
 
   it('maps a normalized ChatGPT list item (.title is the title)', () => {
-    const row = toRow('chatgpt', { uuid: 'chat-xyz', title: 'Image request fourth wing', updated_at: '2026-09-19T08:00:00Z' });
+    const row = toRow('chatgpt', { uuid: 'chat-xyz', title: 'Synthetic fixture: recipe scaling', updated_at: '2026-09-19T08:00:00Z' });
     expect(row).toEqual({
       uuid: 'chat-xyz',
-      title: 'Image request fourth wing',
+      title: 'Synthetic fixture: recipe scaling',
       updated_at: '2026-09-19T08:00:00Z',
       model: null,
       openUrl: 'https://chatgpt.com/c/chat-xyz',
