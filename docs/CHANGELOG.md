@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.9.0] — One sync core for every caller
+
+- **`chrome/sync_core.js`** — `syncBatch(source, ctx, scry, items, { concurrency, onProgress, signal })` and `reconcileAndSync(source, ctx, scry, conversations, { onProgress, signal, cap })` are now the only implementation of the batch loop and the reconcile-then-sync flow. The continuous engine, the Claude dashboard and the ChatGPT page all call them; the dashboard's and the ChatGPT page's private copies are gone. A fix to either flow now lands once (the v2.5.4/v2.5.5 staleness fix had to be applied twice, which is why this existed as a TODO). Progress and cancel are injected callbacks, so each caller keeps its own UI; trigger and planning (alarm-driven watermark walk vs. a button over a selection) stay per caller by design.
+- **`chrome/sources.js`** — the `SOURCES` registry and the per-source pure helpers moved out of the alarm engine so pages can use a source without loading it. `SOURCES.chatgpt.syncOne` returns `{ status, filesStored, imageFailures }` and the core carries each item's result through `succeeded[].result`, which is how the ChatGPT page still reports "K image files stored" and visible-vs-regenerated-away misses.
+- **Behaviour changes worth knowing:** the dashboard's manual sync now gets the same stub → Scry-reconcile → skip classification the continuous path already had (a soft-empty claude.ai stub Scry says is tombstoned or complete counts as a skip, not a failure). The dashboard's reconcile modal shows a generic "re-syncing N…" during the run and the missing/incomplete/stale breakdown in the completion toast. The ChatGPT page no longer shows the per-image "images N/M" and "rate limited — waiting Ns" sub-status mid-conversation (conversation-level progress only); restoring a status hook is on the dashboard work's list.
+- Load order everywhere: `utils, scry_sync, scry_client, chatgpt_adapter, sources, sync_core, [continuous_sync — background only]`.
+- +21 tests (269 total), including one proving the continuous engine and the pages resolve to the same `syncBatch`/`reconcileAndSync` functions.
+
 ## [2.8.0] — ChatGPT continuous sync; one engine, two sources; Chrome-only
 
 - **Continuous background sync for ChatGPT**, mirroring Claude decision for decision: the same 15-minute incremental alarm and daily deep reconcile, a watermark that initialises to the newest conversation and syncs nothing on first run, reconcile-first selection against Scry, 15/30/60-minute backoff on chatgpt.com-side failures only, badge `!` after three failed wakes. Image bytes always ride along. Capture only — no delete path.
