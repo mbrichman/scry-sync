@@ -1,40 +1,44 @@
 // Capture unhandled errors for diagnostics (sanitized, stored in chrome.storage.local)
 if (typeof initErrorCapture === 'function') initErrorCapture('popup');
 
-// Get organization ID from storage (fallback)
-async function getStoredOrgId() {
-  return new Promise((resolve) => {
-    chrome.storage.sync.get(['organizationId'], (result) => resolve(result.organizationId));
-  });
+// Claude org id — stored value first, direct credentialed auto-detect
+// (chrome/scry_client.js's detectClaudeOrgId) otherwise. No tab relay: this
+// works even when the active tab is the one being synced, not some other
+// open claude.ai tab.
+async function ensureClaudeOrgId() {
+  const stored = await readOrgIdFromStorage();
+  if (stored) return stored;
+  return detectClaudeOrgId(); // throws if it fails — caller surfaces the message
 }
 
-// Auto-detect organization ID via content script, fall back to stored.
-async function getOrgId() {
-  try {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab && tab.url && tab.url.includes('claude.ai')) {
-      const response = await new Promise((resolve) => {
-        chrome.tabs.sendMessage(tab.id, { action: 'detectOrgId' }, (res) => {
-          resolve(chrome.runtime.lastError ? null : res);
-        });
-      });
-      if (response && response.success && response.orgId) {
-        chrome.storage.sync.set({ organizationId: response.orgId });
-        return response.orgId;
-      }
-    }
-  } catch (e) {
-    console.log('Auto-detect org ID failed, falling back to stored:', e);
-  }
-  return getStoredOrgId();
-}
-
-// Current conversation UUID from the active claude.ai tab URL.
-async function getCurrentConversationId() {
+// Which source + conversation id the ACTIVE TAB is looking at — the pure
+// rule lives in dashboard_model.js's detectSyncTarget (shared with the
+// dashboard) so both "claude.ai/chat/<uuid>" and "chatgpt.com/c/<id>" are
+// recognized the same way everywhere. { source: null, uuid: null } on any
+// other site.
+async function getActiveTabSyncTarget() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab || !tab.url) return null;
-  const match = new URL(tab.url).pathname.match(/\/chat\/([a-f0-9-]+)/);
-  return match ? match[1] : null;
+  return detectSyncTarget(tab && tab.url);
+}
+
+// Reflect the active tab's site on the Sync button: enabled + targeted at
+// the right source when it's a specific Claude/ChatGPT conversation page,
+// disabled with an explanatory hint everywhere else (including a source's
+// non-conversation pages, e.g. the claude.ai homepage).
+async function updateSyncButtonForActiveTab() {
+  const button = document.getElementById('syncCurrent');
+  if (!button) return;
+  const { source, uuid } = await getActiveTabSyncTarget();
+  if (!source) {
+    button.disabled = true;
+    button.title = 'Open a claude.ai or chatgpt.com conversation to sync it';
+  } else if (!uuid) {
+    button.disabled = true;
+    button.title = `Open a specific ${source === 'claude' ? 'Claude' : 'ChatGPT'} conversation to sync it`;
+  } else {
+    button.disabled = false;
+    button.title = '';
+  }
 }
 
 function showStatus(message, type = 'info') {
@@ -59,66 +63,54 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('header-title').textContent = manifest.name;
   document.getElementById('header-version').textContent = `v${manifest.version}`;
   renderAutoSyncStatus();
+  updateSyncButtonForActiveTab();
 });
 
 // --- continuous background sync status line ---
-// Sourced from chrome.storage.local "continuousSync" (written by
-// continuous_sync.js's runContinuousSync, driven by the alarms in
-// background.js). Purely a read/render of persisted state — no sync logic
-// here, matching the split between the engine and the UI everywhere else in
-// this popup.
-
-function formatRelativeTime(ms) {
-  const diffMin = Math.round((Date.now() - ms) / 60000);
-  if (diffMin < 1) return 'just now';
-  if (diffMin < 60) return `${diffMin} min ago`;
-  const diffHr = Math.round(diffMin / 60);
-  if (diffHr < 24) return `${diffHr} hr ago`;
-  return `${Math.round(diffHr / 24)} d ago`;
-}
-
-function getContinuousSyncState() {
-  return new Promise((resolve) =>
-    chrome.storage.local.get(['continuousSync'], (r) => resolve(r.continuousSync || null)));
-}
+// Sourced from chrome.storage.local under each source's own state key
+// ("continuousSync" for Claude, "continuousSync:chatgpt" for ChatGPT — see
+// SOURCES in sources.js), written by runContinuousSync /
+// runAllContinuousSyncs, driven by the alarms in background.js. Purely a
+// read/render of persisted state — no sync logic here, matching the split
+// between the engine and the UI everywhere else in this popup.
+//
+// formatRelativeTime / getContinuousSyncStates / formatSourceStatus now live
+// in chrome/scry_client.js (moved there this phase so the dashboard's footer
+// status line can share them too — see chrome/browse.js's
+// renderContinuousFooter) and are loaded as globals before this file.
 
 async function renderAutoSyncStatus() {
   const el = document.getElementById('autoSyncStatus');
   if (!el) return;
 
-  // The options-page off-switch beats any state: say "off", not a stale
-  // last-sync time or error.
   const scry = await new Promise((resolve) =>
     chrome.storage.local.get(['scry'], (r) => resolve(r.scry || {})));
-  if (scry.continuousSync === false) {
-    el.textContent = 'Auto-sync: off';
+  const claudeEnabled = scry.continuousSync !== false;
+  // ChatGPT has two gates (SOURCES.chatgpt.isEnabled in sources.js):
+  // the source itself (default OFF) and its continuous sub-toggle.
+  const chatgptSourceEnabled = scry.chatgptEnabled === true;
+  const chatgptSyncEnabled = chatgptSourceEnabled && scry.chatgptContinuousSync !== false;
+
+  const states = await getContinuousSyncStates();
+
+  const claudeLine = formatSourceStatus('Claude', claudeEnabled, states.claude);
+  // ChatGPT never turned on at all → omit its line entirely rather than
+  // showing "ChatGPT: off" or a stale "not signed in".
+  const chatgptLine = chatgptSourceEnabled
+    ? formatSourceStatus('ChatGPT', chatgptSyncEnabled, states.chatgpt)
+    : null;
+
+  const parts = [claudeLine, chatgptLine].filter(Boolean);
+  if (parts.length === 0) {
+    el.textContent = '';
     el.className = 'auto-sync-status';
     return;
   }
 
-  const state = await getContinuousSyncState();
-
-  if (!state || (!state.lastSyncAt && !state.lastError)) {
-    el.textContent = ''; // never woken yet (e.g. just installed)
-    el.className = 'auto-sync-status';
-    return;
-  }
-
-  if ((state.consecutiveFailures || 0) >= 3 && state.lastError) {
-    const since = state.lastSyncAt ? formatRelativeTime(state.lastSyncAt) : 'install';
-    const shortError = state.lastError.length > 60 ? `${state.lastError.slice(0, 57)}…` : state.lastError;
-    el.textContent = `Auto-sync failing since ${since} — ${shortError}`;
-    el.className = 'auto-sync-status error';
-    return;
-  }
-
-  if (state.lastSyncAt) {
-    el.textContent = `Auto-sync: ${formatRelativeTime(state.lastSyncAt)} · ${state.lastPushed || 0} pushed`;
-    el.className = 'auto-sync-status';
-    return;
-  }
-
-  el.textContent = '';
+  const anyFailing = [states.claude, states.chatgpt].some(
+    (s) => s && (s.consecutiveFailures || 0) >= 3 && s.lastError);
+  el.textContent = parts.join(' · ');
+  el.className = 'auto-sync-status' + (anyFailing ? ' error' : '');
 }
 
 // Sync the conversation currently open in the claude.ai tab.
@@ -131,24 +123,32 @@ document.getElementById('syncCurrent').addEventListener('click', async () => {
     const scry = await loadScrySettings();
     if (!scry.url) throw new Error('Set your Scry URL in Options first.');
 
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (!tab || !tab.url || !tab.url.includes('claude.ai')) {
-      throw new Error('Open a claude.ai conversation first.');
-    }
-
-    const orgId = await getOrgId();
-    if (!orgId) throw new Error('Could not determine organization ID. Set it in Options.');
-    const conversationId = await getCurrentConversationId();
-    if (!conversationId) throw new Error('No conversation detected — open a claude.ai chat.');
+    const { source, uuid } = await getActiveTabSyncTarget();
+    if (!source) throw new Error('Open a claude.ai or chatgpt.com conversation first.');
+    if (!uuid) throw new Error(`No conversation detected — open a specific ${source === 'claude' ? 'Claude' : 'ChatGPT'} chat.`);
 
     const granted = await ensureScryPermission(scry.url);
     if (!granted) throw new Error('Host permission for Scry was declined.');
 
-    const result = await syncOneConversation(orgId, conversationId, scry);
+    // SOURCES[source].syncOne (chrome/sources.js) — the same per-conversation
+    // logic the dashboard and continuous sync use. ctx is built fresh per
+    // click: Claude needs orgId up front; ChatGPT's syncOne fetches its own
+    // token when ctx.token is absent, and defaults wantImages to true
+    // (ctx.wantImages !== false) — images on, matching the dashboard's default.
+    let ctx = {};
+    if (source === 'claude') {
+      const orgId = await ensureClaudeOrgId();
+      if (!orgId) throw new Error('Could not determine organization ID. Set it in Options.');
+      ctx = { orgId };
+    }
+
+    const result = await SOURCES[source].syncOne(ctx, { uuid }, scry);
 
     // Record the synced version so the dashboard's skip-unchanged agrees.
+    // ChatGPT's syncOne result has no updatedAt (unlike Claude's) — fall back
+    // to "now", same as the dashboard's per-row sync does for the same reason.
     const syncedMap = await getScrySyncedMap();
-    syncedMap[conversationId] = result.updatedAt;
+    syncedMap[uuid] = result.updatedAt || new Date().toISOString();
     await setScrySyncedMap(syncedMap);
 
     showStatus(`Synced to Scry (${result.status}) ✓`, 'success');
@@ -156,6 +156,7 @@ document.getElementById('syncCurrent').addEventListener('click', async () => {
     showStatus(error.message, 'error');
   } finally {
     button.disabled = false;
+    await updateSyncButtonForActiveTab();
   }
 });
 

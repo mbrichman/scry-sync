@@ -67,3 +67,25 @@ describe('reconcileWithScry payload', () => {
     expect(lastRequest.opts.headers.Authorization).toBe('Bearer tok');
   });
 });
+
+// source_type: the ChatGPT continuous-sync engine reuses this exact function
+// (SOURCES.chatgpt.reconcile in continuous_sync.js) with a third argument;
+// every pre-existing caller omits it and must keep getting 'claude'.
+describe('reconcileWithScry source_type', () => {
+  it('defaults to "claude" when the third argument is omitted (every existing caller)', async () => {
+    await reconcileWithScry(scry, ['a']);
+    expect(lastRequest.body.source_type).toBe('claude');
+  });
+
+  it('sends "chatgpt" when asked', async () => {
+    await reconcileWithScry(scry, ['a'], 'chatgpt');
+    expect(lastRequest.body.source_type).toBe('chatgpt');
+  });
+
+  it('still carries source_ids/source_updated_ats correctly alongside a non-default source_type', async () => {
+    await reconcileWithScry(scry, [{ uuid: 'a', updated_at: '2026-08-01T00:00:00Z' }], 'chatgpt');
+    expect(lastRequest.body.source_type).toBe('chatgpt');
+    expect(lastRequest.body.source_ids).toEqual(['a']);
+    expect(lastRequest.body.source_updated_ats).toEqual({ a: '2026-08-01T00:00:00Z' });
+  });
+});

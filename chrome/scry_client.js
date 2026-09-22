@@ -47,6 +47,90 @@ async function listClaudeConversations(orgId) {
   return resp.json();
 }
 
+// --- org id auto-detect (no tab relay) ---
+//
+// content.js's detectOrgId message handler runs this exact selection over a
+// tab-relayed fetch; this is the same rule, PURE (fixture-testable) and
+// reachable without an open claude.ai tab, so the dashboard (chrome/browse.js)
+// no longer depends on sendMessageToClaudeTab for org detection either.
+
+// Pick which organization is "the" Claude.ai org from the account's list:
+// prefer the one with "chat" capability (the Claude.ai org, as opposed to an
+// API-only org on the same account); fall back to the first if none declares
+// it. Mirrors content.js's detectOrgId handler exactly.
+function selectClaudeOrgId(orgs) {
+  if (!Array.isArray(orgs) || orgs.length === 0) return null;
+  const chatOrg = orgs.find((org) => org && Array.isArray(org.capabilities) && org.capabilities.includes('chat'));
+  const chosen = chatOrg || orgs[0];
+  return (chosen && chosen.uuid) || null;
+}
+
+// Credentialed fetch + the selection rule above + persist to chrome.storage.sync
+// (organizationId) so the manual override in Options still works and every
+// other reader (continuous sync's readOrgIdFromStorage, the popup) sees it.
+// Throws on any failure — callers fall back to the stored id, same as before.
+async function detectClaudeOrgId() {
+  const resp = await fetch('https://claude.ai/api/organizations', {
+    credentials: 'include', headers: { 'Accept': 'application/json' },
+  });
+  if (!resp.ok) throw new Error(`fetch organizations ${resp.status}`);
+  const orgs = await resp.json();
+  const orgId = selectClaudeOrgId(orgs);
+  if (!orgId) throw new Error('no organizations found');
+  await new Promise((resolve) => chrome.storage.sync.set({ organizationId: orgId }, resolve));
+  return orgId;
+}
+
+// --- continuous-sync status line (shared by the popup and the dashboard footer) ---
+//
+// Sourced from chrome.storage.local under each source's own state key
+// ("continuousSync" for Claude, "continuousSync:chatgpt" for ChatGPT — see
+// SOURCES in sources.js), written by runContinuousSync / runAllContinuousSyncs,
+// driven by the alarms in background.js. Purely a read/render of persisted
+// state — no sync logic here. Previously duplicated in popup.js; both it and
+// the dashboard footer (the mockup's "Continuous: Claude synced 12 min ago …"
+// line) now share this one copy.
+
+function formatRelativeTime(ms) {
+  const diffMin = Math.round((Date.now() - ms) / 60000);
+  if (diffMin < 1) return 'just now';
+  if (diffMin < 60) return `${diffMin} min ago`;
+  const diffHr = Math.round(diffMin / 60);
+  if (diffHr < 24) return `${diffHr} hr ago`;
+  return `${Math.round(diffHr / 24)} d ago`;
+}
+
+function getContinuousSyncStates() {
+  return new Promise((resolve) =>
+    chrome.storage.local.get(['continuousSync', 'continuousSync:chatgpt'], (r) =>
+      resolve({ claude: r.continuousSync || null, chatgpt: r['continuousSync:chatgpt'] || null })));
+}
+
+// One source's compact status fragment: "<Label>: off" / "not yet synced" /
+// "synced 12 min ago" / "failing since 2 hr ago — <error>" / a plain
+// non-failure lastError (e.g. ChatGPT's "not signed in to chatgpt.com" — see
+// continuous_sync.js's runContinuousSync 'signed-out' path, which records
+// lastError WITHOUT bumping consecutiveFailures, so it must not be rendered
+// as a failure streak).
+function formatSourceStatus(label, enabled, state) {
+  if (!enabled) return `${label}: off`;
+  if (!state || (!state.lastSyncAt && !state.lastError)) return `${label}: not yet synced`;
+
+  if ((state.consecutiveFailures || 0) >= 3 && state.lastError) {
+    const since = state.lastSyncAt ? formatRelativeTime(state.lastSyncAt) : 'install';
+    const shortError = state.lastError.length > 40 ? `${state.lastError.slice(0, 37)}…` : state.lastError;
+    return `${label}: failing since ${since} — ${shortError}`;
+  }
+
+  if (state.lastError && !(state.consecutiveFailures > 0)) {
+    return `${label}: ${state.lastError}`;
+  }
+
+  if (state.lastSyncAt) return `${label}: synced ${formatRelativeTime(state.lastSyncAt)}`;
+
+  return `${label}: —`;
+}
+
 // --- helpers ---
 
 function scryOriginPattern(url) {
@@ -162,7 +246,11 @@ async function fetchConversationFileBlobs(convData) {
 // (its stored copy is internally consistent, just not current). Gets back
 // { to_resync: [...], summary: {...}, extra } — to_resync = missing +
 // incomplete + stale.
-async function reconcileWithScry(scry, items) {
+//
+// `sourceType` defaults to 'claude' so every existing caller (manual sync,
+// the claude continuous-sync engine) is untouched; the ChatGPT continuous-sync
+// engine is the one caller that passes 'chatgpt'.
+async function reconcileWithScry(scry, items, sourceType = 'claude') {
   const url = `${scry.url.replace(/\/+$/, '')}/api/conversations/reconcile`;
   const headers = { 'Content-Type': 'application/json' };
   if (scry.token) headers['Authorization'] = `Bearer ${scry.token}`;
@@ -179,7 +267,7 @@ async function reconcileWithScry(scry, items) {
     }
   }
 
-  const body = { source_type: 'claude', source_ids: sourceIds };
+  const body = { source_type: sourceType, source_ids: sourceIds };
   if (Object.keys(sourceUpdatedAts).length) body.source_updated_ats = sourceUpdatedAts;
 
   const resp = await fetch(url, {
@@ -265,7 +353,12 @@ async function syncOneConversation(orgId, conversationUuid, scry) {
   return { status: resp.body.status, updatedAt: data.updated_at };
 }
 
-// In Node (vitest), expose the pure helpers for testing.
+// In Node (vitest), expose the pure helpers for testing (plus detectClaudeOrgId,
+// which needs global.fetch/chrome.* stubbed — see tests/org_detect.test.js).
 if (typeof module !== 'undefined' && module.exports) {
-  module.exports = { conversationBodyIsStub, partitionDeletableReport, reconcileWithScry };
+  module.exports = {
+    conversationBodyIsStub, partitionDeletableReport, reconcileWithScry,
+    selectClaudeOrgId, detectClaudeOrgId,
+    formatRelativeTime, formatSourceStatus, getContinuousSyncStates,
+  };
 }

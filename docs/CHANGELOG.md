@@ -1,5 +1,96 @@
 # Changelog
 
+## [3.0.0] — One dashboard, two sources
+
+- **The dashboard is now source-aware.** Tabs per enabled source (`Claude 1,204 · ChatGPT 318`, counts from enumeration); a single-source user sees one tab and no switcher; a ChatGPT tab is hidden entirely while chatgpt.com is signed out. Same table, search, sort and bulk actions for both: *Sync selected*, *Sync last N days*, *Reconcile & sync*. Per-row: sync, and open at the source. **Delete-from-source appears only in the Claude tab**, gated exactly as before; ChatGPT has no delete anywhere. Active tab is remembered.
+- **Claude enumeration is off the tab relay.** The dashboard lists conversations by direct credentialed fetch (the path continuous sync has used since v2.5.0) and **auto-detects the organization id the same way** (`detectClaudeOrgId`, credentialed `GET /api/organizations`, same selection rule the content script used). No claude.ai tab needs to be open. `content.js` remains only for the in-page Claude buttons.
+- **The standalone ChatGPT page is retired** (`chatgpt.html`/`chatgpt.js` deleted). The popup's *Sync this conversation → Scry* follows the active tab's site — claude.ai or chatgpt.com — and is disabled with a hint elsewhere.
+- **Options restructured:** Scry connection; a **Sources** block (Claude: org id auto-detected and editable, continuous toggle; ChatGPT: enable, continuous toggle, and the one-line reason delete is not offered); Backup & restore; Model display (Claude only). **Source checkboxes now persist on change** — in 2.8.0 they only saved via the connection block's Save button, which is why enabling ChatGPT appeared to do nothing.
+- **Image fixes from the bulk-push measurement:** `buildChatGptFileBlob` recovers the real image type from the data's magic bytes or the file name when chatgpt.com sends none (28 of 88 blobs had landed as `application/octet-stream`); `fetchChatGptFileBlobs` runs at most 3 fetches at once (one 36-image conversation had lost every image to a rate-limit storm). The ChatGPT sub-status ("images N/M", "rate limited — waiting Ns") is back via an `onStatus` hook through the sync core.
+- **Deviations from the approved mockup (Projects removal confirmed by the owner: "I don't need it"):** the Claude **Projects** column and filter are gone (they were the last tab-relay dependency and not in the mockup); ChatGPT rows show no model (the list endpoint carries none); "Scry: connected ●" reflects configuration, not a live ping; *Sync all* is replaced by select-all + *Sync selected*.
+- Fixed in passing: *Mark all as exported/new* wrote to a key nothing read (now `scrySyncedMap`); duplicate status helpers consolidated into `scry_client.js`.
+- `jszip.min.js` stays only because `background.js` still injects it into claude.ai tabs; nothing calls it. Adapter export renderers remain, unreferenced, pending cleanup.
+- +54 tests (323 total).
+
+## [2.9.0] — One sync core for every caller
+
+- **`chrome/sync_core.js`** — `syncBatch(source, ctx, scry, items, { concurrency, onProgress, signal })` and `reconcileAndSync(source, ctx, scry, conversations, { onProgress, signal, cap })` are now the only implementation of the batch loop and the reconcile-then-sync flow. The continuous engine, the Claude dashboard and the ChatGPT page all call them; the dashboard's and the ChatGPT page's private copies are gone. A fix to either flow now lands once (the v2.5.4/v2.5.5 staleness fix had to be applied twice, which is why this existed as a TODO). Progress and cancel are injected callbacks, so each caller keeps its own UI; trigger and planning (alarm-driven watermark walk vs. a button over a selection) stay per caller by design.
+- **`chrome/sources.js`** — the `SOURCES` registry and the per-source pure helpers moved out of the alarm engine so pages can use a source without loading it. `SOURCES.chatgpt.syncOne` returns `{ status, filesStored, imageFailures }` and the core carries each item's result through `succeeded[].result`, which is how the ChatGPT page still reports "K image files stored" and visible-vs-regenerated-away misses.
+- **Behaviour changes worth knowing:** the dashboard's manual sync now gets the same stub → Scry-reconcile → skip classification the continuous path already had (a soft-empty claude.ai stub Scry says is tombstoned or complete counts as a skip, not a failure). The dashboard's reconcile modal shows a generic "re-syncing N…" during the run and the missing/incomplete/stale breakdown in the completion toast. The ChatGPT page no longer shows the per-image "images N/M" and "rate limited — waiting Ns" sub-status mid-conversation (conversation-level progress only); restoring a status hook is on the dashboard work's list.
+- Load order everywhere: `utils, scry_sync, scry_client, chatgpt_adapter, sources, sync_core, [continuous_sync — background only]`.
+- +21 tests (269 total), including one proving the continuous engine and the pages resolve to the same `syncBatch`/`reconcileAndSync` functions.
+
+## [2.8.0] — ChatGPT continuous sync; one engine, two sources; Chrome-only
+
+- **Continuous background sync for ChatGPT**, mirroring Claude decision for decision: the same 15-minute incremental alarm and daily deep reconcile, a watermark that initialises to the newest conversation and syncs nothing on first run, reconcile-first selection against Scry, 15/30/60-minute backoff on chatgpt.com-side failures only, badge `!` after three failed wakes. Image bytes always ride along. Capture only — no delete path.
+  - **One engine.** `continuous_sync.js` now holds a `SOURCES` registry (`claude`, `chatgpt`): each source supplies enumerate / syncOne / reconcile / errorDomain; every pure planning helper is reused unchanged. Sources run **sequentially** on the same alarms (`runAllContinuousSyncs`); each keeps its own state blob (`continuousSync` for Claude, unchanged, so nothing on an installed machine moves; `continuousSync:chatgpt` for ChatGPT). `reconcileWithScry(scry, items, sourceType='claude')`.
+  - **Signed-out is not a failure.** If you are not signed in to chatgpt.com, the wake records "not signed in" and does nothing: no failure count, no badge, no backoff.
+  - **Sources are opt-in.** Options gains **Enable ChatGPT** (default **off**, so existing installs never start hitting chatgpt.com on their own) with a nested continuous-sync toggle; a disabled source shows nothing in the popup. Claude stays on by default.
+  - Popup status line shows both sources: `Claude: synced 12 min ago · ChatGPT: not signed in`.
+- **Export removed.** Per the owner: the extension is sync-only for every source — Scry is the archive. The ChatGPT page loses Markdown/JSON export and the ZIP path; it is now "ChatGPT → Scry". (Pure renderers in `chatgpt_adapter.js` are retained until the page folds into the dashboard.)
+- **Chrome-only.** The `firefox/` tree, frozen at the July v2.0 snapshot with none of the sync engine, is deleted. README rewritten to describe Scry Sync as it is.
+- +34 tests (248 total).
+
+## [2.7.6] — ChatGPT push: off-branch images reported softly
+
+- Live result from v2.7.5: **2 of 3 images stored** (verified on Scry: real PNGs by magic bytes, ~2.3 MB each, linked in the view). The third was a regenerated-away attempt on a dead sibling node that chatgpt.com no longer serves (404 on every route). Failures now carry `onBranch`; the status line reports visible-image failures as errors and dead-sibling misses as "N regenerated-away image(s) no longer served by chatgpt.com, skipped". +1 test (214).
+
+## [2.7.5] — ChatGPT push: credentialed byte fetch on chatgpt.com
+
+- Live result from v2.7.4: a metadata route now yields a signed URL, and the bytes fetch returned **403 from chatgpt.com** — the signed URL is on chatgpt.com itself, which wants the session. `_bytesFetchOptions` now sends cookies + bearer when the download host is chatgpt.com / openai.com, and stays anonymous for the separate media host (`*.oaiusercontent.com`), which is signature-authorised. +3 tests (213).
+
+## [2.7.4] — ChatGPT push: try files/:id/download first
+
+- Live result from v2.7.3's status line: `files/download/:id` AND `conversation/:convId/attachment/:id/download` both returned **404** for every image_gen `sediment://` asset on a personal account. Added `files/:id/download` (the route the reference implementation's `fetchImageFromPointer` uses) as the first attempt, plus a `?conversation_id=` variant; all four are tried and every miss is reported in the status line.
+
+## [2.7.3] — ChatGPT push: image fetch fallback + loud failures
+
+- **Why:** the first live push with v2.7.2 stored zero image bytes and still said "Pushed ✓". Every per-image fetch failure was only `console.warn`ed. That is fixed two ways:
+  - **Failures are surfaced.** `fetchChatGptFileBlobs` returns `{ blobs, failures }`; the push status now reads "Pushed N (K image files stored)" on success, or "…but images failed — 2/3 image(s) not fetched — <endpoint: HTTP status>" on failure, so the next run tells you exactly what chatgpt.com answered.
+  - **Endpoint fallback.** `_fetchChatGptAsset` tries `GET backend-api/files/download/:id` and then `GET backend-api/conversation/:convId/attachment/:id/download` — the reference implementation uses both, the second for newer `sediment://` assets. A bytes-fetch that throws names the signed URL's host, so a missing `host_permissions` entry is diagnosable from the status line.
+  - +3 tests with a stubbed `fetch` (fallback path, double-failure message, failures returned not swallowed). 210 total.
+
+## [2.7.2] — ChatGPT push: image bytes travel with the conversation
+
+- **Images now come over on push.** With the image toggle on, *Push selected → Scry* resolves every image asset in the conversation (whole tree, deduped) via `GET backend-api/files/download/:id` → signed URL → bytes, and sends them in the ingest body's `files[]` — the same contract the Claude path uses: `{ file_uuid, file_name, file_type, file_variant: 'original', data }`. Message text stays verbatim; no base64 is inlined into content or the archive.
+  - **`file_uuid` is the asset id** (`sediment://file_<hex>` → `file_<hex>`, `file-service://file-<b62>` → `file-<b62>`), extracted by `chatGptAssetId` with the same "after `://`" anchoring as Scry's `extract_asset_id`, because that id is what Scry stores the bytes under and links the message's image record to. Requires the matching Scry change (scry PR #107) that keeps tool-rendered image turns and stamps image records with their asset id.
+  - New pure helpers `chatGptAssetId`, `buildChatGptFileBlob`; `collectChatGptImagePointers(data, { wholeTree })`; impure `fetchChatGptFileBlobs` (per-pointer failures logged and skipped, 429-aware). Per-image progress in the status line.
+  - +8 tests (57 in the ChatGPT suite, 207 total). Non-image uploads (PDFs, docs) are still not fetched — see docs/TODO.md.
+
+## [2.7.1] — ChatGPT push: live-run hardening
+
+- **Identity fallback.** `buildChatGptIngestPayload(body, files, fallbackConversationId)` fills `conversation_id` from the list endpoint's id when the fetched body carries none. Scry keys both the conversation row and its verbatim archive on that id; without it a push would import with no source id and skip fidelity capture entirely. A body's own id always wins.
+- **Rate-limit backoff in the push loop.** New `withChatGptRateLimitRetry(fn, {maxRetries, sleep, onRetry})` waits chatgpt.com's `Retry-After` and retries (2×) on a 429 instead of failing that conversation; the page shows "Rate limited — waiting Ns". Non-429 errors propagate untouched. Body fetches in *Push selected → Scry* now go through it.
+- **Copy.** The export page and the Options section no longer claim "nothing is synced to Scry"; they now say reads are read-only and nothing is ever deleted at the source.
+- +7 tests (49 in the ChatGPT suite, 199 total). Image bytes are still not sent on push (known gap, see docs/TODO.md).
+
+## [2.7.0] — Push ChatGPT conversations to Scry (Chrome)
+
+- **The PoC page can now push selected conversations into Scry** via the same `/api/conversations/ingest` the Claude sync uses (*Push selected → Scry*). Reuses `loadScrySettings` / `ensureScryPermission` / `postToScry` from `scry_client.js`; no manifest permission change — `optional_host_permissions` already covers any Scry origin.
+  - **The body goes VERBATIM.** Scry walks `current_node → root` server-side, so import and fidelity verification prune with the same code and agree by construction. `buildChatGptIngestPayload` deliberately does not reuse `normalizeChatGptConversation` (that stays for the exporters): a client-side prune would be a second branch rule in a second language, and any drift would read on the server as a permanent capture gap.
+  - One conversation failing does not abort the run; failures are collected and reported per conversation.
+  - **Known gap:** image bytes are not sent. The export path inlines them as data URIs into message text, which for a sync would push base64 into Scry's content and archived raw_json; they need the Claude path's separate `files[]` blob contract. Until then a pushed conversation carries its text, not its images.
+  - Requires Scry's ingest to accept `mapping` bodies (scry PR #46, live). +4 tests (192 total).
+
+## [2.6.1] — ChatGPT export: image byte capture (Chrome)
+
+- **Images now export as real bytes, not placeholders.** The PoC resolves each ChatGPT image asset pointer (`sediment://` / `file-service://`) via `GET backend-api/files/download/:id` → signed URL → fetches the bytes → inlines them as a data URI, so uploaded images and code-interpreter plots actually render in the exported Markdown/JSON. Covers both multimodal image parts and `aggregate_result` output images.
+  - New pure helper `collectChatGptImagePointers` (branch-scoped, deduped) + impure `fetchChatGptImageDataUrl` / `fetchChatGptImageDataUrls`. Image bytes are threaded through the renderers as an optional `imageMap` (no mutation of the source body); failures degrade to placeholders rather than aborting the export.
+  - Export page gains a **"Fetch & embed image bytes"** toggle (on by default) with per-image progress.
+  - **Manifest:** added `https://*.oaiusercontent.com/*` host permission so the extension can read the cross-origin image bytes; version 2.6.0 → 2.6.1.
+  - +6 tests (38 in the ChatGPT suite, 188 total). Still read-only; still no Scry sync.
+  - **Known limits:** signed URLs on hosts other than `*.oaiusercontent.com` will fall back to placeholders (add the host to permissions if OpenAI changes it); original non-image file bytes and Canvas/artifacts remain unsupported (see docs/TODO.md).
+
+## [2.6.0] — ChatGPT export (read-only PoC, Chrome)
+
+- **New ChatGPT source adapter (proof of concept).** Read-only export of ChatGPT conversations to Markdown or JSON, proving the data path end-to-end without touching the Scry sync pipeline or backend.
+  - **`chatgpt_adapter.js`** — the ChatGPT counterpart to the Claude-specific layer (content.js + utils.js). Pure, unit-tested transforms: walk ChatGPT's `mapping` tree from `current_node` to root (the analog of Claude's `getCurrentBranch`), drop system/hidden/empty turns, extract text across content types (text, multimodal_text with image placeholders, code, execution_output), normalize to a source-agnostic `{ id, title, created_at, updated_at, model, messages[] }` shape, and render Markdown/JSON. Plus browser-side fetchers for chatgpt.com's `backend-api` (bearer-token auth via `/api/auth/session`, paginated conversation list, conversation body).
+  - **`chatgpt.html` / `chatgpt.js`** — a standalone PoC page: load your ChatGPT conversation list, export any conversation (or a multi-select ZIP) to Markdown/JSON. Reachable from Options → *ChatGPT Export (Beta)*.
+  - **Manifest** — added `chatgpt.com` / `chat.openai.com` host permissions and exposed `chatgpt.html` as a web-accessible resource.
+  - **Tests** — 22 new unit tests (`tests/chatgpt_adapter.test.js`) covering branch reconstruction (including superseded-branch exclusion and leaf fallback), message filtering, text extraction, timestamp normalization, and rendering.
+  - **Hardened against the reference implementation** (pionxzh/chatgpt-exporter). Cross-checked the adapter against their `src/api.ts` and fixed real gaps: skip messages addressed to a tool (`recipient !== 'all'`) so tool-call payloads no longer leak into exports; skip hidden `thoughts`/`reasoning_recap` and `model_editable_context`/`user_editable_context`; keep tool messages only when they render an image; send `X-Authorization` alongside `Authorization` (and plumb `Chatgpt-Account-Id` for team accounts); add `ChatGptRateLimitError` (429 + `Retry-After`); render code-interpreter images from `aggregate_result`; derive the model by scanning message `model_slug` when `default_model_slug` is absent. +10 tests (32 in the ChatGPT suite, 182 total).
+  - **Scope note:** this is the *adapter + export* half only. A true ChatGPT *sync* additionally needs the Scry backend to learn `source_type: 'chatgpt'` (ingest / reconcile / verify-deletable), which lives outside this repo. Firefox mirror, image-byte capture, and team-account auto-detection are pending (Chrome-first PoC) — see docs/TODO.md.
+
 ## [2.0.1]
 
 - **Retry transient sync failures.** A single image-heavy conversation could fail with `TypeError: Failed to fetch` when Scry's Flask dev server dropped the large POST mid-flight. The sync loop now retries each ingest POST up to 2× with linear backoff (via a new tested `withRetry` in `scry_sync.js`), retrying on a thrown network error or a 5xx — but not on 4xx/auth. Failures that still exhaust retries continue to be caught per-conversation and picked up on the next run (they're never marked synced). 5 new unit tests.

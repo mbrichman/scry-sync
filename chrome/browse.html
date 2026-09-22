@@ -32,6 +32,8 @@
       --badge-sonnet: #ce5c04;
       --badge-haiku: #09923b;
       --badge-opus: #7c3aed;
+      --ok-color: #22c55e;
+      --warn-color: #d97706;
     }
 
     @media (prefers-color-scheme: dark) {
@@ -63,6 +65,8 @@
         --badge-sonnet: #ffaa66;
         --badge-haiku: #66cc66;
         --badge-opus: #c084cc;
+        --ok-color: #4ade80;
+        --warn-color: #fbbf24;
       }
     }
 
@@ -94,6 +98,8 @@
       --badge-sonnet: #ffaa66;
       --badge-haiku: #66cc66;
       --badge-opus: #c084cc;
+      --ok-color: #4ade80;
+      --warn-color: #fbbf24;
     }
 
     * {
@@ -109,15 +115,14 @@
       line-height: 1.6;
       /* Keep the table fully visible at all times. When the viewport is
          narrower than this, the PAGE scrolls horizontally instead of the
-         table shrinking or being clipped. 1140 = 1100 (table min-width)
-         + 2 * 20px (.container horizontal padding). */
-      min-width: 1140px;
+         table shrinking or being clipped. */
+      min-width: 1000px;
     }
-    
+
     .header {
       background: var(--bg-card);
       border-bottom: 1px solid var(--border-color);
-      padding: 20px;
+      padding: 16px 20px;
       position: sticky;
       top: 0;
       z-index: 100;
@@ -127,14 +132,23 @@
     .header-top {
       display: flex;
       align-items: center;
-      gap: 15px;
-      margin-bottom: 15px;
+      justify-content: space-between;
+      width: 100%;
+      gap: 20px;
+      margin-bottom: 12px;
     }
 
-    .header h1 {
+    .header-left {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      flex-shrink: 0;
+    }
+
+    .header-left h1 {
       color: var(--primary-color);
       margin: 0;
-      flex: 1;
+      font-size: 20px;
     }
 
     .settings-wrapper {
@@ -242,7 +256,50 @@
     .settings-item-has-submenu:hover .settings-submenu {
       display: block;
     }
-    
+
+    /* --- Scry connection indicator --- */
+    .conn-status {
+      font-size: 13px;
+      color: var(--text-secondary);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+    .conn-dot {
+      font-size: 10px;
+      color: var(--disabled-text);
+      line-height: 1;
+    }
+    .conn-dot.connected { color: var(--ok-color); }
+
+    /* --- source tabs --- */
+    .source-tabs {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+    .source-tab {
+      background: var(--secondary-bg);
+      border: 1px solid var(--border-color);
+      border-radius: 18px;
+      padding: 6px 16px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .source-tab:hover {
+      border-color: var(--primary-color);
+      color: var(--primary-color);
+    }
+    .source-tab.active {
+      background: var(--primary-color);
+      border-color: var(--primary-color);
+      color: #fff;
+    }
+
     .controls {
       display: flex;
       flex-wrap: wrap;
@@ -250,13 +307,21 @@
       align-items: center;
       justify-content: space-between;
     }
-    
+
+    .search-group {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-grow: 1;
+      max-width: 540px;
+    }
+
     .search-box {
       flex-grow: 1;
       max-width: 500px;
       position: relative;
     }
-    
+
     .search-box input {
       width: 100%;
       padding: 10px 40px 10px 15px;
@@ -286,196 +351,9 @@
       padding: 5px;
       display: none;
     }
-    
+
     .search-box.has-text .clear-btn {
       display: block;
-    }
-    
-    .filter-group {
-      display: flex;
-      gap: 10px;
-      align-items: center;
-    }
-    
-    .filter-group label {
-      font-size: 14px;
-      color: var(--text-secondary);
-    }
-
-    .filter-group select {
-      padding: 8px 12px;
-      border: 1px solid var(--input-border);
-      border-radius: 5px;
-      font-size: 14px;
-      background: var(--bg-card);
-      color: var(--text-primary);
-      cursor: pointer;
-    }
-
-    .stats {
-      font-size: 14px;
-      color: var(--text-secondary);
-    }
-    
-    .export-all-btn {
-      padding: 10px 20px;
-      background: var(--primary-color);
-      color: white;
-      border: none;
-      border-radius: 5px;
-      font-size: 14px;
-      cursor: pointer;
-      transition: background 0.2s;
-    }
-
-    .export-all-btn:hover {
-      background: var(--primary-hover);
-    }
-
-    .export-all-btn:disabled {
-      background: var(--disabled-bg);
-      color: var(--disabled-text);
-      cursor: not-allowed;
-    }
-    
-    .container {
-      max-width: 1600px;
-      margin: 20px auto;
-      padding: 0 20px;
-    }
-    
-    .conversations-table {
-      background: var(--bg-card);
-      border-radius: 8px;
-      overflow: hidden;
-      box-shadow: 0 2px 8px var(--shadow-sm);
-    }
-
-    table {
-      width: 100%;
-      min-width: 1100px;
-      border-collapse: collapse;
-    }
-
-    thead {
-      background: var(--secondary-bg);
-      border-bottom: 3px solid var(--bg-body);
-    }
-
-    th {
-      padding: 15px;
-      padding-right: 25px;
-      text-align: left;
-      font-weight: 600;
-      color: var(--text-secondary);
-      font-size: 13px;
-      text-transform: uppercase;
-      letter-spacing: 0.5px;
-      cursor: pointer;
-      user-select: none;
-      position: relative;
-      white-space: nowrap;
-    }
-
-    th.sortable:hover {
-      background: var(--hover-bg);
-    }
-    
-    th.sorted-asc::after,
-    th.sorted-desc::after {
-      content: '';
-      position: absolute;
-      right: 10px;
-      top: 50%;
-      transform: translateY(-50%);
-      width: 0;
-      height: 0;
-      border-left: 5px solid transparent;
-      border-right: 5px solid transparent;
-    }
-    
-    th.sorted-asc::after {
-      border-bottom: 5px solid var(--primary-color);
-    }
-
-    th.sorted-desc::after {
-      border-top: 5px solid var(--primary-color);
-    }
-
-    .sort-indicator {
-      margin-left: 5px;
-      color: var(--primary-color);
-      font-size: 14px;
-      font-weight: normal;
-    }
-
-    .sort-indicator sub {
-      font-size: 10px;
-      margin-left: 1px;
-    }
-
-    th.sortable {
-      cursor: pointer;
-      user-select: none;
-    }
-
-    tbody tr {
-      border-bottom: 1px solid var(--border-light);
-      transition: background 0.1s;
-    }
-
-    tbody tr:hover {
-      background: var(--hover-bg);
-    }
-    
-    td {
-      padding: 15px 20px;
-      font-size: 14px;
-    }
-    
-    .conversation-name {
-      font-weight: 500;
-      color: var(--text-primary);
-      max-width: 400px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .new-dot {
-      width: 8px;
-      height: 8px;
-      min-width: 8px;
-      border-radius: 50%;
-      background: #22c55e;
-      display: inline-block;
-    }
-
-    .conversation-name a {
-      color: inherit;
-      text-decoration: none;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .conversation-name a:hover {
-      color: var(--link-hover);
-      text-decoration: underline;
-    }
-
-    .search-group {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      flex-grow: 1;
-      max-width: 540px;
-    }
-
-    .search-group .search-box {
-      max-width: none;
     }
 
     .filter-wrapper {
@@ -495,6 +373,7 @@
       color: var(--text-secondary);
       transition: all 0.2s;
       position: relative;
+      flex-shrink: 0;
     }
 
     .filter-btn:hover {
@@ -512,7 +391,7 @@
       display: none;
       position: absolute;
       top: calc(100% + 4px);
-      right: 0;
+      left: 0;
       background: var(--bg-card);
       border: 1px solid var(--border-color);
       border-radius: 8px;
@@ -543,10 +422,137 @@
       font-weight: 600;
     }
 
-    .filter-divider {
-      height: 1px;
-      background: var(--border-color);
-      margin: 4px 0;
+    .stats {
+      font-size: 13px;
+      color: var(--text-secondary);
+      white-space: nowrap;
+    }
+
+    .action-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      justify-content: flex-end;
+    }
+
+    .action-btn {
+      padding: 9px 16px;
+      background: var(--primary-color);
+      color: white;
+      border: none;
+      border-radius: 5px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: background 0.2s;
+      white-space: nowrap;
+    }
+
+    .action-btn:hover {
+      background: var(--primary-hover);
+    }
+
+    .action-btn:disabled {
+      background: var(--disabled-bg);
+      color: var(--disabled-text);
+      cursor: not-allowed;
+    }
+
+    .action-btn.danger {
+      background: var(--cancel-btn);
+    }
+
+    .container {
+      max-width: 1600px;
+      margin: 20px auto;
+      padding: 0 20px;
+    }
+
+    .conversations-table {
+      background: var(--bg-card);
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 2px 8px var(--shadow-sm);
+    }
+
+    table {
+      width: 100%;
+      min-width: 900px;
+      border-collapse: collapse;
+    }
+
+    thead {
+      background: var(--secondary-bg);
+      border-bottom: 3px solid var(--bg-body);
+    }
+
+    th {
+      padding: 15px;
+      padding-right: 25px;
+      text-align: left;
+      font-weight: 600;
+      color: var(--text-secondary);
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      cursor: pointer;
+      user-select: none;
+      position: relative;
+      white-space: nowrap;
+    }
+
+    th.sortable:hover {
+      background: var(--hover-bg);
+    }
+
+    .sort-indicator {
+      margin-left: 5px;
+      color: var(--primary-color);
+      font-size: 14px;
+      font-weight: normal;
+    }
+
+    .sort-indicator sub {
+      font-size: 10px;
+      margin-left: 1px;
+    }
+
+    tbody tr {
+      border-bottom: 1px solid var(--border-light);
+      transition: background 0.1s;
+    }
+
+    tbody tr:hover {
+      background: var(--hover-bg);
+    }
+
+    td {
+      padding: 15px 20px;
+      font-size: 14px;
+    }
+
+    .conversation-name {
+      font-weight: 500;
+      color: var(--text-primary);
+      max-width: 420px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .conversation-name a {
+      color: inherit;
+      text-decoration: none;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .conversation-name a:hover {
+      color: var(--link-hover);
+      text-decoration: underline;
     }
 
     .date {
@@ -555,11 +561,16 @@
       line-height: 1.4;
     }
 
-    .time {
-      font-size: 11px;
-      color: var(--text-muted);
+    .synced-badge {
+      font-size: 13px;
+      white-space: nowrap;
+      font-weight: 500;
     }
-    
+    .synced-badge.synced { color: var(--ok-color); }
+    .synced-badge.stale { color: var(--warn-color); }
+    .synced-badge.missing { color: var(--text-muted); }
+    .synced-badge.unknown { color: var(--text-muted); }
+
     .model-badge {
       display: inline-block;
       padding: 3px 0;
@@ -570,32 +581,26 @@
       white-space: nowrap;
     }
 
-    .model-badge.sonnet {
-      color: var(--badge-sonnet);
-    }
-
-    .model-badge.haiku {
-      color: var(--badge-haiku);
-    }
-
-    .model-badge.opus {
-      color: var(--badge-opus);
-    }
+    .model-badge.sonnet { color: var(--badge-sonnet); }
+    .model-badge.haiku { color: var(--badge-haiku); }
+    .model-badge.opus { color: var(--badge-opus); }
 
     .model-bounced {
       margin-left: 4px;
       font-size: 12px;
       color: var(--badge-default);
     }
-
     .model-bounced.sonnet { color: var(--badge-sonnet); }
     .model-bounced.haiku  { color: var(--badge-haiku); }
     .model-bounced.opus   { color: var(--badge-opus); }
 
-    /* Wrapper that carries the tooltip + cursor so hover works on the badge or asterisk */
     .model-cell {
       display: inline-block;
       cursor: help;
+    }
+
+    .model-none {
+      color: var(--text-muted);
     }
 
     .actions {
@@ -617,7 +622,7 @@
       vertical-align: middle;
       margin: 0;
     }
-    
+
     .btn-small {
       padding: 6px 12px;
       border: none;
@@ -626,14 +631,11 @@
       cursor: pointer;
       transition: all 0.2s;
       font-weight: 500;
-    }
-    
-    .btn-export {
       background: var(--primary-color);
       color: white;
     }
 
-    .btn-export:hover {
+    .btn-small:hover {
       background: var(--primary-hover);
     }
 
@@ -642,7 +644,7 @@
       color: var(--disabled-text);
       cursor: not-allowed;
     }
-    
+
     .loading {
       text-align: center;
       padding: 40px;
@@ -660,7 +662,7 @@
       padding: 40px;
       color: var(--text-secondary);
     }
-    
+
     .spinner {
       display: inline-block;
       width: 30px;
@@ -671,39 +673,12 @@
       animation: spin 1s linear infinite;
       margin-bottom: 10px;
     }
-    
+
     @keyframes spin {
       0% { transform: rotate(0deg); }
       100% { transform: rotate(360deg); }
     }
-    
-    .export-options {
-      position: fixed;
-      bottom: 20px;
-      right: 20px;
-      background: var(--bg-card);
-      padding: 15px;
-      border-radius: 8px;
-      box-shadow: 0 4px 12px var(--shadow-md);
-      display: none;
-      z-index: 1000;
-    }
-    
-    .export-options.show {
-      display: block;
-    }
-    
-    .export-options h3 {
-      margin-bottom: 10px;
-      font-size: 14px;
-    }
-    
-    .export-options label {
-      display: block;
-      margin: 8px 0;
-      font-size: 13px;
-    }
-    
+
     .toast {
       position: fixed;
       bottom: 20px;
@@ -718,21 +693,25 @@
       display: none;
       box-shadow: 0 4px 12px var(--shadow-md);
     }
-    
+
     .toast.show {
       display: block;
       animation: slideUp 0.3s ease;
     }
-    
+
     @keyframes slideUp {
-      from {
-        transform: translateX(-50%) translateY(100px);
-        opacity: 0;
-      }
-      to {
-        transform: translateX(-50%) translateY(0);
-        opacity: 1;
-      }
+      from { transform: translateX(-50%) translateY(100px); opacity: 0; }
+      to { transform: translateX(-50%) translateY(0); opacity: 1; }
+    }
+
+    /* --- continuous-sync footer --- */
+    .continuous-footer {
+      max-width: 1600px;
+      margin: 0 auto 24px;
+      padding: 10px 20px;
+      font-size: 12px;
+      color: var(--text-muted);
+      text-align: center;
     }
   </style>
 </head>
@@ -761,7 +740,7 @@
             </div>
             <div class="settings-divider"></div>
             <div class="settings-item" id="settingsOrgId">
-              <span class="settings-label">Org ID</span>
+              <span class="settings-label">Claude Org ID</span>
               <span class="settings-value settings-org-id" id="orgIdDisplay" title="">Auto-detected</span>
             </div>
             <div class="settings-item" id="editOrgId">
@@ -793,16 +772,16 @@
       </div>
 
       <div class="header-right">
-        <div class="stats" id="stats">
-          Loading...
-        </div>
+        <div class="conn-status" id="scryConnStatus">Scry: <span class="conn-dot">●</span></div>
       </div>
     </div>
+
+    <div class="source-tabs" id="sourceTabs"></div>
 
     <div class="controls">
       <div class="search-group">
         <div class="search-box" id="searchBox">
-          <input type="text" id="searchInput" placeholder="Search conversations by name...">
+          <input type="text" id="searchInput" placeholder="Search conversations by title...">
           <button class="clear-btn" id="clearSearch">✕</button>
         </div>
         <div class="filter-wrapper">
@@ -815,133 +794,54 @@
             <div class="filter-option" data-value="all">All conversations</div>
             <div class="filter-option" data-value="new">Needs sync</div>
             <div class="filter-option" data-value="synced">Previously synced</div>
-            <div class="filter-divider"></div>
-            <div class="filter-option" data-value="projects">Search projects</div>
           </div>
         </div>
+        <div class="stats" id="stats">Loading...</div>
       </div>
 
-      <div class="export-controls-wrapper">
-        <div class="scry-sync-controls" style="display: inline-flex; align-items: center; gap: 6px;">
-          <button class="export-all-btn" id="syncAllScryBtn" disabled title="Push every conversation (with images) to Scry">
-            Sync all to Scry
-          </button>
-          <button class="export-all-btn" id="syncRecentScryBtn" disabled title="Push conversations updated in the last N days to Scry">
-            Sync last
-          </button>
-          <input type="number" id="syncRecentDays" value="7" min="1" max="3650"
-                 style="width: 56px; padding: 6px; text-align: right;" title="Number of days">
-          <span style="color: var(--text-secondary);">days</span>
-          <button class="export-all-btn" id="reconcileScryBtn" disabled
-                  title="Ask Scry which conversations are missing or incompletely captured, and re-sync exactly those">
-            Reconcile
-          </button>
-          <button class="export-all-btn" id="deleteFromClaudeBtn" disabled
-                  style="background: var(--cancel-btn, #d32f2f); color: #fff;"
-                  title="Delete the SELECTED conversations from Claude — but only after Scry re-verifies each one live (capture complete AND live body matches the archive). Irreversible at Claude; Scry keeps its copy.">
-            Delete selected from Claude
-          </button>
-        </div>
+      <div class="action-controls">
+        <button class="action-btn" id="syncSelectedBtn" disabled title="Push the selected conversations to Scry">
+          Sync selected ›
+        </button>
+        <button class="action-btn" id="syncRecentBtn" disabled title="Push conversations updated in the last N days to Scry">
+          Sync last
+        </button>
+        <input type="number" id="syncRecentDays" value="7" min="1" max="3650"
+               style="width: 56px; padding: 6px; text-align: right;" title="Number of days">
+        <span style="color: var(--text-secondary); font-size: 13px;">days ›</span>
+        <button class="action-btn" id="reconcileBtn" disabled
+                title="Ask Scry which conversations are missing or incompletely captured, and re-sync exactly those">
+          Reconcile &amp; sync ›
+        </button>
+        <button class="action-btn danger" id="deleteFromClaudeBtn" disabled
+                title="Delete the SELECTED conversations from Claude — but only after Scry re-verifies each one live (capture complete AND live body matches the archive). Irreversible at Claude; Scry keeps its copy.">
+          Delete selected from Claude
+        </button>
       </div>
     </div>
   </div>
-  
+
   <div class="container">
     <div class="conversations-table">
       <div id="tableContent">
         <div class="loading">
           <div class="spinner"></div>
-          <div id="loadingText">Fetching organization ID...</div>
+          <div id="loadingText">Loading…</div>
         </div>
       </div>
     </div>
   </div>
-  
-  <!-- Export options moved to header for better visibility -->
-  <style>
-    .header-top {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      width: 100%;
-      gap: 20px;
-    }
-    .header-left {
-      display: flex;
-      align-items: center;
-      gap: 20px;
-      flex-shrink: 0;
-    }
-    .header-left h1 {
-      margin: 0;
-    }
-    .header-right {
-      display: flex;
-      align-items: center;
-      flex-shrink: 0;
-    }
-    .header-right .stats {
-      margin: 0;
-    }
-    .export-controls-wrapper {
-      display: flex;
-      flex-wrap: wrap;
-      align-items: center;
-      gap: 15px;
-    }
-    .export-settings {
-      display: inline-flex;
-      flex-wrap: wrap;
-      gap: 15px;
-      align-items: center;
-      padding: 8px 15px;
-      background: var(--secondary-bg);
-      border-radius: 5px;
-    }
-    .export-row {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 20px;
-      align-items: center;
-    }
-    .export-section {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 15px;
-      align-items: center;
-    }
-    .section-divider {
-      width: 1px;
-      height: 25px;
-      background: var(--input-border);
-      align-self: center;
-    }
-    .export-settings label {
-      display: flex;
-      align-items: center;
-      gap: 5px;
-      font-size: 13px;
-      color: var(--text-secondary);
-      white-space: nowrap;
-    }
-    .export-settings select {
-      padding: 4px 8px;
-      border: 1px solid var(--input-border);
-      border-radius: 3px;
-      font-size: 13px;
-      background-color: var(--bg-card);
-      color: var(--text-primary);
-    }
-  </style>
-  
+
+  <div class="continuous-footer" id="continuousFooter"></div>
+
   <div class="toast" id="toast"></div>
-  
-  <!-- Progress modal for bulk export -->
+
+  <!-- Progress modal for bulk sync/reconcile/delete -->
   <div id="progressModal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--modal-overlay); z-index: 3000;">
     <div style="position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); background: var(--bg-card); padding: 30px; border-radius: 8px; min-width: 400px; color: var(--text-primary);">
-      <h3 style="margin-top: 0; color: var(--text-primary);">Exporting Conversations</h3>
+      <h3 style="margin-top: 0; color: var(--text-primary);">Syncing Conversations</h3>
       <div style="margin: 20px 0;">
-        <div id="progressText" style="color: var(--text-primary);">Preparing export...</div>
+        <div id="progressText" style="color: var(--text-primary);">Preparing…</div>
         <div style="background: var(--progress-bg); height: 20px; border-radius: 10px; margin-top: 10px; overflow: hidden;">
           <div id="progressBar" style="background: var(--primary-color); height: 100%; width: 0%; transition: width 0.3s;"></div>
         </div>
@@ -950,13 +850,14 @@
       <button id="cancelExport" style="padding: 8px 16px; background: var(--cancel-btn); color: white; border: none; border-radius: 4px; cursor: pointer;">Cancel</button>
     </div>
   </div>
-  
-  <!-- JSZip library for creating ZIP archives -->
-  <!-- Official source: https://github.com/Stuk/jszip -->
-  <!-- Website: https://stuk.github.io/jszip/ -->
+
   <script src="utils.js"></script>
   <script src="scry_sync.js"></script>
   <script src="scry_client.js"></script>
+  <script src="chatgpt_adapter.js"></script>
+  <script src="sources.js"></script>
+  <script src="sync_core.js"></script>
+  <script src="dashboard_model.js"></script>
   <script src="browse.js"></script>
 </body>
 </html>

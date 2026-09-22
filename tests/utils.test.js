@@ -11,6 +11,7 @@ const {
   imageAssetName,
   imageAssetUrl,
   collectImageFiles,
+  mergeScrySetting,
 } = utils;
 
 // Regression coverage for the bug fixed in v1.9.1: bash/web_search/repl
@@ -318,5 +319,36 @@ describe('image file handling', () => {
       ],
     };
     expect(collectImageFiles(data)).toHaveLength(0);
+  });
+});
+
+// Backs options.js's per-checkbox immediate-persist (Sources block: Claude
+// continuous sync, ChatGPT enable, ChatGPT continuous sync) — each writes its
+// OWN key rather than the Save button's old whole-object replace, which is
+// exactly how a real bug shipped in v2.8.0: ticking "Enable ChatGPT" without
+// also hitting the (unrelated) Scry-connection Save button was silently
+// never persisted.
+describe('mergeScrySetting', () => {
+  it('sets a key on an empty/undefined existing blob', () => {
+    expect(mergeScrySetting(undefined, 'chatgptEnabled', true)).toEqual({ chatgptEnabled: true });
+    expect(mergeScrySetting({}, 'chatgptEnabled', true)).toEqual({ chatgptEnabled: true });
+  });
+
+  it('preserves every OTHER existing key untouched', () => {
+    const existing = { url: 'http://host:5001', token: 'tok', concurrency: 4, chatgptEnabled: false };
+    const result = mergeScrySetting(existing, 'chatgptEnabled', true);
+    expect(result).toEqual({ url: 'http://host:5001', token: 'tok', concurrency: 4, chatgptEnabled: true });
+  });
+
+  it('overwrites only the named key, never mutates the input object', () => {
+    const existing = { continuousSync: true };
+    const result = mergeScrySetting(existing, 'continuousSync', false);
+    expect(result).toEqual({ continuousSync: false });
+    expect(existing).toEqual({ continuousSync: true }); // input untouched
+    expect(result).not.toBe(existing); // a new object, not the same reference
+  });
+
+  it('null existing behaves like an empty blob', () => {
+    expect(mergeScrySetting(null, 'chatgptContinuousSync', false)).toEqual({ chatgptContinuousSync: false });
   });
 });

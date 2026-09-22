@@ -1,8 +1,8 @@
 {
     "manifest_version": 3,
     "name": "Scry Sync",
-    "version": "2.5.5",
-    "description": "Sync your Claude.ai conversations (with images and file originals) into Scry.",
+    "version": "3.0.0",
+    "description": "Sync your Claude.ai and ChatGPT conversations (with images and file originals) into Scry.",
       "permissions": [
     "activeTab",
     "storage",
@@ -11,7 +11,10 @@
     "alarms"
   ],
     "host_permissions": [
-      "https://claude.ai/*"
+      "https://claude.ai/*",
+      "https://chatgpt.com/*",
+      "https://chat.openai.com/*",
+      "https://*.oaiusercontent.com/*"
     ],
     "optional_host_permissions": [
       "http://*/*",

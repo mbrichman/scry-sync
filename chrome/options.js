@@ -176,6 +176,37 @@ function scryOriginPattern(url) {
   }
 }
 
+// Show/hide the ChatGPT continuous-sync sub-fields based on the "Enable
+// ChatGPT" checkbox. Elements stay in the DOM (just display:none) so their
+// values/listeners are unaffected.
+function syncChatGptFieldsVisibility() {
+  const enabled = document.getElementById('scryChatGptEnabled').checked;
+  document.getElementById('chatGptEnabledFields').style.display = enabled ? '' : 'none';
+}
+
+// Read-merge-write ONE key of the 'scry' blob and persist it immediately —
+// used by every Sources-block checkbox (Claude continuous sync, ChatGPT
+// enable, ChatGPT continuous sync) so each persists itself on 'change' rather
+// than waiting for a Save button click. Real bug this fixes (v2.8.0): those
+// checkboxes were ONLY ever written by the Scry-connection section's Save
+// button, so ticking "Enable ChatGPT" and never touching Save (a normal thing
+// to do — nothing about that section looked related) silently did nothing;
+// the popup kept omitting ChatGPT. `savedElId`, if given, flashes a brief
+// inline "Saved" confirmation next to the checkbox.
+function persistScrySetting(key, value, savedElId) {
+  chrome.storage.local.get(['scry'], (result) => {
+    const updated = mergeScrySetting(result.scry, key, value);
+    chrome.storage.local.set({ scry: updated }, () => {
+      if (!savedElId) return;
+      const el = document.getElementById(savedElId);
+      if (!el) return;
+      el.style.display = 'inline';
+      clearTimeout(el._hideTimer);
+      el._hideTimer = setTimeout(() => { el.style.display = 'none'; }, 1500);
+    });
+  });
+}
+
 // Load saved Scry settings into the form.
 document.addEventListener('DOMContentLoaded', () => {
   chrome.storage.local.get(['scry'], (result) => {
@@ -185,9 +216,32 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('scryConcurrency').value = scry.concurrency || 4;
     // Absent = enabled (default-on): only an explicit false unchecks.
     document.getElementById('scryContinuous').checked = scry.continuousSync !== false;
+    // ChatGPT is the OPPOSITE default: absent/undefined = OFF, so an existing
+    // install never starts hitting chatgpt.com just because this shipped.
+    // Only an explicit true turns it on.
+    document.getElementById('scryChatGptEnabled').checked = scry.chatgptEnabled === true;
+    document.getElementById('scryChatGptContinuous').checked = scry.chatgptContinuousSync !== false;
+    syncChatGptFieldsVisibility();
   });
 });
 
+document.getElementById('scryContinuous').addEventListener('change', (e) => {
+  persistScrySetting('continuousSync', e.target.checked, 'scryContinuousSaved');
+});
+
+document.getElementById('scryChatGptEnabled').addEventListener('change', (e) => {
+  syncChatGptFieldsVisibility();
+  persistScrySetting('chatgptEnabled', e.target.checked, 'scryChatGptEnabledSaved');
+});
+
+document.getElementById('scryChatGptContinuous').addEventListener('change', (e) => {
+  persistScrySetting('chatgptContinuousSync', e.target.checked, 'scryChatGptContinuousSaved');
+});
+
+// URL/token/concurrency ONLY — the Sources checkboxes above persist
+// themselves. Reads the current blob and merges these three keys in rather
+// than replacing the whole object, so it can never clobber a checkbox state
+// set since the page loaded.
 document.getElementById('saveScryBtn').addEventListener('click', () => {
   const url = document.getElementById('scryUrl').value.trim().replace(/\/+$/, '');
   const token = document.getElementById('scryToken').value.trim();
@@ -202,20 +256,23 @@ document.getElementById('saveScryBtn').addEventListener('click', () => {
   }
 
   // How many conversations the bulk sync processes at once. Clamp to a sane
-  // range so a typo can't hammer claude.ai or stall on a huge value.
+  // range so a typo can't hammer the source or stall on a huge value.
   let concurrency = parseInt(document.getElementById('scryConcurrency').value, 10);
   if (!Number.isFinite(concurrency)) concurrency = 4;
   concurrency = Math.max(1, Math.min(concurrency, 12));
 
-  const continuousSync = document.getElementById('scryContinuous').checked;
-
   // Pre-request the host permission so the later sync fetch isn't blocked.
   chrome.permissions.request({ origins: [scryOriginPattern(url)] }, (granted) => {
-    chrome.storage.local.set({ scry: { url, token, concurrency, continuousSync } }, () => {
-      showStatus('scryStatus',
-        granted ? 'Scry settings saved.' : 'Saved, but host permission was declined — sync will fail until granted.',
-        granted ? 'success' : 'error');
-      setTimeout(() => hideStatus('scryStatus'), 4000);
+    chrome.storage.local.get(['scry'], (result) => {
+      let updated = mergeScrySetting(result.scry, 'url', url);
+      updated = mergeScrySetting(updated, 'token', token);
+      updated = mergeScrySetting(updated, 'concurrency', concurrency);
+      chrome.storage.local.set({ scry: updated }, () => {
+        showStatus('scryStatus',
+          granted ? 'Scry connection saved.' : 'Saved, but host permission was declined — sync will fail until granted.',
+          granted ? 'success' : 'error');
+        setTimeout(() => hideStatus('scryStatus'), 4000);
+      });
     });
   });
 });

@@ -1,118 +1,40 @@
-# Claude Exporter - Development Guide
+# Scry Sync — Development Guide
 
-## Communication Style
+Chrome extension (MV3, `chrome/`) that pushes Claude.ai and ChatGPT conversations into the owner's Scry instance. **Sync-only** (no file export — Scry is the archive) and **Chrome-only** (the Firefox tree was retired in v2.8.0). The server side lives in the `scry` repo; its `CLAUDE.md` and decision trace govern any change that touches the ingest / reconcile / verify contracts.
 
-- Narrate what you're doing at each step — brief status updates help the user follow along and make the chat searchable
-- Be patient with tangents and context-switching (ADHD-friendly pacing)
-- Keep explanations concise but don't skip them
-- **Scope guard:** Gently remind the user when a tangent is pulling away from the current task. User tends to spiral into feature ideas mid-implementation — help stay focused on finishing the current thing before starting the next. A quick "want to add that to TODO and finish X first?" goes a long way.
+## Layout
 
-## Self-Maintenance
+- `chrome/manifest.json` — the only manifest. Bump `"version"` on every user-visible change.
+- `chrome/utils.js` — pure Claude helpers (branch walk, model names, file collection) + shared pure utilities (`mergeStorageData`, `mergeScrySetting`) + backup/restore + diagnostics.
+- `chrome/scry_sync.js` — pure sync helpers: `buildIngestPayload`, `withRetry`, `runPool`, selection.
+- `chrome/scry_client.js` — impure: Scry HTTP (`postToScry`, `reconcileWithScry(scry, items, sourceType)`, `verifyDeletableWithScry`), Claude fetchers (`listClaudeConversations`, `fetchConversationBody`, org-id auto-detect — `detectClaudeOrgId`/`selectClaudeOrgId`, no tab relay), and the continuous-sync status-line helpers shared by the popup and the dashboard footer (`formatRelativeTime`, `formatSourceStatus`, `getContinuousSyncStates`).
+- `chrome/chatgpt_adapter.js` — ChatGPT source: pure transforms + impure chatgpt.com fetchers (`getChatGptAccessToken`, `listAllChatGptConversations`, `fetchChatGptConversation`, `fetchChatGptFileBlobs` — bounded pool, default concurrency 3 — `buildChatGptIngestPayload`). `buildChatGptFileBlob` recovers a real image mime (magic-byte sniff, then file_name extension) when chatgpt.com's byte response carries none.
+- `chrome/sources.js` — the `SOURCES` registry (`claude`, `chatgpt`): everything the shared sync core and the continuous-sync orchestrator need to enumerate / sync-one / reconcile / classify errors for a source, plus each source's error-classification helpers. `SOURCES.chatgpt.syncOne` reports sub-item status ("images N/M", "rate limited — waiting Ns") via `ctx.onStatus` when a caller sets one.
+- `chrome/sync_core.js` — the shared sync core: `syncBatch`/`reconcileAndSync`, the ONE implementation of "sync a batch for a source", used by the dashboard, the popup, and the continuous engine. `syncBatch`'s `opts.onStatus` is attached to `ctx.onStatus` for the call's duration.
+- `chrome/dashboard_model.js` — pure model behind the unified dashboard: which source tabs to show (`visibleSourceTabs`), tab labels (`tabLabel`), row mapping (`toRow`), the synced-status badge (`syncedBadge`), and the popup's site-detection helper (`detectSyncTarget`).
+- `chrome/continuous_sync.js` — the background engine: pure planning/state machine + `runAllContinuousSyncs`. Loaded by `background.js` via `importScripts` (order matters: `utils`, `scry_sync`, `scry_client`, `chatgpt_adapter`, `sources`, `sync_core`, `continuous_sync`).
+- `chrome/background.js` — alarms (15-min incremental, daily deep reconcile).
+- `chrome/browse.*` — the unified dashboard (one page, a tab per visible source: Claude always on, ChatGPT only when enabled in Options and not signed out of chatgpt.com). Claude enumeration is a direct credentialed fetch (`listClaudeConversations`/`detectClaudeOrgId`), not a claude.ai tab relay. Load order: `utils`, `scry_sync`, `scry_client`, `chatgpt_adapter`, `sources`, `sync_core`, `dashboard_model`, `browse`.
+- `chrome/popup.*` — site-aware sync: detects claude.ai vs. chatgpt.com from the active tab (`dashboard_model.detectSyncTarget`) and syncs via `SOURCES[source].syncOne`. Load order: `popup-theme`, `utils`, `scry_sync`, `scry_client`, `chatgpt_adapter`, `sources`, `dashboard_model`, `popup`.
+- `chrome/options.*` — Scry connection (URL/token/concurrency, its own Save) + a Sources block (Claude: org id auto-detected/editable + continuous sync; ChatGPT: enable + continuous sync — each Sources checkbox persists itself immediately via `mergeScrySetting`, no separate Save step) + Backup & Restore + Model Display (Claude only).
+- The standalone ChatGPT page (`chrome/chatgpt.html`/`chrome/chatgpt.js`) was retired — folded into the dashboard's ChatGPT tab. `chrome/jszip.min.js` stays: `background.js` still injects it into claude.ai tabs alongside `content.js`, even though nothing calls into it anymore.
+- `tests/` — vitest over the pure surface. Run `npx vitest run` from the repo root.
 
-This file is the shared project memory. **Update it proactively** when:
+## Rules
 
-- A new critical rule or recurring bug pattern is discovered
-- Project structure changes (new files, renamed files, new architecture patterns)
-- A decision is made about how something should always work (e.g., "exports > 1 file must ZIP")
+- **Bodies go to Scry verbatim.** Never prune a conversation client-side (Claude branch or ChatGPT `mapping`); Scry prunes server-side so import and fidelity verification agree by construction.
+- **File bytes travel as `files[]`** — `{ file_uuid, file_name, file_type, file_variant, data }`. For ChatGPT, `file_uuid` is the asset id after `://` (`file_<hex>` / `file-<b62>`), matching Scry's `extract_asset_id`; that is the key Scry links the message's image record to.
+- **Adding a source = implementing the `SOURCES` contract** (enumerate → `{uuid, updated_at, title}`, syncOne, reconcile, errorDomain, isStubError, optional isSignedOutError, own `stateKey`, `isEnabled`). Do not add a second orchestrator.
+- **Sources are opt-in per user.** Claude is on by default; every other source defaults off (`scry.<source>Enabled`).
+- **Capture only for ChatGPT.** No delete-from-ChatGPT until Scry's `verify-deletable` can prove a `mapping` capture. Claude's delete flow stays server-authoritative: Scry clears an id in the same run it is deleted.
+- **Failures must be visible.** A per-item failure that only reaches `console.warn` reads as success to the user (v2.7.2 shipped that way and "images aren't coming over" was the result). Surface counts and the first error in the status line.
+- **MV3 gotcha:** reloading the extension does NOT refresh the running service worker. After changing anything `background.js` imports, terminate the SW on `chrome://extensions` (or toggle the extension off/on). Diagnostic: manual path works, continuous doesn't ⇒ stale SW.
+- **Test-first** for pure helpers; when a fetcher is involved, stub `global.fetch` as `tests/chatgpt_adapter.test.js` does. Mutation-check new tests (revert the product line, confirm the test fails).
+- **Commit/push only when asked.** PRs need the same dual clearance as the `scry` repo (code-reviewer + Oracle GATE) before merge. Record merges and reversals in the scry decision trace.
+- Keep `docs/CHANGELOG.md` current (one `## [X.Y.Z]` entry per version) and move finished items in `docs/TODO.md`.
 
-Keep it concise. Don't duplicate what's already here — update existing sections instead.
+## Live-measured facts worth not re-deriving
 
-**This file exists in two places:** the workspace root (read by Claude Code) and `src/CLAUDE.md` (tracked in git). When updating, update both copies.
-
-## Project Structure
-- Extension source and git repo lives in `src/`
-- Parallel Chrome (`src/chrome/`) and Firefox (`src/firefox/`) versions — nearly identical copies
-- Chrome uses Manifest V3, Firefox uses Manifest V2
-- Releases go in `releases/vX.Y.Z/`
-
-## Key Files (under `src/chrome/` and `src/firefox/`)
-- `content.js` — Content script injected on claude.ai pages (handles API calls, popup export actions)
-- `utils.js` — Shared utilities (convertToMarkdown, convertToText, downloadFile, extractArtifactFiles, etc.)
-- `browse.js` — Browse page logic (filtering, sorting, has its own export functions, always ZIPs)
-- `background.js` — Re-injects content scripts on install/update
-- `jszip.min.js` — ZIP library
-- `popup.html` / `popup.js` — Extension popup UI and logic
-- `browse.html` — Browse/search conversations page
-
-## Git & Commits
-
-**Auto-commit after every completed change.** Don't wait for the user to ask. After finishing a task (bug fix, feature, refactor), commit immediately with a clear message.
-
-- Git repo is in `src/` — always `cd` there for git commands
-- Write concise, descriptive commit messages: `Fix bulk export to always ZIP instead of individual downloads`
-- Not: `wip`, `fix stuff`, `update`, `final FINAL (1)`
-- Group related changes into one commit (e.g., Chrome + Firefox changes for the same fix = one commit)
-- Don't push unless asked
-- **Branching**: Do all development on `testing` branch. Merge to `main` only when creating a release
-
-## Documentation Upkeep
-
-**After each commit**, update these files:
-
-- **`src/docs/TODO.md`** — Move completed items to the Completed section, update the current version number, clean up any stale entries
-- **`src/docs/CHANGELOG.md`** — Append a short entry under the current version. Create the file if it doesn't exist. Format: `## [X.Y.Z]` header, then bullet points describing changes. Keep entries concise — one line per change is fine
-- The CHANGELOG doubles as store update notes. All changes between the current version and the last `_Published_` marker are what goes into the store listing update
-
-## Release Process
-
-**Only create releases when explicitly asked.** Never auto-release.
-
-When the user asks to create a release for version X.Y.Z:
-
-1. **Verify version** — Confirm both `chrome/manifest.json` and `firefox/manifest.json` show the correct version
-2. **Create release directory** — `mkdir -p releases/vX.Y.Z`
-3. **ZIP Chrome extension** — `cd src/chrome && zip -r ../../releases/vX.Y.Z/claude-exporter-chrome.zip ./*`
-4. **ZIP Firefox extension** — `cd src/firefox && zip -r ../../releases/vX.Y.Z/claude-exporter-firefox.zip ./*` (unsigned; user handles .xpi signing via AMO)
-5. **Git tag** — `cd src && git tag vX.Y.Z -m "Release vX.Y.Z"`
-6. **Push tag** — `git push origin vX.Y.Z`
-7. **Create GitHub release** — `gh release create vX.Y.Z ../releases/vX.Y.Z/* --title "vX.Y.Z" --notes "$(changelog excerpt from docs/CHANGELOG.md)"` — use all changes since last `_Published_` marker as the notes
-8. **Mark as published** — Add `_Published_` line after the released version's entries in docs/CHANGELOG.md, commit
-
-## Critical Rules
-
-### Always apply changes to BOTH browsers
-Every code change to `chrome/` must also be applied to `firefox/`. The files are nearly identical — differences are only in manifest format and API calls (`chrome.scripting.executeScript` vs `chrome.tabs.executeScript`).
-
-### Always bump version on every change
-Update `"version"` in BOTH `chrome/manifest.json` AND `firefox/manifest.json`.
-
-### background.js must inject ALL content scripts
-When re-injecting into already-open tabs (on install/update), background.js must inject all three files: `jszip.min.js`, `utils.js`, AND `content.js`. Injecting only `content.js` causes "JSZip is not defined" / "downloadFile is not defined" / "extractArtifactFiles is not defined" errors on already-open tabs.
-
-### Multi-file exports must always be ZIPped
-Any export producing more than one file should always create a ZIP — never trigger individual browser downloads.
-
-### Manifest name differs by branch
-
-`"name"` in BOTH manifests must be:
-
-- `"Claude Exporter"` on the `main` branch (released version)
-- `"Claude Exporter Beta"` on the `testing` branch (so the user can tell at a glance which build is loaded)
-
-The popup header title is populated from `manifest.name` in `popup.js` (`#header-title`), so the popup automatically reads "Claude Exporter Beta" on the testing branch — no separate HTML edit needed.
-
-When merging `testing` → `main` for a release, flip both manifest names to drop "Beta" as part of the merge.
-
-## Testing
-
-- **Vitest** test harness (`package.json` + `node_modules/`) lives in `src/tests/`. Run tests with `npm test` (one-shot) or `npm run test:watch` (watch mode) from `src/tests/`.
-- Test files live in `src/tests/` and import from `src/chrome/utils.js` (the canonical copy).
-- `firefox/utils.js` is a mirror — if it drifts from `chrome/utils.js`, the tests won't catch it. Keep them in sync per the existing rule.
-- `utils.js` has a conditional `module.exports` block at the bottom that fires only when `module` is defined (Node/vitest). Browser extensions ignore it because the global is undefined.
-- `node_modules/` and `package-lock.json` are gitignored (`package.json` is tracked under `src/tests/`). None are part of the release ZIPs.
-
-## Architecture Notes
-
-### Content Script Injection
-- On fresh page loads: manifest `content_scripts` handles injection of all three JS files
-- On extension install/update: `background.js` re-injects into already-open claude.ai tabs
-- `content.js` has a double-injection guard (`window.claudeExporterContentScriptLoaded`) to prevent duplicate message listeners
-
-### Export Flow
-- **Popup "Export Current"** → sends message to content script on the active claude.ai tab
-- **Popup "Export All"** → sends message to content script, which fetches all conversations and ZIPs them
-- **Browse page** → loads conversation list via content script relay (`sendMessageToClaudeTab`), then exports directly via `fetch()` to claude.ai API
-
-### Chrome vs Firefox API Differences
-- Chrome MV3: `chrome.scripting.executeScript({ target, files })` — accepts file array
-- Firefox MV2: `chrome.tabs.executeScript(tabId, { file })` — one file at a time, must loop
+- chatgpt.com media: `GET backend-api/files/:id/download` is the route that returns a signed URL for image_gen `sediment://` assets; `files/download/:id` and the conversation-scoped attachment route 404. The signed URL is on chatgpt.com itself and needs the session (cookies + bearer); `*.oaiusercontent.com` URLs are signature-authorised and reject credentials.
+- A pointer on an off-branch (regenerated-away) node 404s everywhere; that is expected, not a failure.
+- `/api/auth/session` failing = not signed in; treat as "do nothing", not as a failure streak.

@@ -177,6 +177,27 @@ describe('badgeStateAfter', () => {
   });
 });
 
+describe('applyResult — generalized source domain (ChatGPT support)', () => {
+  const now = Date.parse('2026-07-01T12:00:00Z');
+
+  it('any non-scry domain (e.g. chatgpt) triggers backoff, same as claude', () => {
+    const prior = defaultContinuousSyncState();
+    const next = applyResult(prior, { ok: false, domain: 'chatgpt', error: 'rate limited' }, now);
+    expect(next.consecutiveFailures).toBe(1);
+    expect(next.errorDomain).toBe('chatgpt');
+    expect(next.backoffMs).toBe(15 * 60 * 1000);
+    expect(next.nextAllowedAt).toBe(now + 15 * 60 * 1000);
+  });
+
+  it('a scry-domain failure still never triggers backoff, regardless of which source reported it', () => {
+    const prior = defaultContinuousSyncState();
+    const next = applyResult(prior, { ok: false, domain: 'scry', error: 'mini unreachable' }, now);
+    expect(next.errorDomain).toBe('scry');
+    expect(next.backoffMs).toBeNull();
+    expect(next.nextAllowedAt).toBeNull();
+  });
+});
+
 describe('applyResult', () => {
   const now = Date.parse('2026-07-01T12:00:00Z');
 
@@ -465,5 +486,246 @@ describe('continuous sync enable toggle', () => {
   it('disabled wins over backoff/running/unconfigured — the user turned it off, say so', () => {
     const s = { continuousSyncEnabled: false, configured: false, nextAllowedAt: 999999, running: 900 };
     expect(shouldRun(s, 1000).reason).toBe('disabled');
+  });
+});
+
+// --- ChatGPT continuous sync: source registry + multi-source orchestration ---
+// SOURCES.chatgpt plugs ChatGPT's list/fetch/ingest into the SAME pure
+// planning helpers tested above (they only ever look at {uuid, updated_at}).
+// These tests cover the source-specific pieces: normalizing the ChatGPT list
+// endpoint's shape, classifying its errors (including "signed out ≠
+// failure"), the two-gate enable toggle, per-source state-key isolation, and
+// runAllContinuousSyncs's sequential ordering + cross-source badge.
+
+const {
+  SOURCES,
+  SOURCE_ORDER,
+  normalizeChatGptListItem,
+  isChatGptSignedOutError,
+  badgeStateAfterAll,
+  runAllContinuousSyncs,
+  CONTINUOUS_STORAGE_KEY,
+  CONTINUOUS_STORAGE_KEY_CHATGPT,
+  _getState,
+  _setState,
+} = require('../chrome/continuous_sync.js');
+const { ChatGptRateLimitError } = require('../chrome/chatgpt_adapter.js');
+
+describe('normalizeChatGptListItem', () => {
+  it('normalizes an ISO update_time', () => {
+    const r = normalizeChatGptListItem({ id: 'c1', update_time: '2026-07-01T00:00:00.000Z', title: 'Hi there' });
+    expect(r).toEqual({ uuid: 'c1', updated_at: '2026-07-01T00:00:00.000Z', title: 'Hi there' });
+  });
+
+  it('normalizes an epoch-seconds update_time', () => {
+    const r = normalizeChatGptListItem({ id: 'c2', update_time: 1700000000 });
+    expect(r.uuid).toBe('c2');
+    expect(r.updated_at).toBe(new Date(1700000000 * 1000).toISOString());
+    expect(r.title).toBeNull();
+  });
+
+  it('normalizes a numeric-string epoch seconds value too (list endpoint inconsistency)', () => {
+    const r = normalizeChatGptListItem({ id: 'c3', update_time: '1700000000' });
+    expect(r.updated_at).toBe(new Date(1700000000 * 1000).toISOString());
+  });
+
+  it('is tolerant of a missing/unparseable update_time rather than throwing', () => {
+    expect(normalizeChatGptListItem({ id: 'c4', update_time: null }).updated_at).toBeNull();
+    expect(normalizeChatGptListItem({ id: 'c5' }).updated_at).toBeNull();
+    expect(() => normalizeChatGptListItem(null)).not.toThrow();
+  });
+});
+
+describe('SOURCES.chatgpt.errorDomain', () => {
+  it('classifies a rate-limit error as chatgpt-domain', () => {
+    expect(SOURCES.chatgpt.errorDomain(new ChatGptRateLimitError('30'))).toBe('chatgpt');
+  });
+
+  it('classifies a chatgpt.com backend-api URL error as chatgpt-domain', () => {
+    expect(SOURCES.chatgpt.errorDomain(new Error('https://chatgpt.com/backend-api/conversation/x: 500'))).toBe('chatgpt');
+  });
+
+  it('classifies an auth/session error as chatgpt-domain', () => {
+    expect(SOURCES.chatgpt.errorDomain(new Error('auth/session 401 — are you signed in to chatgpt.com?'))).toBe('chatgpt');
+  });
+
+  it('classifies a "fetch conversation" prefixed error as chatgpt-domain', () => {
+    expect(SOURCES.chatgpt.errorDomain(new Error('fetch conversation abc: boom'))).toBe('chatgpt');
+  });
+
+  it('classifies an ingest-side failure as scry-domain (the default)', () => {
+    expect(SOURCES.chatgpt.errorDomain(new Error('ingest HTTP 500'))).toBe('scry');
+    expect(SOURCES.chatgpt.errorDomain(new Error('ingest rejected'))).toBe('scry');
+    expect(SOURCES.chatgpt.errorDomain(new Error('reconcile HTTP 503'))).toBe('scry');
+  });
+});
+
+describe('isChatGptSignedOutError', () => {
+  it('matches the auth/session non-OK message (any status, incl. 401/403)', () => {
+    expect(isChatGptSignedOutError(new Error('auth/session 401 — are you signed in to chatgpt.com?'))).toBe(true);
+    expect(isChatGptSignedOutError(new Error('auth/session 403 — are you signed in to chatgpt.com?'))).toBe(true);
+    expect(isChatGptSignedOutError(new Error('auth/session 500 — are you signed in to chatgpt.com?'))).toBe(true);
+  });
+
+  it('matches the missing-accessToken message', () => {
+    expect(isChatGptSignedOutError(new Error('No access token in session — sign in to chatgpt.com first.'))).toBe(true);
+  });
+
+  it('does not match an unrelated chatgpt-domain error (a real sync failure)', () => {
+    expect(isChatGptSignedOutError(new Error('https://chatgpt.com/backend-api/conversations?offset=0&limit=100: 500'))).toBe(false);
+    expect(isChatGptSignedOutError(new ChatGptRateLimitError('30'))).toBe(false);
+  });
+
+  it('never throws on junk', () => {
+    expect(isChatGptSignedOutError(null)).toBe(false);
+    expect(isChatGptSignedOutError(undefined)).toBe(false);
+    expect(isChatGptSignedOutError('string')).toBe(false);
+  });
+});
+
+// Owner ruling (2026-09-21): ChatGPT needs its OWN default-off enable gate —
+// existing installs must not start hitting chatgpt.com just because this
+// shipped — layered under the existing continuous-sync sub-toggle.
+describe('SOURCES.chatgpt.isEnabled', () => {
+  it('absent chatgptEnabled → false (default OFF, unlike claude)', () => {
+    expect(SOURCES.chatgpt.isEnabled({})).toBe(false);
+  });
+
+  it('chatgptEnabled true, continuous sub-toggle absent → true (default-on once the source itself is on)', () => {
+    expect(SOURCES.chatgpt.isEnabled({ chatgptEnabled: true })).toBe(true);
+  });
+
+  it('chatgptEnabled true, continuous sub-toggle explicitly false → false', () => {
+    expect(SOURCES.chatgpt.isEnabled({ chatgptEnabled: true, chatgptContinuousSync: false })).toBe(false);
+  });
+
+  it('chatgptEnabled false wins even if the sub-toggle is true — the source gate is the outer one', () => {
+    expect(SOURCES.chatgpt.isEnabled({ chatgptEnabled: false, chatgptContinuousSync: true })).toBe(false);
+  });
+});
+
+describe('SOURCES.claude.isEnabled (unchanged: default-on)', () => {
+  it('absent/undefined continuousSync → true', () => {
+    expect(SOURCES.claude.isEnabled({})).toBe(true);
+  });
+  it('explicit false → false', () => {
+    expect(SOURCES.claude.isEnabled({ continuousSync: false })).toBe(false);
+  });
+});
+
+describe('badgeStateAfterAll', () => {
+  it('clears when every source is under the failure threshold', () => {
+    expect(badgeStateAfterAll([{ consecutiveFailures: 0 }, { consecutiveFailures: 2 }])).toEqual({ clear: true });
+  });
+
+  it('shows the badge when ANY source is at/over the threshold, even if others are healthy', () => {
+    const b = badgeStateAfterAll([{ consecutiveFailures: 0 }, { consecutiveFailures: 3 }]);
+    expect(b.clear).toBeUndefined();
+    expect(b.text).toBe('!');
+  });
+
+  it('treats missing/null per-source state as zero failures rather than throwing', () => {
+    expect(badgeStateAfterAll([null, undefined, {}])).toEqual({ clear: true });
+    expect(badgeStateAfterAll([])).toEqual({ clear: true });
+    expect(badgeStateAfterAll(undefined)).toEqual({ clear: true });
+  });
+});
+
+// --- state-key isolation: a chatgpt write must never touch the claude blob ---
+// _getState/_setState are factored to take (key, storage) so this is
+// testable with an in-memory storage stub — no chrome.storage.local, no
+// global chrome.* at all.
+function makeStorageStub(initial = {}) {
+  const store = { ...initial };
+  return {
+    get: (keys, cb) => {
+      const r = {};
+      (keys || []).forEach((k) => {
+        if (Object.prototype.hasOwnProperty.call(store, k)) r[k] = store[k];
+      });
+      cb(r);
+    },
+    set: (obj, cb) => { Object.assign(store, obj); if (cb) cb(); },
+    _store: store,
+  };
+}
+
+describe('state-key isolation (_getState / _setState)', () => {
+  it('reads each source from its own independent key', async () => {
+    const storage = makeStorageStub({
+      continuousSync: { watermark: 'claude-wm' },
+      'continuousSync:chatgpt': { watermark: 'chatgpt-wm' },
+    });
+    const claudeState = await _getState(CONTINUOUS_STORAGE_KEY, storage);
+    const chatgptState = await _getState(CONTINUOUS_STORAGE_KEY_CHATGPT, storage);
+    expect(claudeState.watermark).toBe('claude-wm');
+    expect(chatgptState.watermark).toBe('chatgpt-wm');
+  });
+
+  it('writing the chatgpt state never touches the claude blob', async () => {
+    const storage = makeStorageStub({
+      continuousSync: { watermark: 'claude-wm', consecutiveFailures: 0 },
+    });
+    const newChatGptState = applyResult(
+      defaultContinuousSyncState(), { ok: false, domain: 'chatgpt', error: 'boom' }, 1000);
+    await _setState(newChatGptState, CONTINUOUS_STORAGE_KEY_CHATGPT, storage);
+
+    expect(storage._store[CONTINUOUS_STORAGE_KEY].watermark).toBe('claude-wm');
+    expect(storage._store[CONTINUOUS_STORAGE_KEY].consecutiveFailures).toBe(0);
+    expect(storage._store[CONTINUOUS_STORAGE_KEY_CHATGPT].errorDomain).toBe('chatgpt');
+    expect(storage._store[CONTINUOUS_STORAGE_KEY_CHATGPT].consecutiveFailures).toBe(1);
+  });
+
+  it('an unset key reads back the default state, not the other source\'s', async () => {
+    const storage = makeStorageStub({ continuousSync: { watermark: 'claude-wm' } });
+    const chatgptState = await _getState(CONTINUOUS_STORAGE_KEY_CHATGPT, storage);
+    expect(chatgptState).toEqual(defaultContinuousSyncState());
+  });
+});
+
+describe('runAllContinuousSyncs', () => {
+  it('runs every SOURCES entry sequentially in SOURCE_ORDER (claude, then chatgpt)', async () => {
+    expect(SOURCE_ORDER).toEqual(['claude', 'chatgpt']);
+    const calls = [];
+    const runOne = async (kind, name) => {
+      calls.push(name);
+      return { ran: true, result: { ok: true, pushed: 0 } };
+    };
+    const getState = async () => defaultContinuousSyncState();
+    const applyBadge = () => {};
+    const results = await runAllContinuousSyncs('incremental', { runOne, getState, applyBadge });
+    expect(calls).toEqual(['claude', 'chatgpt']);
+    expect(Object.keys(results)).toEqual(['claude', 'chatgpt']);
+  });
+
+  it('never runs the two sources concurrently — chatgpt only starts after claude resolves', async () => {
+    const events = [];
+    const runOne = async (kind, name) => {
+      events.push(`${name}:start`);
+      await new Promise((r) => setTimeout(r, 5));
+      events.push(`${name}:end`);
+      return { ran: true };
+    };
+    const getState = async () => defaultContinuousSyncState();
+    await runAllContinuousSyncs('incremental', { runOne, getState, applyBadge: () => {} });
+    expect(events).toEqual(['claude:start', 'claude:end', 'chatgpt:start', 'chatgpt:end']);
+  });
+
+  it('applies the badge computed across BOTH sources\' persisted state, not just the one that ran last', async () => {
+    const runOne = async () => ({ ran: true });
+    const getState = async (key) => (key === CONTINUOUS_STORAGE_KEY_CHATGPT
+      ? { ...defaultContinuousSyncState(), consecutiveFailures: 5 }
+      : { ...defaultContinuousSyncState(), consecutiveFailures: 0 });
+    let appliedBadge = null;
+    await runAllContinuousSyncs('incremental', { runOne, getState, applyBadge: (b) => { appliedBadge = b; } });
+    expect(appliedBadge.text).toBe('!');
+  });
+
+  it('clears the badge when neither source is failing', async () => {
+    const runOne = async () => ({ ran: true });
+    const getState = async () => defaultContinuousSyncState();
+    let appliedBadge = null;
+    await runAllContinuousSyncs('deep', { runOne, getState, applyBadge: (b) => { appliedBadge = b; } });
+    expect(appliedBadge).toEqual({ clear: true });
   });
 });
