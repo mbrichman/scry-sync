@@ -1,11 +1,15 @@
 // MV3 classic (non-module) service worker: pull in the sync engines so
 // continuous sync can reuse the exact same helpers as the manual sync UI
 // (utils.js -> scry_sync.js -> scry_client.js -> chatgpt_adapter.js ->
-// continuous_sync.js, matching each file's own internal require/global
-// expectations). chatgpt_adapter.js MUST load before continuous_sync.js —
-// continuous_sync.js's SOURCES.chatgpt entry references its globals
+// sources.js -> sync_core.js -> continuous_sync.js, matching each file's own
+// internal require/global expectations). chatgpt_adapter.js MUST load before
+// sources.js — sources.js's SOURCES.chatgpt entry references its globals
 // (getChatGptAccessToken, listAllChatGptConversations, etc.) directly.
-importScripts('utils.js', 'scry_sync.js', 'scry_client.js', 'chatgpt_adapter.js', 'continuous_sync.js');
+// sources.js MUST load before sync_core.js (syncBatch resolves
+// classifyStubAfterReconcile as a global) and before continuous_sync.js
+// (which resolves SOURCES/SOURCE_ORDER the same way); sync_core.js MUST load
+// before continuous_sync.js (which resolves syncBatch/reconcileAndSync).
+importScripts('utils.js', 'scry_sync.js', 'scry_client.js', 'chatgpt_adapter.js', 'sources.js', 'sync_core.js', 'continuous_sync.js');
 
 const INCREMENTAL_ALARM = 'scry-incremental';
 const DEEP_RECONCILE_ALARM = 'scry-deep-reconcile';
