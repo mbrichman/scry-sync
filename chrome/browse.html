@@ -957,6 +957,12 @@
   <script src="utils.js"></script>
   <script src="scry_sync.js"></script>
   <script src="scry_client.js"></script>
+  <!-- chatgpt_adapter.js: sources.js's SOURCES.chatgpt entry references its
+       globals structurally; this page never calls into SOURCES.chatgpt, but
+       load order stays uniform with chatgpt.html/background.js. -->
+  <script src="chatgpt_adapter.js"></script>
+  <script src="sources.js"></script>
+  <script src="sync_core.js"></script>
   <script src="browse.js"></script>
 </body>
 </html>

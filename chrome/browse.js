@@ -654,8 +654,16 @@ async function refreshSyncStatus() {
 }
 
 // Sync a given list of conversation objects to Scry with the bounded pool +
-// progress modal. Shared by "Sync all/last-N" and "Reconcile". Returns
-// { synced, failed, cancelled }.
+// progress modal, via the shared sync core (chrome/sync_core.js's syncBatch —
+// also used by continuous_sync.js and chatgpt.js, so there is exactly ONE
+// implementation of this loop). Shared by "Sync all/last-N" and "Reconcile".
+// Returns { synced, failed, cancelled }.
+//
+// One behavior change from before this extraction: syncBatch's stub -> Scry
+// reconcile -> classify path (previously continuous-sync-only) now also
+// applies here, so a claude.ai soft-empty-stub that Scry's reconcile says is
+// tombstoned/already-complete counts as a skip (success), not a failure —
+// the manual path gains the same smarts the background engine already had.
 async function syncCandidateList(candidates, scry, headerText) {
   const total = candidates.length;
 
@@ -668,45 +676,46 @@ async function syncCandidateList(candidates, scry, headerText) {
   progressText.textContent = headerText;
   progressModal.style.display = 'block';
 
-  let cancelled = false;
+  // AbortSignal-like object syncBatch checks before starting each item.
+  const signal = { aborted: false };
   document.getElementById('cancelExport').onclick = () => {
-    cancelled = true;
+    signal.aborted = true;
     progressModal.style.display = 'none';
     showToast('Sync cancelled', true);
   };
 
   const syncedMap = await getScrySyncedMap();
-  let synced = 0, failed = 0, done = 0;
-  const failures = [];
+  let synced = 0, failed = 0;
 
-  // Process several conversations at once (bounded pool) so a full sync of
-  // thousands isn't strictly one-at-a-time. Concurrency is configurable in
-  // Options (scry.concurrency); default 4. syncedMap is persisted after each
-  // completion so an interrupted run resumes.
-  const concurrency = (scry.concurrency && scry.concurrency > 0) ? scry.concurrency : 4;
-
-  await runPool(candidates, concurrency, async (conv) => {
-    if (cancelled) return;
-    try {
-      const result = await syncOneConversation(orgId, conv.uuid, scry);
-      synced++;
-      syncedMap[conv.uuid] = result.updatedAt || conv.updated_at;
-    } catch (e) {
-      failed++;
-      failures.push(`${conv.name || conv.uuid}: ${e.message}`);
-      console.error('Scry sync failed for', conv.uuid, e);
-    }
-
-    done++;
-    progressBar.style.width = `${Math.round((done / total) * 100)}%`;
-    progressStats.textContent = `${synced} synced, ${failed} failed of ${total}`;
-    await setScrySyncedMap(syncedMap); // persist incrementally so a crash resumes
+  // Concurrency is configurable in Options (scry.concurrency); default 4 —
+  // syncBatch applies that same fallback when no explicit option is passed.
+  const result = await syncBatch(SOURCES.claude, { orgId }, scry, candidates, {
+    signal,
+    onProgress: async ({ done, item, ok }) => {
+      if (ok) synced++; else failed++;
+      // Persist incrementally so a crash resumes. The enumeration-time
+      // updated_at is a fine interim value; the authoritative pass below
+      // (syncOne's own freshly-fetched updated_at) corrects it once the
+      // batch finishes.
+      syncedMap[item.uuid] = item.updated_at;
+      progressBar.style.width = `${Math.round((done / total) * 100)}%`;
+      progressStats.textContent = `${synced} synced, ${failed} failed of ${total}`;
+      await setScrySyncedMap(syncedMap);
+    },
   });
+
+  for (const { item, result: r } of result.succeeded) {
+    syncedMap[item.uuid] = (r && r.updatedAt) || item.updated_at;
+  }
+  await setScrySyncedMap(syncedMap);
 
   progressModal.style.display = 'none';
   await refreshSyncStatus();
-  if (failed > 0) console.warn('Scry sync failures:', failures);
-  return { synced, failed, cancelled };
+  if (result.failed.length > 0) {
+    console.warn('Scry sync failures:', result.failed.map(
+      ({ item, error }) => `${item.name || item.uuid}: ${error.message}`));
+  }
+  return { synced, failed, cancelled: signal.aborted };
 }
 
 // Bulk sync. mode is 'all' or { days: N }.
@@ -741,7 +750,19 @@ async function syncToScry(mode) {
 // incompletely captured, then re-sync exactly those. This is the completeness
 // gate — the authoritative "does Scry hold every conversation with full
 // fidelity?" check — run before deleting anything from Claude.
-async function reconcileAndSync() {
+//
+// Routed through the shared core's reconcileAndSync (chrome/sync_core.js) —
+// same function continuous_sync.js's deep reconcile calls — rather than doing
+// reconcile -> map to_resync -> sync by hand. Named reconcileAndSyncUI (not
+// reconcileAndSync) to avoid shadowing that shared global: both this file and
+// sync_core.js load into the same page/global scope.
+//
+// One UX difference from before: the live progress modal's header can no
+// longer show the missing/incomplete/stale breakdown WHILE syncing (the core
+// bundles reconcile + sync into one call, so that breakdown isn't known until
+// the whole thing resolves) — it now shows a plain "re-syncing N…" during the
+// run and the breakdown moves to the completion toast instead.
+async function reconcileAndSyncUI() {
   const scry = await loadScrySettings();
   if (!scry.url) { showToast('Set your Scry URL in Options first', true); return; }
   if (!(await ensureScryPermission(scry.url))) { showToast('Host permission for Scry was declined', true); return; }
@@ -751,34 +772,74 @@ async function reconcileAndSync() {
   // a conversation Scry holds "complete" but that grew at the source must
   // re-sync. Bare ids here left the manual path blind to continued chats.
   const items = allConversations.filter((c) => c && c.uuid);
-  let report;
+  showToast(`Reconciling ${items.length} conversations with Scry…`);
+
+  const progressModal = document.getElementById('progressModal');
+  const progressBar = document.getElementById('progressBar');
+  const progressText = document.getElementById('progressText');
+  const progressStats = document.getElementById('progressStats');
+
+  const signal = { aborted: false };
+  document.getElementById('cancelExport').onclick = () => {
+    signal.aborted = true;
+    progressModal.style.display = 'none';
+    showToast('Sync cancelled', true);
+  };
+
+  const syncedMap = await getScrySyncedMap();
+  let synced = 0, failed = 0;
+  let modalShown = false; // only flips true once there's actually something to sync
+
+  let outcome;
   try {
-    showToast(`Reconciling ${items.length} conversations with Scry…`);
-    report = await reconcileWithScry(scry, items);
+    outcome = await reconcileAndSync(SOURCES.claude, { orgId }, scry, items, {
+      signal,
+      onProgress: async ({ done, total, item, ok }) => {
+        if (!modalShown) {
+          modalShown = true;
+          progressBar.style.width = '0%';
+          progressStats.textContent = '';
+          progressText.textContent = `Reconcile: re-syncing ${total}…`;
+          progressModal.style.display = 'block';
+        }
+        if (ok) synced++; else failed++;
+        syncedMap[item.uuid] = item.updated_at;
+        progressBar.style.width = `${Math.round((done / total) * 100)}%`;
+        progressStats.textContent = `${synced} synced, ${failed} failed of ${total}`;
+        await setScrySyncedMap(syncedMap);
+      },
+    });
   } catch (e) {
     console.error('Reconcile failed', e);
     showToast(`Reconcile failed: ${e.message}`, true);
     return;
   }
 
+  const { report, toSync } = outcome;
   const s = report.summary || {};
-  const resync = new Set(report.to_resync || []);
   console.log('Scry reconcile:', s, 'extra(in Scry, not listed):', report.extra);
 
-  if (resync.size === 0) {
+  if (modalShown) {
+    for (const { item, result: r } of outcome.succeeded) {
+      syncedMap[item.uuid] = (r && r.updatedAt) || item.updated_at;
+    }
+    await setScrySyncedMap(syncedMap);
+    progressModal.style.display = 'none';
+    await refreshSyncStatus();
+  }
+
+  if (toSync.length === 0) {
     showToast(`✓ Scry holds all ${s.complete} conversations with full fidelity`);
     return;
   }
+  if (signal.aborted) return;
 
-  const candidates = allConversations.filter((c) => resync.has(c.uuid));
-  const r = await syncCandidateList(candidates, scry,
-    `Reconcile: ${s.missing} missing + ${s.incomplete} incomplete + ${s.stale || 0} stale → re-syncing ${candidates.length}…`);
-  if (r.cancelled) return;
+  const breakdown = `${s.missing || 0} missing + ${s.incomplete || 0} incomplete + ${s.stale || 0} stale`;
   showToast(
-    r.failed > 0
-      ? `Re-synced ${r.synced}/${candidates.length} — ${r.failed} failed (see console)`
-      : `Reconciled ✓ re-synced ${r.synced}. Run again to confirm 0 remaining.`,
-    r.failed > 0,
+    outcome.failed.length > 0
+      ? `Reconcile (${breakdown}): re-synced ${synced}/${toSync.length} — ${outcome.failed.length} failed (see console)`
+      : `Reconciled (${breakdown}) ✓ re-synced ${synced}. Run again to confirm 0 remaining.`,
+    outcome.failed.length > 0,
   );
 }
 
@@ -1129,7 +1190,7 @@ function setupEventListeners() {
   }
   const reconcileBtn = document.getElementById('reconcileScryBtn');
   if (reconcileBtn) {
-    reconcileBtn.addEventListener('click', () => reconcileAndSync());
+    reconcileBtn.addEventListener('click', () => reconcileAndSyncUI());
   }
   const deleteFromClaudeBtn = document.getElementById('deleteFromClaudeBtn');
   if (deleteFromClaudeBtn) {
