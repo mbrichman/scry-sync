@@ -4,7 +4,7 @@
 // across content types, normalize to the source-agnostic shape, and render
 // markdown/JSON.
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 
 const {
   getChatGptBranch,
@@ -564,5 +564,48 @@ describe('buildChatGptFileBlob', () => {
   it('returns null when the pointer has no id or there is no data', () => {
     expect(buildChatGptFileBlob('nope', {}, 'data:image/png;base64,AA')).toBeNull();
     expect(buildChatGptFileBlob('sediment://file_a', {}, null)).toBeNull();
+  });
+});
+
+describe('_fetchChatGptAsset — endpoint fallback and loud failure', () => {
+  const { _fetchChatGptAsset, fetchChatGptFileBlobs } = require('../chrome/chatgpt_adapter.js');
+  const jsonResp = (status, body) => ({ ok: status < 400, status, headers: { get: () => null }, json: async () => body });
+  let calls;
+  const install = (handler) => {
+    calls = [];
+    global.fetch = async (url, opts) => { calls.push(url); return handler(url, opts); };
+    global.FileReader = class { readAsDataURL() { this.result = 'data:application/octet-stream;base64,QUJD'; this.onloadend(); } };
+  };
+  afterEach(() => { delete global.fetch; delete global.FileReader; });
+
+  it('falls back to the conversation-scoped attachment endpoint when files/download fails', async () => {
+    install((url) => {
+      if (url.includes('/files/download/')) return jsonResp(404, { detail: 'Not Found' });
+      if (url.includes('/conversation/conv-1/attachment/file_abc/download')) return jsonResp(200, { status: 'success', download_url: 'https://files.oaiusercontent.com/x', file_name: 'a.png', mime_type: 'image/png' });
+      if (url === 'https://files.oaiusercontent.com/x') return { ok: true, status: 200, headers: { get: (h) => h === 'content-type' ? 'image/png' : null }, blob: async () => ({}) };
+      throw new Error('unexpected ' + url);
+    });
+    const got = await _fetchChatGptAsset('tok', 'sediment://file_abc', null, 'conv-1');
+    expect(got.meta.file_name).toBe('a.png');
+    expect(got.dataUrl.startsWith('data:image/png')).toBe(true);
+    expect(calls.some((u) => u.includes('/files/download/file_abc'))).toBe(true);
+    expect(calls.some((u) => u.includes('/conversation/conv-1/attachment/file_abc/download'))).toBe(true);
+  });
+
+  it('throws with both endpoint statuses when neither yields a signed URL', async () => {
+    install(() => jsonResp(404, { detail: 'nope' }));
+    await expect(_fetchChatGptAsset('tok', 'sediment://file_abc', null, 'conv-1')).rejects.toThrow(/files\/download.*404.*attachment\/file_abc\/download.*404/s);
+  });
+
+  it('fetchChatGptFileBlobs returns failures instead of swallowing them', async () => {
+    install(() => jsonResp(403, {}));
+    const body = { conversation_id: 'conv-1', current_node: 't1', mapping: {
+      t1: { id: 't1', parent: null, children: [], message: { author: { role: 'tool' }, recipient: 'all',
+            content: { content_type: 'multimodal_text', parts: [{ content_type: 'image_asset_pointer', asset_pointer: 'sediment://file_abc' }] } } } } };
+    const out = await fetchChatGptFileBlobs('tok', body, null);
+    expect(out.blobs).toEqual([]);
+    expect(out.failures).toHaveLength(1);
+    expect(out.failures[0].pointer).toBe('sediment://file_abc');
+    expect(out.failures[0].error).toMatch(/403/);
   });
 });

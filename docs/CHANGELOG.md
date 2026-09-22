@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.3] — ChatGPT push: image fetch fallback + loud failures
+
+- **Why:** the first live push with v2.7.2 stored zero image bytes and still said "Pushed ✓". Every per-image fetch failure was only `console.warn`ed. That is fixed two ways:
+  - **Failures are surfaced.** `fetchChatGptFileBlobs` returns `{ blobs, failures }`; the push status now reads "Pushed N (K image files stored)" on success, or "…but images failed — 2/3 image(s) not fetched — <endpoint: HTTP status>" on failure, so the next run tells you exactly what chatgpt.com answered.
+  - **Endpoint fallback.** `_fetchChatGptAsset` tries `GET backend-api/files/download/:id` and then `GET backend-api/conversation/:convId/attachment/:id/download` — the reference implementation uses both, the second for newer `sediment://` assets. A bytes-fetch that throws names the signed URL's host, so a missing `host_permissions` entry is diagnosable from the status line.
+  - +3 tests with a stubbed `fetch` (fallback path, double-failure message, failures returned not swallowed). 210 total.
+
 ## [2.7.2] — ChatGPT push: image bytes travel with the conversation
 
 - **Images now come over on push.** With the image toggle on, *Push selected → Scry* resolves every image asset in the conversation (whole tree, deduped) via `GET backend-api/files/download/:id` → signed URL → bytes, and sends them in the ingest body's `files[]` — the same contract the Claude path uses: `{ file_uuid, file_name, file_type, file_variant: 'original', data }`. Message text stays verbatim; no base64 is inlined into content or the archive.

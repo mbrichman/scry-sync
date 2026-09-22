@@ -206,7 +206,9 @@ async function pushSelectedToScry() {
   const btn = $('pushScry');
   btn.disabled = true;
   let pushed = 0;
+  let filesStored = 0;
   const failures = [];
+  const imageFailures = [];
 
   try {
     await ensureToken();
@@ -223,12 +225,18 @@ async function pushSelectedToScry() {
         if (wantImages()) {
           const total = collectChatGptImagePointers(body, { wholeTree: true }).length;
           let done = 0;
-          fileBlobs = await fetchChatGptFileBlobs(accessToken, body, null, () => {
+          const got = await fetchChatGptFileBlobs(accessToken, body, null, () => {
             done++;
             setStatus(`Pushing ${pushed + failures.length + 1}/${ids.length}: "${label}" — images ${done}/${total}…`);
           });
+          fileBlobs = got.blobs;
+          if (got.failures.length) {
+            // Surface it. A push whose images silently vanished reads as success.
+            imageFailures.push(`"${label}": ${got.failures.length}/${total} image(s) not fetched — ${got.failures[0].error}`);
+          }
         }
         const resp = await postToScry(scry, buildChatGptIngestPayload(body, fileBlobs, id));
+        if (resp.body && typeof resp.body.files_stored === 'number') filesStored += resp.body.files_stored;
         if (!resp.ok || !resp.body || !resp.body.success) {
           throw new Error((resp.body && resp.body.error) || `HTTP ${resp.status}`);
         }
@@ -239,8 +247,11 @@ async function pushSelectedToScry() {
       }
     }
 
-    if (failures.length === 0) {
-      setStatus(`Pushed ${pushed} conversation${pushed === 1 ? '' : 's'} to Scry ✓`);
+    const filesNote = wantImages() ? ` (${filesStored} image file${filesStored === 1 ? '' : 's'} stored)` : '';
+    if (failures.length === 0 && imageFailures.length === 0) {
+      setStatus(`Pushed ${pushed} conversation${pushed === 1 ? '' : 's'} to Scry ✓${filesNote}`);
+    } else if (failures.length === 0) {
+      setStatus(`Pushed ${pushed} conversation${pushed === 1 ? '' : 's'}${filesNote}, but images failed — ${imageFailures.join('; ')}`, true);
     } else {
       setStatus(
         `Pushed ${pushed}/${ids.length}. ${failures.length} failed — ${failures.join('; ')}`,

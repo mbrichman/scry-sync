@@ -492,14 +492,44 @@ function _blobToDataUrl(blob) {
 // The bytes host (e.g. *.oaiusercontent.com) must be in host_permissions for the
 // extension to read the cross-origin response. Returns null on any failure so the
 // renderer falls back to a placeholder rather than aborting the export.
-async function _fetchChatGptAsset(token, pointer, accountId) {
+// Resolve one asset pointer to { meta, dataUrl }. Two endpoints are tried,
+// because chatgpt.com serves the two pointer schemes differently and the
+// reference implementation (pionxzh/chatgpt-exporter) uses BOTH:
+//   1. GET backend-api/files/download/:id                       (file-service://, older)
+//   2. GET backend-api/conversation/:convId/attachment/:id/download  (sediment://, newer)
+// Each returns { status: 'success', download_url, file_name?, mime_type? }.
+// Any failure THROWS with the endpoint + HTTP status in the message so the
+// caller can show it -- a silent null here is how "images aren't coming over"
+// went unexplained on the first live run.
+async function _fetchChatGptAsset(token, pointer, accountId, conversationId) {
   const id = String(pointer || '').replace(/^\w[\w+.-]*:\/\//, ''); // strip scheme://
-  if (!id) return null;
-  const meta = await chatGptApiGet(
-    `${CHATGPT_API}/files/download/${encodeURIComponent(id)}?inline=false`, token, accountId);
-  if (!meta || meta.status !== 'success' || !meta.download_url) return null;
-  const resp = await fetch(meta.download_url, { credentials: 'omit' });
-  if (!resp.ok) throw new Error(`image bytes ${resp.status}`);
+  if (!id) throw new Error(`unusable pointer "${pointer}"`);
+  const attempts = [`${CHATGPT_API}/files/download/${encodeURIComponent(id)}?inline=false`];
+  if (conversationId) {
+    attempts.push(`${CHATGPT_API}/conversation/${encodeURIComponent(conversationId)}/attachment/${encodeURIComponent(id)}/download`);
+  }
+  let meta = null;
+  const errors = [];
+  for (const url of attempts) {
+    try {
+      const m = await chatGptApiGet(url, token, accountId);
+      if (m && m.status === 'success' && m.download_url) { meta = m; break; }
+      errors.push(`${url.replace(CHATGPT_API, '')}: status=${m && m.status}`);
+    } catch (e) {
+      if (e instanceof ChatGptRateLimitError) throw e;
+      errors.push(`${url.replace(CHATGPT_API, '')}: ${e.message}`);
+    }
+  }
+  if (!meta) throw new Error(`no signed URL (${errors.join(' | ')})`);
+  let resp;
+  try {
+    resp = await fetch(meta.download_url, { credentials: 'omit' });
+  } catch (e) {
+    let host = '?';
+    try { host = new URL(meta.download_url).host; } catch { /* leave ? */ }
+    throw new Error(`bytes fetch threw for host ${host} (${e.message}) -- is that host in manifest host_permissions?`);
+  }
+  if (!resp.ok) throw new Error(`bytes ${resp.status} from ${new URL(meta.download_url).host}`);
   const raw = await _blobToDataUrl(await resp.blob());
   // Prefer the real content-type over FileReader's guess.
   const ct = resp.headers.get('content-type') || meta.mime_type;
@@ -507,49 +537,42 @@ async function _fetchChatGptAsset(token, pointer, accountId) {
   return { meta: { ...meta, mime_type: (ct || meta.mime_type || '').split(';')[0].trim() || meta.mime_type }, dataUrl };
 }
 
-async function fetchChatGptImageDataUrl(token, pointer, accountId) {
-  const got = await _fetchChatGptAsset(token, pointer, accountId);
-  return got ? got.dataUrl : null;
+async function fetchChatGptImageDataUrl(token, pointer, accountId, conversationId) {
+  try {
+    const got = await _fetchChatGptAsset(token, pointer, accountId, conversationId);
+    return got ? got.dataUrl : null;
+  } catch (e) {
+    if (e instanceof ChatGptRateLimitError) throw e;
+    console.warn('ChatGPT export: image resolve failed for', pointer, e.message);
+    return null;
+  }
 }
 
 // Fetch the ORIGINAL bytes of every image asset in the conversation (whole tree)
-// as Scry files[] records — the ChatGPT analog of the Claude path's
-// fetchConversationFileBlobs. Failures are logged and skipped so one dead
-// signed URL never costs the push; `onEach()` fires per pointer for progress.
+// as Scry files[] records -- the ChatGPT analog of the Claude path's
+// fetchConversationFileBlobs. Returns { blobs, failures }: a failure never
+// aborts the push, but it is RETURNED (pointer + reason), not just logged, so
+// the page can say "2 of 3 images failed: ..." instead of "Pushed ✓".
 async function fetchChatGptFileBlobs(token, body, accountId, onEach) {
   const pointers = collectChatGptImagePointers(body, { wholeTree: true });
-  const out = [];
+  const conversationId = body && (body.conversation_id || body.id) || null;
+  const blobs = [];
+  const failures = [];
   await Promise.all(pointers.map(async (pointer) => {
     try {
-      const got = await withChatGptRateLimitRetry(() => _fetchChatGptAsset(token, pointer, accountId));
-      const rec = got ? buildChatGptFileBlob(pointer, got.meta, got.dataUrl) : null;
-      if (rec) out.push(rec);
-      else console.warn('ChatGPT push: no bytes for', pointer);
+      const got = await withChatGptRateLimitRetry(
+        () => _fetchChatGptAsset(token, pointer, accountId, conversationId));
+      const rec = buildChatGptFileBlob(pointer, got.meta, got.dataUrl);
+      if (rec) blobs.push(rec);
+      else failures.push({ pointer, error: 'could not build files[] record (no asset id or empty bytes)' });
     } catch (e) {
       console.warn('ChatGPT push: file fetch failed for', pointer, e);
+      failures.push({ pointer, error: e.message || String(e) });
     } finally {
       if (onEach) onEach();
     }
   }));
-  return out;
-}
-
-// Resolve many pointers concurrently into a { pointer -> data URL } map. Failures
-// are logged and omitted (those images stay placeholders). `onEach()` fires after
-// each pointer settles so the UI can show progress.
-async function fetchChatGptImageDataUrls(token, pointers, accountId, onEach) {
-  const map = {};
-  await Promise.all((pointers || []).map(async (pointer) => {
-    try {
-      const url = await fetchChatGptImageDataUrl(token, pointer, accountId);
-      if (url) map[pointer] = url;
-    } catch (e) {
-      console.warn('ChatGPT export: image resolve failed for', pointer, e);
-    } finally {
-      if (onEach) onEach();
-    }
-  }));
-  return map;
+  return { blobs, failures };
 }
 
 // ===== PURE: the Scry ingest contract =====
@@ -613,6 +636,8 @@ if (typeof module !== 'undefined' && module.exports) {
     ChatGptRateLimitError,
     chatGptAssetId,
     buildChatGptFileBlob,
+    _fetchChatGptAsset,
+    fetchChatGptFileBlobs,
     shouldSkipChatGptMessage,
     isDisplayableChatGptMessage,
     chatGptMessageText,
