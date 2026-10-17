@@ -122,3 +122,28 @@ describe('mergeReconcileReports', () => {
     expect(m.to_resync).toEqual(['a', 'b']);
   });
 });
+
+describe('mergeReconcileReports — chunk semantics', () => {
+  const { mergeReconcileReports } = require('../chrome/scry_client.js');
+  it('carries every bucket, including complete and tombstoned', () => {
+    const m = mergeReconcileReports([
+      { to_resync: ['m1'], extra: [], summary: {}, buckets: { missing: ['m1'], incomplete: [], stale: [], complete: ['c1'], tombstoned: ['t1'] } },
+      { to_resync: [], extra: [], summary: {}, buckets: { missing: [], incomplete: [], stale: ['s2'], complete: ['c2'], tombstoned: [] } },
+    ]);
+    expect(m.buckets.complete.sort()).toEqual(['c1', 'c2']);
+    expect(m.buckets.tombstoned).toEqual(['t1']);
+    expect(m.buckets.stale).toEqual(['s2']);
+  });
+  it("'extra' is the intersection across chunks, not the concatenation", () => {
+    // Each chunk sees the OTHER chunks' ids as "extra" (in Scry, not in this
+    // chunk). Only an id every chunk calls extra is truly not enumerated.
+    const m = mergeReconcileReports([
+      { to_resync: [], extra: ['b1', 'x'], summary: {} },   // chunk of a-ids: sees b-ids + x as extra
+      { to_resync: [], extra: ['a1', 'x'], summary: {} },   // chunk of b-ids: sees a-ids + x as extra
+    ]);
+    expect(m.extra).toEqual(['x']);
+  });
+  it('a single chunk keeps its extra as is', () => {
+    expect(mergeReconcileReports([{ to_resync: [], extra: ['q'], summary: {} }]).extra).toEqual(['q']);
+  });
+});

@@ -101,6 +101,9 @@ function badgeFromReconcile(uuid, report) {
     if ((b.missing || []).includes(uuid)) return 'missing';
     if ((b.incomplete || []).includes(uuid)) return 'incomplete';
     if ((b.stale || []).includes(uuid)) return 'stale';
+    // Deleted in Scry on purpose (tombstone blocks resurrection): Scry does
+    // NOT hold it, and it is not wanted either — never let it read as synced.
+    if ((b.tombstoned || []).includes(uuid)) return 'tombstoned';
     return 'synced';
   }
   return (report.to_resync || []).includes(uuid) ? 'needs-sync' : 'synced';

@@ -170,3 +170,15 @@ describe('detectSyncTarget', () => {
     expect(detectSyncTarget('not a url')).toEqual({ source: null, uuid: null });
   });
 });
+
+describe('badgeFromReconcile — tombstoned', () => {
+  const { badgeFromReconcile, badgeNeedsSync } = require('../chrome/dashboard_model.js');
+  it('renders a deliberately deleted conversation as tombstoned, never synced', () => {
+    const report = { to_resync: [], buckets: { missing: [], incomplete: [], stale: [], complete: ['a'], tombstoned: ['t'] } };
+    expect(badgeFromReconcile('t', report)).toBe('tombstoned');
+    expect(badgeFromReconcile('a', report)).toBe('synced');
+  });
+  it('tombstoned is not actionable', () => {
+    expect(badgeNeedsSync('tombstoned')).toBe(false);
+  });
+});

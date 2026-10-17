@@ -493,6 +493,7 @@ function syncedCellHtml(row) {
   if (status === 'incomplete') return `<span class="synced-badge incomplete"${tip('Scry has an incomplete capture')}>incomplete</span>`;
   if (status === 'stale') return `<span class="synced-badge stale"${tip('Scry has an older version')}>! stale</span>`;
   if (status === 'needs-sync') return `<span class="synced-badge needs-sync"${tip('Scry reports this needs syncing')}>needs sync</span>`;
+  if (status === 'tombstoned') return `<span class="synced-badge tombstoned"${tip('Deleted in Scry on purpose; will not re-sync')}>deleted in Scry</span>`;
   return `<span class="synced-badge unknown"${tip('no answer from Scry')}>?</span>`;
 }
 

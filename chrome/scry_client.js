@@ -292,15 +292,22 @@ function chunkIds(list, size) {
 function mergeReconcileReports(reports) {
   const rs = (reports || []).filter(Boolean);
   const merged = { to_resync: [], extra: [], summary: {} };
+  // `extra` = ids Scry holds that were NOT in the request. With chunked
+  // requests every chunk reports the other chunks' ids as extra, so the
+  // truthful merge is the INTERSECTION across chunks, not the concatenation.
+  let extra = null;
   for (const r of rs) {
     merged.to_resync.push(...(r.to_resync || []));
-    merged.extra.push(...(r.extra || []));
+    const e = new Set(r.extra || []);
+    extra = extra === null ? e : new Set([...extra].filter((id) => e.has(id)));
     for (const [k, v] of Object.entries(r.summary || {})) {
       if (typeof v === 'number') merged.summary[k] = (merged.summary[k] || 0) + v;
     }
   }
+  merged.extra = extra ? [...extra] : [];
+  if (merged.summary.extra !== undefined) merged.summary.extra = merged.extra.length;
   if (rs.length && rs.every((r) => r.buckets && typeof r.buckets === 'object')) {
-    merged.buckets = { missing: [], incomplete: [], stale: [] };
+    merged.buckets = { missing: [], incomplete: [], stale: [], complete: [], tombstoned: [] };
     for (const r of rs) for (const k of Object.keys(merged.buckets)) merged.buckets[k].push(...(r.buckets[k] || []));
   }
   return merged;
