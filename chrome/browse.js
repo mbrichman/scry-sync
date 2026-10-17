@@ -709,7 +709,10 @@ function renderStatusError() {
 // keep the merged report in memory. Never syncs. A failure leaves the report
 // null (badges read 'unknown') and surfaces the error under the toolbar.
 const reconcileStatusTokens = {}; // per-source: only the newest in-flight pass may write its result
-async function refreshReconcileStatus(source) {
+// `allowPrompt` is true only from a click (the Refresh status button): Chrome
+// only lets permissions.request() prompt inside a user gesture. The page-load
+// pass checks silently and, if access is missing, says how to grant it.
+async function refreshReconcileStatus(source, { allowPrompt = false } = {}) {
   const items = (sourceItems[source] || []).filter((c) => c && c.uuid);
   const myToken = (reconcileStatusTokens[source] || 0) + 1;
   reconcileStatusTokens[source] = myToken;
@@ -719,7 +722,12 @@ async function refreshReconcileStatus(source) {
   try {
     const scry = await loadScrySettings();
     if (!scry.url) throw new Error('Scry URL not set in Options');
-    if (!(await ensureScryPermission(scry.url))) throw new Error('host permission for Scry was declined');
+    const granted = allowPrompt ? await ensureScryPermission(scry.url) : await hasScryPermission(scry.url);
+    if (!granted) {
+      throw new Error(allowPrompt
+        ? 'access to Scry was declined'
+        : `this browser has not granted the extension access to ${new URL(scry.url).origin} yet — click Refresh status to grant it`);
+    }
     report = await reconcileStatusWithScry(scry, items, source === 'chatgpt' ? 'chatgpt' : 'claude');
   } catch (e) {
     error = e.message || String(e);
@@ -1230,7 +1238,7 @@ function setupEventListeners() {
   }
 
   const refreshStatusBtn = document.getElementById('refreshStatusBtn');
-  if (refreshStatusBtn) refreshStatusBtn.addEventListener('click', () => refreshReconcileStatus(activeSource));
+  if (refreshStatusBtn) refreshStatusBtn.addEventListener('click', () => refreshReconcileStatus(activeSource, { allowPrompt: true }));
 
   const reconcileBtn = document.getElementById('reconcileBtn');
   if (reconcileBtn) reconcileBtn.addEventListener('click', () => reconcileAndSyncUI());

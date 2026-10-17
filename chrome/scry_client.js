@@ -150,6 +150,18 @@ function ensureScryPermission(url) {
     chrome.permissions.request({ origins: [pattern] }, resolve));
 }
 
+// Does the extension ALREADY hold host permission for the Scry origin? Unlike
+// ensureScryPermission this never prompts, so it is safe to call from code
+// that runs without a user gesture (a page-load status pass): Chrome refuses
+// permissions.request() outside a gesture, which on a fresh profile made the
+// dashboard's status pass fail before it ever reached Scry.
+function hasScryPermission(url) {
+  const pattern = scryOriginPattern(url);
+  if (!pattern) return Promise.resolve(false);
+  return new Promise((resolve) =>
+    chrome.permissions.contains({ origins: [pattern] }, (ok) => resolve(Boolean(ok))));
+}
+
 function blobToDataUrl(blob) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
