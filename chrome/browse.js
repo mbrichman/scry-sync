@@ -708,18 +708,26 @@ function renderStatusError() {
 // READ-ONLY status pass: ask Scry which enumerated conversations it holds and
 // keep the merged report in memory. Never syncs. A failure leaves the report
 // null (badges read 'unknown') and surfaces the error under the toolbar.
+const reconcileStatusTokens = {}; // per-source: only the newest in-flight pass may write its result
 async function refreshReconcileStatus(source) {
   const items = (sourceItems[source] || []).filter((c) => c && c.uuid);
+  const myToken = (reconcileStatusTokens[source] || 0) + 1;
+  reconcileStatusTokens[source] = myToken;
   reconcileStatusError[source] = null;
+  let report = null;
+  let error = null;
   try {
     const scry = await loadScrySettings();
     if (!scry.url) throw new Error('Scry URL not set in Options');
     if (!(await ensureScryPermission(scry.url))) throw new Error('host permission for Scry was declined');
-    reconcileReports[source] = await reconcileStatusWithScry(scry, items, source === 'chatgpt' ? 'chatgpt' : 'claude');
+    report = await reconcileStatusWithScry(scry, items, source === 'chatgpt' ? 'chatgpt' : 'claude');
   } catch (e) {
-    reconcileReports[source] = null;
-    reconcileStatusError[source] = e.message || String(e);
+    error = e.message || String(e);
   }
+  // A newer pass started while this one was in flight: its answer wins.
+  if (reconcileStatusTokens[source] !== myToken) return;
+  reconcileReports[source] = report;
+  reconcileStatusError[source] = error;
   if (source === activeSource && sourceLoaded[source]) {
     renderStatusError();
     applyFiltersAndSort();

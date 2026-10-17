@@ -109,9 +109,10 @@ describe('mergeReconcileReports', () => {
       { to_resync: ['b'], extra: [], summary: { stale: 1, complete: 3 }, buckets: { missing: [], incomplete: [], stale: ['b'] } },
     ]);
     expect(m.to_resync).toEqual(['a', 'b']);
-    expect(m.extra).toEqual(['x']);
+    // 'x' was extra for chunk 1 only (chunk 2 enumerated it) -> not truly extra.
+    expect(m.extra).toEqual([]);
     expect(m.summary).toEqual({ missing: 1, complete: 5, stale: 1 });
-    expect(m.buckets).toEqual({ missing: ['a'], incomplete: [], stale: ['b'] });
+    expect(m.buckets).toEqual({ missing: ['a'], incomplete: [], stale: ['b'], complete: [], tombstoned: [] });
   });
   it('drops buckets entirely if any chunk lacks them (no half-truth)', () => {
     const m = mergeReconcileReports([
