@@ -277,6 +277,48 @@ async function reconcileWithScry(scry, items, sourceType = 'claude') {
   return resp.json();
 }
 
+// Split a list into chunks of at most `size` (pure). Bad size -> one chunk.
+function chunkIds(list, size) {
+  const arr = Array.isArray(list) ? list : [];
+  if (!arr.length) return [];
+  if (!(size > 0)) return [arr.slice()];
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
+// Merge per-chunk reconcile reports into one (pure). Buckets survive only if
+// EVERY chunk carried them — a partial bucket set would mislabel the rest.
+function mergeReconcileReports(reports) {
+  const rs = (reports || []).filter(Boolean);
+  const merged = { to_resync: [], extra: [], summary: {} };
+  for (const r of rs) {
+    merged.to_resync.push(...(r.to_resync || []));
+    merged.extra.push(...(r.extra || []));
+    for (const [k, v] of Object.entries(r.summary || {})) {
+      if (typeof v === 'number') merged.summary[k] = (merged.summary[k] || 0) + v;
+    }
+  }
+  if (rs.length && rs.every((r) => r.buckets && typeof r.buckets === 'object')) {
+    merged.buckets = { missing: [], incomplete: [], stale: [] };
+    for (const r of rs) for (const k of Object.keys(merged.buckets)) merged.buckets[k].push(...(r.buckets[k] || []));
+  }
+  return merged;
+}
+
+const RECONCILE_STATUS_CHUNK = 2000;
+
+// READ-ONLY status pass: ask Scry which of `items` it holds, chunked, merged.
+// Never syncs. Throws on any chunk failure (caller surfaces it).
+async function reconcileStatusWithScry(scry, items, sourceType = 'claude', chunkSize = RECONCILE_STATUS_CHUNK) {
+  const list = (items || []).filter((it) => it && it.uuid);
+  const reports = [];
+  for (const chunk of chunkIds(list, chunkSize)) {
+    reports.push(await reconcileWithScry(scry, chunk, sourceType));
+  }
+  return mergeReconcileReports(reports);
+}
+
 // Ask Scry which conversations are CLEARED for deletion from the source. Each
 // item is { source_id, live_body } where live_body is the conversation's tree
 // just fetched LIVE from Claude. Scry clears one only if capture is complete AND
@@ -358,6 +400,7 @@ async function syncOneConversation(orgId, conversationUuid, scry) {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     conversationBodyIsStub, partitionDeletableReport, reconcileWithScry,
+    chunkIds, mergeReconcileReports, reconcileStatusWithScry,
     selectClaudeOrgId, detectClaudeOrgId,
     formatRelativeTime, formatSourceStatus, getContinuousSyncStates,
   };

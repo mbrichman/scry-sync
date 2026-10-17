@@ -5,7 +5,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-const { reconcileWithScry } = require('../chrome/scry_client.js');
+const { reconcileWithScry, chunkIds, mergeReconcileReports } = require('../chrome/scry_client.js');
 
 let lastRequest;
 
@@ -87,5 +87,38 @@ describe('reconcileWithScry source_type', () => {
     expect(lastRequest.body.source_type).toBe('chatgpt');
     expect(lastRequest.body.source_ids).toEqual(['a']);
     expect(lastRequest.body.source_updated_ats).toEqual({ a: '2026-08-01T00:00:00Z' });
+  });
+});
+
+describe('chunkIds', () => {
+  it('splits into chunks of at most size, preserving order', () => {
+    expect(chunkIds([1, 2, 3, 4, 5], 2)).toEqual([[1, 2], [3, 4], [5]]);
+    expect(chunkIds([1, 2], 2)).toEqual([[1, 2]]);
+  });
+  it('empty/invalid input -> no chunks; bad size -> one chunk', () => {
+    expect(chunkIds([], 2)).toEqual([]);
+    expect(chunkIds(undefined, 2)).toEqual([]);
+    expect(chunkIds([1, 2, 3], 0)).toEqual([[1, 2, 3]]);
+  });
+});
+
+describe('mergeReconcileReports', () => {
+  it('concatenates lists, sums summary, merges buckets', () => {
+    const m = mergeReconcileReports([
+      { to_resync: ['a'], extra: ['x'], summary: { missing: 1, complete: 2 }, buckets: { missing: ['a'], incomplete: [], stale: [] } },
+      { to_resync: ['b'], extra: [], summary: { stale: 1, complete: 3 }, buckets: { missing: [], incomplete: [], stale: ['b'] } },
+    ]);
+    expect(m.to_resync).toEqual(['a', 'b']);
+    expect(m.extra).toEqual(['x']);
+    expect(m.summary).toEqual({ missing: 1, complete: 5, stale: 1 });
+    expect(m.buckets).toEqual({ missing: ['a'], incomplete: [], stale: ['b'] });
+  });
+  it('drops buckets entirely if any chunk lacks them (no half-truth)', () => {
+    const m = mergeReconcileReports([
+      { to_resync: ['a'], buckets: { missing: ['a'], incomplete: [], stale: [] } },
+      { to_resync: ['b'] },
+    ]);
+    expect(m.buckets).toBeUndefined();
+    expect(m.to_resync).toEqual(['a', 'b']);
   });
 });
