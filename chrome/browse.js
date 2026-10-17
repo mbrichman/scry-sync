@@ -73,6 +73,10 @@ let currentSort = 'updated_desc';
 let sortStack = []; // multi-level sort: [{field, direction}, ...]
 let selectedConversations = new Set(); // uuids selected in the ACTIVE source's table; cleared on tab switch
 let lastCheckedIndex = null;
+// Server truth for the Synced badge: the merged reconcile report per source
+// (null = no answer yet / failed). exportTimestamps below is a tooltip hint only.
+const reconcileReports = { claude: null, chatgpt: null };
+const reconcileStatusError = { claude: null, chatgpt: null };
 let exportTimestamps = {}; // scrySyncedMap: uuid -> last-synced source updated_at (both sources share this map; uuids don't collide across sources)
 let modelSnapshots = {}; // Claude only, written by content.js
 let statusFilter = 'all'; // 'all' | 'new' | 'synced'
@@ -367,10 +371,12 @@ async function loadSourceWithErrorHandling(source) {
   }
   sourceLoaded[source] = true;
   renderTabs();
+  if (!sourceLoadError[source]) refreshReconcileStatus(source);
   if (source === activeSource) renderActiveSource();
 }
 
 function renderActiveSource() {
+  renderStatusError();
   if (sourceLoadError[activeSource]) {
     showError(`Failed to load ${activeSource === 'claude' ? 'Claude' : 'ChatGPT'} conversations: ${sourceLoadError[activeSource]}`);
     updateStats();
@@ -393,7 +399,7 @@ function buildActiveRows() {
       row.model = modelInfo.model;
       row._modelInfo = modelInfo;
     }
-    row._synced = syncedBadge({ syncedAt: exportTimestamps[row.uuid] || null, updatedAt: row.updated_at });
+    row._synced = badgeFromReconcile(row.uuid, reconcileReports[activeSource]);
     return row;
   });
 }
@@ -408,7 +414,7 @@ function applyFiltersAndSort() {
   filteredConversations = rows.filter((row) => {
     const matchesSearch = !searchTerm || row.title.toLowerCase().includes(searchTerm);
     let matchesStatus = true;
-    if (statusFilter === 'new') matchesStatus = row._synced !== 'synced';
+    if (statusFilter === 'new') matchesStatus = badgeNeedsSync(row._synced);
     else if (statusFilter === 'synced') matchesStatus = row._synced === 'synced';
     return matchesSearch && matchesStatus;
   });
@@ -479,14 +485,15 @@ function getSortIndicator(field) {
 
 function syncedCellHtml(row) {
   const status = row._synced;
-  if (status === 'synced') {
-    const syncedAt = exportTimestamps[row.uuid];
-    const rel = syncedAt ? formatRelativeTime(Date.parse(syncedAt)) : '';
-    return `<span class="synced-badge synced">✓${rel ? ' ' + escapeHtml(rel) : ''}</span>`;
-  }
-  if (status === 'stale') return '<span class="synced-badge stale">! stale</span>';
-  if (status === 'missing') return '<span class="synced-badge missing">missing</span>';
-  return '<span class="synced-badge unknown">?</span>';
+  const pushed = exportTimestamps[row.uuid];
+  const hint = pushed ? `last pushed from this browser: ${formatRelativeTime(Date.parse(pushed))}` : '';
+  const tip = (base) => ` title="${escapeHtml(hint ? `${base} — ${hint}` : base)}"`;
+  if (status === 'synced') return `<span class="synced-badge synced"${tip('Scry holds this conversation')}>✓</span>`;
+  if (status === 'missing') return `<span class="synced-badge missing"${tip('Scry does not have this conversation')}>missing</span>`;
+  if (status === 'incomplete') return `<span class="synced-badge incomplete"${tip('Scry has an incomplete capture')}>incomplete</span>`;
+  if (status === 'stale') return `<span class="synced-badge stale"${tip('Scry has an older version')}>! stale</span>`;
+  if (status === 'needs-sync') return `<span class="synced-badge needs-sync"${tip('Scry reports this needs syncing')}>needs sync</span>`;
+  return `<span class="synced-badge unknown"${tip('no answer from Scry')}>?</span>`;
 }
 
 // Claude gets the rich badge + bounced-model tooltip (unchanged from the
@@ -650,7 +657,7 @@ function updateStats() {
   const stats = document.getElementById('stats');
   if (!stats) return;
   const total = allRowsForActiveSource.length;
-  const newCount = allRowsForActiveSource.filter((r) => r._synced !== 'synced').length;
+  const newCount = allRowsForActiveSource.filter((r) => badgeNeedsSync(r._synced)).length;
   stats.textContent = `Showing ${filteredConversations.length} of ${total} (${newCount} new/updated)`;
 }
 
@@ -659,7 +666,7 @@ function updateStats() {
 function autoSelectNewUpdated() {
   selectedConversations.clear();
   filteredConversations.forEach((row) => {
-    if (row._synced !== 'synced' && row.uuid) selectedConversations.add(row.uuid);
+    if (badgeNeedsSync(row._synced) && row.uuid) selectedConversations.add(row.uuid);
   });
   displayConversations();
 }
@@ -686,6 +693,36 @@ function showToast(message, isError = false) {
 async function refreshSyncStatus() {
   await loadExportTimestamps();
   applyFiltersAndSort();
+  refreshReconcileStatus(activeSource);
+}
+
+function renderStatusError() {
+  const el = document.getElementById('statusError');
+  if (!el) return;
+  const msg = reconcileStatusError[activeSource];
+  el.textContent = msg ? `Couldn't ask Scry which conversations it holds: ${msg}` : '';
+  el.style.display = msg ? 'block' : 'none';
+}
+
+// READ-ONLY status pass: ask Scry which enumerated conversations it holds and
+// keep the merged report in memory. Never syncs. A failure leaves the report
+// null (badges read 'unknown') and surfaces the error under the toolbar.
+async function refreshReconcileStatus(source) {
+  const items = (sourceItems[source] || []).filter((c) => c && c.uuid);
+  reconcileStatusError[source] = null;
+  try {
+    const scry = await loadScrySettings();
+    if (!scry.url) throw new Error('Scry URL not set in Options');
+    if (!(await ensureScryPermission(scry.url))) throw new Error('host permission for Scry was declined');
+    reconcileReports[source] = await reconcileStatusWithScry(scry, items, source === 'chatgpt' ? 'chatgpt' : 'claude');
+  } catch (e) {
+    reconcileReports[source] = null;
+    reconcileStatusError[source] = e.message || String(e);
+  }
+  if (source === activeSource && sourceLoaded[source]) {
+    renderStatusError();
+    applyFiltersAndSort();
+  }
 }
 
 // Sync a list of raw items (from sourceItems[activeSource]) via the shared
@@ -856,6 +893,7 @@ async function reconcileAndSyncUI() {
   }
 
   const { report, toSync } = outcome;
+  refreshReconcileStatus(activeSource); // re-run the read-only status pass now that the sync is done
   const s = report.summary || {};
   console.log('Scry reconcile:', s, 'extra(in Scry, not listed):', report.extra);
 
@@ -1181,6 +1219,9 @@ function setupEventListeners() {
       syncRecentToScry(Number.isFinite(days) && days > 0 ? days : 7);
     });
   }
+
+  const refreshStatusBtn = document.getElementById('refreshStatusBtn');
+  if (refreshStatusBtn) refreshStatusBtn.addEventListener('click', () => refreshReconcileStatus(activeSource));
 
   const reconcileBtn = document.getElementById('reconcileBtn');
   if (reconcileBtn) reconcileBtn.addEventListener('click', () => reconcileAndSyncUI());
