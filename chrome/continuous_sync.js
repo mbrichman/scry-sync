@@ -325,7 +325,8 @@ function _classifyEnumerateError(source, e) {
 async function _runIncremental(source, ctx, scry, state) {
   let conversations;
   try {
-    conversations = await source.enumerate(ctx);
+    // Sources that can page newest-first stop at the watermark; others ignore the hint.
+    conversations = await source.enumerate(ctx, { watermark: state.watermark });
   } catch (e) {
     return _classifyEnumerateError(source, e);
   }

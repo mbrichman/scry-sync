@@ -143,10 +143,15 @@ const SOURCES = {
     // chatgpt.com session is the SEPARATE signed-out path, checked per wake by
     // enumerate() below, not a persistent configuration gate.
     configure: async (scry) => ({ configured: Boolean(scry && scry.url), ctx: {} }),
-    enumerate: async (ctx) => {
+    // `hint.watermark` (set by the incremental wake) lets enumeration stop at
+    // the first page that reaches the watermark instead of listing the whole
+    // account every 15 minutes. Absent (deep reconcile, dashboard) → full list.
+    enumerate: async (ctx, hint = {}) => {
       const token = await getChatGptAccessToken();
       ctx.token = token; // one auth/session call per wake; syncOne reuses it
-      const items = await listAllChatGptConversations(token);
+      const items = hint && hint.watermark
+        ? await listChatGptConversationsSince(token, hint.watermark)
+        : await listAllChatGptConversations(token);
       return items.map(normalizeChatGptListItem);
     },
     // `ctx.wantImages` (default true — matches continuous sync's original
