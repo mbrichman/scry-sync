@@ -441,6 +441,42 @@ async function listAllChatGptConversations(token, onProgress, accountId) {
   return all;
 }
 
+// Has this page (newest-first, as chatgpt.com lists them) reached the
+// watermark? True when the OLDEST item on the page is at or behind it, i.e.
+// every later page is older still and the incremental wake does not need it.
+// A null watermark (first run) never stops early. Pure.
+function chatGptPageReachesWatermark(items, watermarkIso) {
+  if (!watermarkIso || !Array.isArray(items) || items.length === 0) return false;
+  const wm = Date.parse(watermarkIso);
+  if (Number.isNaN(wm)) return false;
+  const times = items.map((it) => Date.parse(chatGptTimeToIso(it && it.update_time))).filter((t) => !Number.isNaN(t));
+  if (times.length === 0) return false;
+  return Math.min(...times) <= wm;
+}
+
+// Enumerate only what an incremental wake needs: pages newest-first until one
+// reaches the watermark. The full list for 3,400 conversations is ~35 requests
+// every 15 minutes — measured as the cause of chatgpt.com 429s (2026-10-19);
+// with a current watermark this is one or two. Returns every item fetched
+// (the planner filters by watermark); the daily deep reconcile keeps using
+// listAllChatGptConversations.
+async function listChatGptConversationsSince(token, watermarkIso, accountId, onProgress) {
+  const limit = 100;
+  let offset = 0;
+  const all = [];
+  for (;;) {
+    const page = await listChatGptConversations(token, { offset, limit, accountId });
+    const items = (page && page.items) || [];
+    all.push(...items);
+    if (onProgress) onProgress(all.length);
+    const total = page && typeof page.total === 'number' ? page.total : null;
+    if (items.length < limit || (total != null && all.length >= total)) break;
+    if (chatGptPageReachesWatermark(items, watermarkIso)) break;
+    offset += limit;
+  }
+  return all;
+}
+
 // Fetch one conversation's full body (the mapping tree).
 async function fetchChatGptConversation(token, conversationId, accountId) {
   const url = `${CHATGPT_API}/conversation/${conversationId}`;
@@ -749,6 +785,8 @@ if (typeof module !== 'undefined' && module.exports) {
     ChatGptRateLimitError,
     chatGptAssetId,
     buildChatGptFileBlob,
+    chatGptPageReachesWatermark,
+    listChatGptConversationsSince,
     _fetchChatGptAsset,
     fetchChatGptFileBlobs,
     _bytesFetchOptions,

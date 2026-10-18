@@ -9,7 +9,8 @@ const {
   visibleSourceTabs,
   tabLabel,
   toRow,
-  syncedBadge,
+  badgeFromReconcile,
+  badgeNeedsSync,
   detectSyncTarget,
 } = require('../chrome/dashboard_model.js');
 
@@ -98,25 +99,41 @@ describe('toRow', () => {
   });
 });
 
-describe('syncedBadge', () => {
-  it('no local record at all → missing', () => {
-    expect(syncedBadge(null)).toBe('missing');
-    expect(syncedBadge(undefined)).toBe('missing');
-    expect(syncedBadge({ syncedAt: null, updatedAt: '2026-09-20T10:00:00Z' })).toBe('missing');
+describe('badgeFromReconcile (server truth)', () => {
+  const withBuckets = {
+    to_resync: ['m', 'i', 's'],
+    buckets: { missing: ['m'], incomplete: ['i'], stale: ['s'] },
+  };
+
+  it('each bucket maps to its own badge; otherwise synced', () => {
+    expect(badgeFromReconcile('m', withBuckets)).toBe('missing');
+    expect(badgeFromReconcile('i', withBuckets)).toBe('incomplete');
+    expect(badgeFromReconcile('s', withBuckets)).toBe('stale');
+    expect(badgeFromReconcile('ok', withBuckets)).toBe('synced');
   });
 
-  it('synced at or after the current updated_at → synced', () => {
-    expect(syncedBadge({ syncedAt: '2026-09-20T11:00:00Z', updatedAt: '2026-09-20T10:00:00Z' })).toBe('synced');
-    expect(syncedBadge({ syncedAt: '2026-09-20T10:00:00Z', updatedAt: '2026-09-20T10:00:00Z' })).toBe('synced');
+  it('without buckets: in to_resync -> needs-sync, else synced', () => {
+    const report = { to_resync: ['a'], summary: {} };
+    expect(badgeFromReconcile('a', report)).toBe('needs-sync');
+    expect(badgeFromReconcile('b', report)).toBe('synced');
   });
 
-  it('synced before the current updated_at (conversation grew since) → stale', () => {
-    expect(syncedBadge({ syncedAt: '2026-09-20T09:00:00Z', updatedAt: '2026-09-20T10:00:00Z' })).toBe('stale');
+  it('fallback NEVER yields missing (or incomplete/stale) when buckets are absent', () => {
+    const report = { to_resync: ['a', 'b'] };
+    for (const id of ['a', 'b', 'c']) {
+      expect(['missing', 'incomplete', 'stale']).not.toContain(badgeFromReconcile(id, report));
+    }
   });
 
-  it('malformed dates → unknown, never a guess', () => {
-    expect(syncedBadge({ syncedAt: 'not-a-date', updatedAt: '2026-09-20T10:00:00Z' })).toBe('unknown');
-    expect(syncedBadge({ syncedAt: '2026-09-20T10:00:00Z', updatedAt: null })).toBe('unknown');
+  it('no report (failed/unreachable/unauthorized) -> unknown, never missing', () => {
+    expect(badgeFromReconcile('a', null)).toBe('unknown');
+    expect(badgeFromReconcile('a', undefined)).toBe('unknown');
+    expect(badgeFromReconcile('a', 'oops')).toBe('unknown');
+  });
+
+  it('badgeNeedsSync is true for actionable badges only', () => {
+    for (const b of ['missing', 'incomplete', 'stale', 'needs-sync']) expect(badgeNeedsSync(b)).toBe(true);
+    for (const b of ['synced', 'unknown']) expect(badgeNeedsSync(b)).toBe(false);
   });
 });
 
@@ -151,5 +168,17 @@ describe('detectSyncTarget', () => {
     expect(detectSyncTarget(undefined)).toEqual({ source: null, uuid: null });
     expect(detectSyncTarget('')).toEqual({ source: null, uuid: null });
     expect(detectSyncTarget('not a url')).toEqual({ source: null, uuid: null });
+  });
+});
+
+describe('badgeFromReconcile — tombstoned', () => {
+  const { badgeFromReconcile, badgeNeedsSync } = require('../chrome/dashboard_model.js');
+  it('renders a deliberately deleted conversation as tombstoned, never synced', () => {
+    const report = { to_resync: [], buckets: { missing: [], incomplete: [], stale: [], complete: ['a'], tombstoned: ['t'] } };
+    expect(badgeFromReconcile('t', report)).toBe('tombstoned');
+    expect(badgeFromReconcile('a', report)).toBe('synced');
+  });
+  it('tombstoned is not actionable', () => {
+    expect(badgeNeedsSync('tombstoned')).toBe(false);
   });
 });
