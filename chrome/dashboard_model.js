@@ -83,25 +83,35 @@ function toRow(source, item) {
 
 // --- synced badge ------------------------------------------------------------
 
-// Classify one row's sync status from a LOCAL synced-map comparison — the
-// same "has this browser pushed the current version" signal browse.js has
-// always tracked (chrome/scry_client.js's scrySyncedMap: uuid -> last-synced
-// source updated_at), reframed from the old table's green dot into the
-// mockup's "Synced" column badge. This is a client-side proxy, not a live
-// Scry-side truth (that needs the Reconcile action's server round trip) —
-// good enough for an at-a-glance table cell.
+// The "Synced" column is SERVER TRUTH from Scry's reconcile, never the
+// browser-local scrySyncedMap (that is a hint only: a fresh Chrome profile has
+// an empty map while Scry holds everything). `report` is the (merged) reconcile
+// response for the row's source: { to_resync, summary, extra, buckets? }.
 //
-// `entry`: null/undefined (no local record at all — never synced from this
-// browser) or { syncedAt: <ISO, the source updated_at last pushed>,
-// updatedAt: <ISO, the conversation's CURRENT updated_at> }.
-// Returns 'missing' | 'stale' | 'synced' | 'unknown'.
-function syncedBadge(entry) {
-  if (!entry || !entry.syncedAt) return 'missing';
-  if (!entry.updatedAt) return 'unknown';
-  const synced = Date.parse(entry.syncedAt);
-  const updated = Date.parse(entry.updatedAt);
-  if (Number.isNaN(synced) || Number.isNaN(updated)) return 'unknown';
-  return synced >= updated ? 'synced' : 'stale';
+// Returns 'missing' | 'incomplete' | 'stale' | 'needs-sync' | 'synced' | 'unknown'.
+//  - no usable report (failed / unreachable / unauthorized) -> 'unknown',
+//    NEVER 'missing': "no answer" must not masquerade as "Scry lacks it".
+//  - report.buckets present -> exact bucket, else 'synced'.
+//  - buckets absent (older server) -> in to_resync = 'needs-sync' (we cannot
+//    tell missing from incomplete/stale), otherwise 'synced'.
+function badgeFromReconcile(uuid, report) {
+  if (!report || typeof report !== 'object') return 'unknown';
+  const b = report.buckets;
+  if (b && typeof b === 'object') {
+    if ((b.missing || []).includes(uuid)) return 'missing';
+    if ((b.incomplete || []).includes(uuid)) return 'incomplete';
+    if ((b.stale || []).includes(uuid)) return 'stale';
+    // Deleted in Scry on purpose (tombstone blocks resurrection): Scry does
+    // NOT hold it, and it is not wanted either — never let it read as synced.
+    if ((b.tombstoned || []).includes(uuid)) return 'tombstoned';
+    return 'synced';
+  }
+  return (report.to_resync || []).includes(uuid) ? 'needs-sync' : 'synced';
+}
+
+// Badges that mean "Scry needs this pushed". 'unknown' is not actionable.
+function badgeNeedsSync(badge) {
+  return badge === 'missing' || badge === 'incomplete' || badge === 'stale' || badge === 'needs-sync';
 }
 
 // --- popup: which source/conversation is the active tab looking at? --------
@@ -134,7 +144,8 @@ if (typeof module !== 'undefined' && module.exports) {
     visibleSourceTabs,
     tabLabel,
     toRow,
-    syncedBadge,
+    badgeFromReconcile,
+    badgeNeedsSync,
     detectSyncTarget,
   };
 }

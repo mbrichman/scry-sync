@@ -60,6 +60,43 @@ describe('buildIngestPayload', () => {
     buildIngestPayload(conv, { u1: 'data:image/png;base64,AAA' });
     expect(conv.chat_messages[0].files[0].data_url).toBeUndefined();
   });
+
+  // Claude Artifacts (documents/code/messages rendered in the side panel) live in
+  // an assistant message's content[] as a tool_use block for the `artifacts` tool.
+  // The body — create's `content`, an update's `new_str` — is the artifact. Scry
+  // re-derives it server-side from content[], so buildIngestPayload MUST forward
+  // the tool_use blocks verbatim; dropping them here would lose a whole content
+  // class (the same gap uploaded-file bytes were). Guards against a future "keep
+  // only type==text blocks" pruning creeping into the payload builder.
+  it('forwards artifact tool_use blocks (create + update) verbatim in content[]', () => {
+    const conv = {
+      uuid: 'conv-art',
+      name: 'Artifact chat',
+      created_at: '2026-07-24T10:00:00Z',
+      updated_at: '2026-07-24T10:05:00Z',
+      current_leaf_message_uuid: 'a2',
+      chat_messages: [
+        { uuid: 'a1', parent_message_uuid: '00000000-0000-0000-0000-000000000000', sender: 'human', text: 'draft a note' },
+        {
+          uuid: 'a2',
+          parent_message_uuid: 'a1',
+          sender: 'assistant',
+          text: '',
+          content: [
+            { type: 'text', text: 'Here you go.' },
+            { type: 'tool_use', name: 'artifacts', input: { id: 'art-1', command: 'create', type: 'text/markdown', title: 'Note', content: '# Note\n\nFirst draft.' } },
+            { type: 'tool_use', name: 'artifacts', input: { id: 'art-1', command: 'update', old_str: 'First draft.', new_str: 'Final draft.' } },
+          ],
+        },
+      ],
+    };
+    const p = buildIngestPayload(conv, {});
+    const assistant = p.chat_messages.find(m => m.uuid === 'a2');
+    const artifacts = assistant.content.filter(c => c.type === 'tool_use' && c.name === 'artifacts');
+    expect(artifacts).toHaveLength(2);
+    expect(artifacts[0].input.content).toBe('# Note\n\nFirst draft.');
+    expect(artifacts[1].input.new_str).toBe('Final draft.'); // the update delta survives the payload
+  });
 });
 
 describe('selectConversationsSince', () => {

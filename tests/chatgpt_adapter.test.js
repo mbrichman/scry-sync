@@ -762,3 +762,38 @@ describe('_bytesFetchOptions', () => {
     expect(_bytesFetchOptions('not a url', 'tok', null)).toEqual({ credentials: 'omit' });
   });
 });
+
+describe('incremental enumeration stops at the watermark', () => {
+  const { chatGptPageReachesWatermark, listChatGptConversationsSince } = require('../chrome/chatgpt_adapter.js');
+  const item = (id, t) => ({ id, update_time: t });
+
+  it('a page whose oldest item is at/behind the watermark is the last page needed', () => {
+    const page = [item('n1', '2026-10-19T10:00:00Z'), item('n2', '2026-10-19T09:00:00Z'), item('o1', '2026-10-18T00:00:00Z')];
+    expect(chatGptPageReachesWatermark(page, '2026-10-18T12:00:00Z')).toBe(true);
+    expect(chatGptPageReachesWatermark(page, '2026-10-17T00:00:00Z')).toBe(false);
+  });
+  it('tolerates epoch-second update_time and a null watermark (never stops early)', () => {
+    expect(chatGptPageReachesWatermark([item('a', 1760000000)], '2026-10-18T00:00:00Z')).toBe(true);
+    expect(chatGptPageReachesWatermark([item('a', '2026-10-19T00:00:00Z')], null)).toBe(false);
+    expect(chatGptPageReachesWatermark([], '2026-10-18T00:00:00Z')).toBe(false);
+  });
+
+  it('fetches only the pages newer than the watermark', async () => {
+    const calls = [];
+    const pages = {
+      0: { items: Array.from({ length: 100 }, (_, i) => item(`p0-${i}`, `2026-10-19T${String(23 - Math.floor(i / 5)).padStart(2, '0')}:00:00Z`)), total: 3400 },
+      100: { items: Array.from({ length: 100 }, (_, i) => item(`p1-${i}`, i < 50 ? '2026-10-18T20:00:00Z' : '2026-10-17T20:00:00Z')), total: 3400 },
+      200: { items: Array.from({ length: 100 }, (_, i) => item(`p2-${i}`, '2026-10-16T00:00:00Z')), total: 3400 },
+    };
+    global.fetch = async (url) => {
+      const offset = Number(new URL(url).searchParams.get('offset'));
+      calls.push(offset);
+      return { ok: true, status: 200, headers: { get: () => null }, json: async () => pages[offset] };
+    };
+    try {
+      const out = await listChatGptConversationsSince('tok', '2026-10-18T00:00:00Z');
+      expect(calls).toEqual([0, 100]);          // page 2 (offset 200) never requested
+      expect(out.length).toBe(200);             // everything fetched is returned; the planner filters by watermark
+    } finally { delete global.fetch; }
+  });
+});

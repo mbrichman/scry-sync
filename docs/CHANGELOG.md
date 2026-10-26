@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.0.1] — The Synced badge is Scry's answer, not this browser's memory
+
+- **Bug:** the dashboard's per-row Synced badge came from the browser-local `scrySyncedMap` (what *this* Chrome had pushed). On a fresh profile that map is empty, so every conversation read "missing" regardless of what Scry holds — the owner hit it after restoring Scry on another machine. The approved design always said the column comes from Scry's reconcile.
+- **Fix:** after each source is enumerated (and after any sync action, or via a new **Refresh status** button), the dashboard runs a read-only reconcile against Scry and draws the badge from the answer (`badgeFromReconcile`). With the server's new per-id `buckets` (scry PR for `feat/reconcile-per-id-buckets`): missing / incomplete / stale / synced. Against an older server: "needs sync" / synced. If Scry cannot be asked at all: "?" with "no answer from Scry" — never "missing". Ids are sent in chunks of 2,000 and the reports merged. The local map is now only a tooltip ("last pushed from this browser").
+- A failed status pass shows one inline line with the HTTP status, so an auth or URL problem is visible instead of masquerading as missing conversations.
+- +5 tests (329). Not yet exercised in Chrome by the builder; owner's reload is the live check.
+
 ## [3.0.0] — One dashboard, two sources
 
 - **The dashboard is now source-aware.** Tabs per enabled source (`Claude 1,204 · ChatGPT 318`, counts from enumeration); a single-source user sees one tab and no switcher; a ChatGPT tab is hidden entirely while chatgpt.com is signed out. Same table, search, sort and bulk actions for both: *Sync selected*, *Sync last N days*, *Reconcile & sync*. Per-row: sync, and open at the source. **Delete-from-source appears only in the Claude tab**, gated exactly as before; ChatGPT has no delete anywhere. Active tab is remembered.
