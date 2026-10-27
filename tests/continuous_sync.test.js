@@ -17,6 +17,11 @@ const {
   defaultContinuousSyncState,
   RUNNING_STALE_MS,
   INCREMENTAL_BATCH_CAP,
+  applyCooldownCarry,
+  planCatchUp,
+  scheduleChatGptCatchUp,
+  runChatGptCatchUp,
+  _runDeepReconcile,
 } = require('../chrome/continuous_sync.js');
 
 function conv(uuid, updatedAt) {
@@ -735,5 +740,189 @@ describe('runAllContinuousSyncs', () => {
     let appliedBadge = null;
     await runAllContinuousSyncs('deep', { runOne, getState, applyBadge: (b) => { appliedBadge = b; } });
     expect(appliedBadge).toEqual({ clear: true });
+  });
+});
+
+
+// ===== ChatGPT back-off: cooldown carry, catch-up slices, abort =====
+
+const { cooldownAbortSignal } = require('../chrome/sources.js');
+const { CHATGPT_DEEP_SLICE, CHATGPT_CATCHUP_ALARM, CHATGPT_CATCHUP_DELAY_MS } = require('../chrome/chatgpt_adapter.js');
+
+describe('SOURCES.chatgpt back-off settings', () => {
+  it('runs batches at concurrency 1 with a 150-conversation deep slice; Claude is unchanged', () => {
+    expect(SOURCES.chatgpt.concurrency).toBe(1);
+    expect(SOURCES.chatgpt.deepSlice).toBe(CHATGPT_DEEP_SLICE);
+    expect(CHATGPT_DEEP_SLICE).toBe(150);
+    expect(SOURCES.claude.concurrency).toBeUndefined();
+    expect(SOURCES.claude.deepSlice).toBeUndefined();
+  });
+});
+
+describe('applyCooldownCarry', () => {
+  it('raises nextAllowedAt to the gate cooldown when the wake ended inside it', () => {
+    const s = applyCooldownCarry({ nextAllowedAt: null }, { cooldownUntil: 5000 }, 1000);
+    expect(s.nextAllowedAt).toBe(5000);
+  });
+  it('never lowers an existing, later nextAllowedAt', () => {
+    expect(applyCooldownCarry({ nextAllowedAt: 9000 }, { cooldownUntil: 5000 }, 1000).nextAllowedAt).toBe(9000);
+  });
+  it('leaves state alone when the cooldown is already over or absent', () => {
+    expect(applyCooldownCarry({ nextAllowedAt: null }, { cooldownUntil: 500 }, 1000).nextAllowedAt).toBeNull();
+    expect(applyCooldownCarry({ nextAllowedAt: null }, null, 1000).nextAllowedAt).toBeNull();
+  });
+  it('makes shouldRun refuse the next wake until the cooldown passes', () => {
+    const s = applyCooldownCarry(applyResult({}, { ok: true, pushed: 3 }, 1000), { cooldownUntil: 5000 }, 1000);
+    expect(shouldRun(s, 2000).run).toBe(false);
+    expect(shouldRun(s, 5001).run).toBe(true);
+  });
+});
+
+describe('cooldownAbortSignal', () => {
+  it('flips to aborted once the run has hit the allowed number of cooldowns', () => {
+    let n = 0;
+    const sig = cooldownAbortSignal(() => ({ cooldownsThisRun: n }), 3);
+    expect(sig.aborted).toBe(false);
+    n = 2; expect(sig.aborted).toBe(false);
+    n = 3; expect(sig.aborted).toBe(true);
+  });
+  it('stops a batch from starting more items (via the sync core signal)', async () => {
+    const { syncBatch } = require('../chrome/sync_core.js');
+    let cooldowns = 0;
+    const source = {
+      name: 'fake', isStubError: () => false, errorDomain: () => 'x', reconcile: async () => ({}),
+      syncOne: async () => { cooldowns++; return { status: 'ok' }; },
+    };
+    const sig = cooldownAbortSignal(() => ({ cooldownsThisRun: cooldowns }), 3);
+    const items = Array.from({ length: 10 }, (_, i) => conv(`c${i}`, '2026-07-01T00:00:00Z'));
+    const out = await syncBatch(source, {}, {}, items, { concurrency: 1, signal: sig });
+    expect(out.pushed).toBe(3);
+    expect(out.failed).toEqual([]);
+  });
+});
+
+describe('applyResult carries catchUpRemaining', () => {
+  it('records it on success and on failure, and leaves it alone when the result has none', () => {
+    expect(applyResult({}, { ok: true, pushed: 1, catchUpRemaining: 40 }, 1).catchUpRemaining).toBe(40);
+    expect(applyResult({}, { ok: false, domain: 'chatgpt', error: 'x', catchUpRemaining: 7 }, 1).catchUpRemaining).toBe(7);
+    expect(applyResult({ catchUpRemaining: 9 }, { ok: true, pushed: 1 }, 1).catchUpRemaining).toBe(9);
+    expect(defaultContinuousSyncState().catchUpRemaining).toBe(0);
+  });
+});
+
+describe('_runDeepReconcile with a deep slice', () => {
+  function fakeChatSource(n, slice, extra = {}) {
+    const synced = [];
+    return {
+      synced,
+      source: {
+        name: 'fake', deepSlice: slice,
+        enumerate: async () => Array.from({ length: n }, (_, i) => conv(`c${i}`, '2026-07-01T00:00:00Z')),
+        reconcile: async (scry, items) => ({ to_resync: items.map((i) => i.uuid) }),
+        syncOne: async (ctx, it) => { synced.push(it.uuid); return { status: 'ok' }; },
+        isStubError: () => false, errorDomain: () => 'fake',
+        ...extra,
+      },
+    };
+  }
+
+  it('pushes at most the slice and reports what is left', async () => {
+    const { source, synced } = fakeChatSource(7, 3);
+    const r = await _runDeepReconcile(source, {}, {});
+    expect(synced).toHaveLength(3);
+    expect(r).toMatchObject({ ok: true, pushed: 3, catchUpRemaining: 4 });
+  });
+
+  it('reports zero remaining when everything fits in one slice', async () => {
+    const { source } = fakeChatSource(2, 5);
+    expect((await _runDeepReconcile(source, {}, {})).catchUpRemaining).toBe(0);
+  });
+
+  it('a source without deepSlice (Claude) is uncapped, as before', async () => {
+    const { source, synced } = fakeChatSource(7, undefined);
+    const r = await _runDeepReconcile(source, {}, {});
+    expect(synced).toHaveLength(7);
+    expect(r.catchUpRemaining).toBe(0);
+  });
+
+  it('counts items an aborted batch never started as still remaining', async () => {
+    let started = 0;
+    const { source } = fakeChatSource(6, 6, {
+      syncOne: async () => { started++; return { status: 'ok' }; },
+      abortSignal: () => ({ get aborted() { return started >= 2; } }),
+    });
+    const r = await _runDeepReconcile(source, {}, {});
+    expect(r.pushed).toBe(2);
+    expect(r.catchUpRemaining).toBe(4);
+  });
+});
+
+describe('catch-up alarm scheduling', () => {
+  const NOW = 1_000_000;
+  function mockAlarms(existing = []) {
+    const created = [];
+    const names = new Set(existing);
+    return {
+      created,
+      create: (name, info) => { created.push({ name, info }); names.add(name); },
+      get: async (name) => (names.has(name) ? { name } : undefined),
+    };
+  }
+
+  it('planCatchUp schedules one alarm ~20 minutes out while work remains', () => {
+    expect(planCatchUp({ catchUpRemaining: 40 }, { ran: true }, NOW)).toEqual({ when: NOW + CHATGPT_CATCHUP_DELAY_MS });
+  });
+  it('planCatchUp waits for a carried cooldown if that is later than 20 minutes', () => {
+    const far = NOW + 3 * 60 * 60 * 1000;
+    expect(planCatchUp({ catchUpRemaining: 40, nextAllowedAt: far }, { ran: true }, NOW)).toEqual({ when: far });
+  });
+  it('planCatchUp keeps the chain alive when the pass was blocked by backoff or an overlapping run', () => {
+    expect(planCatchUp({ catchUpRemaining: 5 }, { ran: false, reason: 'backoff' }, NOW)).not.toBeNull();
+    expect(planCatchUp({ catchUpRemaining: 5 }, { ran: false, reason: 'already-running' }, NOW)).not.toBeNull();
+  });
+  it('planCatchUp stops when nothing remains or the source is off/signed out', () => {
+    expect(planCatchUp({ catchUpRemaining: 0 }, { ran: true }, NOW)).toBeNull();
+    expect(planCatchUp({}, { ran: true }, NOW)).toBeNull();
+    expect(planCatchUp({ catchUpRemaining: 5 }, { ran: false, reason: 'disabled' }, NOW)).toBeNull();
+    expect(planCatchUp({ catchUpRemaining: 5 }, { ran: false, reason: 'signed-out' }, NOW)).toBeNull();
+  });
+
+  it('scheduleChatGptCatchUp creates the named one-shot alarm from persisted state', async () => {
+    const alarms = mockAlarms();
+    const r = await scheduleChatGptCatchUp({ getState: async () => ({ catchUpRemaining: 12 }), alarms, now: () => NOW });
+    expect(alarms.created).toEqual([{ name: CHATGPT_CATCHUP_ALARM, info: { when: NOW + CHATGPT_CATCHUP_DELAY_MS } }]);
+    expect(r.scheduled).toBe(true);
+    expect(CHATGPT_CATCHUP_ALARM).toBe('continuousSync:chatgpt:catchup');
+  });
+  it('scheduleChatGptCatchUp creates nothing once the catch-up is finished', async () => {
+    const alarms = mockAlarms();
+    const r = await scheduleChatGptCatchUp({ getState: async () => ({ catchUpRemaining: 0 }), alarms, now: () => NOW });
+    expect(alarms.created).toEqual([]);
+    expect(r.scheduled).toBe(false);
+  });
+  it('scheduleChatGptCatchUp({keepExisting}) does not push out an alarm that is already set', async () => {
+    const alarms = mockAlarms([CHATGPT_CATCHUP_ALARM]);
+    await scheduleChatGptCatchUp({ getState: async () => ({ catchUpRemaining: 12 }), alarms, now: () => NOW, keepExisting: true });
+    expect(alarms.created).toEqual([]);
+  });
+
+  it('runChatGptCatchUp runs a chatgpt-only deep pass, then schedules the next', async () => {
+    const alarms = mockAlarms();
+    const calls = [];
+    const out = await runChatGptCatchUp({
+      runOne: async (kind, name) => { calls.push([kind, name]); return { ran: true }; },
+      getState: async () => ({ catchUpRemaining: 30 }),
+      alarms, now: () => NOW,
+    });
+    expect(calls).toEqual([['deep', 'chatgpt']]);
+    expect(alarms.created).toHaveLength(1);
+    expect(out.scheduled).toBe(true);
+  });
+  it('runChatGptCatchUp stops scheduling when the pass leaves nothing', async () => {
+    const alarms = mockAlarms();
+    await runChatGptCatchUp({
+      runOne: async () => ({ ran: true }), getState: async () => ({ catchUpRemaining: 0 }), alarms, now: () => NOW,
+    });
+    expect(alarms.created).toEqual([]);
   });
 });

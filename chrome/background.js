@@ -21,6 +21,11 @@ const DEEP_RECONCILE_ALARM = 'scry-deep-reconcile';
 function registerContinuousSyncAlarms() {
   chrome.alarms.create(INCREMENTAL_ALARM, { periodInMinutes: 15 });
   chrome.alarms.create(DEEP_RECONCILE_ALARM, { periodInMinutes: 1440 });
+  // Alarms do not reliably survive a browser restart: if a ChatGPT catch-up is
+  // still in progress, make sure its one-shot alarm exists (without pushing an
+  // already-pending one out).
+  scheduleChatGptCatchUp({ getState: () => _getState(CONTINUOUS_STORAGE_KEY_CHATGPT), alarms: chrome.alarms, keepExisting: true })
+    .catch((e) => console.error('Scry catch-up reschedule failed', e));
 }
 
 chrome.runtime.onStartup.addListener(registerContinuousSyncAlarms);
@@ -30,7 +35,16 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === INCREMENTAL_ALARM) {
     runAllContinuousSyncs('incremental').catch((e) => console.error('Scry incremental sync wake failed', e));
   } else if (alarm.name === DEEP_RECONCILE_ALARM) {
-    runAllContinuousSyncs('deep').catch((e) => console.error('Scry deep reconcile wake failed', e));
+    runAllContinuousSyncs('deep')
+      .then((results) => scheduleChatGptCatchUp({
+        getState: () => _getState(CONTINUOUS_STORAGE_KEY_CHATGPT), alarms: chrome.alarms, runResult: results && results.chatgpt,
+      }))
+      .catch((e) => console.error('Scry deep reconcile wake failed', e));
+  } else if (alarm.name === CHATGPT_CATCHUP_ALARM) {
+    // One-shot: another capped chatgpt-only deep pass; reschedules itself
+    // until a pass leaves nothing behind.
+    runChatGptCatchUp({ getState: () => _getState(CONTINUOUS_STORAGE_KEY_CHATGPT), alarms: chrome.alarms })
+      .catch((e) => console.error('Scry ChatGPT catch-up wake failed', e));
   }
 });
 

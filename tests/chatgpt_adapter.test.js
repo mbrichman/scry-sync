@@ -4,7 +4,7 @@
 // across content types, normalize to the source-agnostic shape, and render
 // markdown/JSON.
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 
 const {
   getChatGptBranch,
@@ -19,6 +19,14 @@ const {
   chatGptConversationToJson,
   slugifyChatGptTitle,
 } = require('../chrome/chatgpt_adapter.js');
+
+// The adapter's requests all run through one global gate with real spacing
+// (hundreds of ms per request); these tests are about the adapter's logic, not
+// pacing (tests/chatgpt_gate.test.js covers that), so use a zero-spacing gate.
+beforeEach(() => {
+  const { createChatGptGate, _setChatGptGate } = require('../chrome/chatgpt_adapter.js');
+  _setChatGptGate(createChatGptGate({ spacing: { list: 0, body: 0, asset: 0 }, warn: () => {} }));
+});
 
 // A conversation with a multimodal image (user upload) and a code-interpreter
 // output image (tool). current_node = out.
@@ -706,7 +714,7 @@ describe('fetchChatGptFileBlobs — bounded concurrency', () => {
 
   afterEach(() => { delete global.fetch; delete global.FileReader; });
 
-  it('never exceeds the default concurrency (3) for 10 pointers', async () => {
+  it('never exceeds the pool bound for 10 pointers (the global gate serializes the requests themselves)', async () => {
     let inFlight = 0, peak = 0;
     global.fetch = async (url) => {
       if (url.includes('/files/') && url.includes('/download')) {
@@ -724,8 +732,8 @@ describe('fetchChatGptFileBlobs — bounded concurrency', () => {
 
     const out = await fetchChatGptFileBlobs('tok', bodyWithNImages(10), null);
     expect(out.blobs).toHaveLength(10);
-    expect(peak).toBeLessThanOrEqual(3);
-    expect(peak).toBeGreaterThan(1); // proves it's actually running concurrently, not serially
+    expect(peak).toBeLessThanOrEqual(2);
+    expect(peak).toBe(1); // one chatgpt.com request in flight at a time, whatever the pool size
   });
 
   it('honors an explicit opts.concurrency', async () => {
