@@ -241,22 +241,30 @@
     <p>Each source below persists its own checkboxes immediately — no separate Save step for these.</p>
 
     <div style="padding: 14px 0; border-bottom: 1px solid var(--border-color);">
-      <label for="scryContinuous" style="display: flex; align-items: center; gap: 8px;">
-        <input type="checkbox" id="scryContinuous" checked style="margin: 0;">
-        <strong>Claude.ai</strong> — continuous background sync
+      <label for="scryClaudeEnabled" style="display: flex; align-items: center; gap: 8px;">
+        <input type="checkbox" id="scryClaudeEnabled" checked style="margin: 0;">
+        <strong>Claude.ai</strong> — enable
       </label>
-      <div class="example">Every 15 minutes, push new/changed claude.ai conversations to Scry, plus a daily deep reconcile. A red "!" badge appears after repeated failures. Unchecking stops the background wakes; manual sync from the dashboard still works.</div>
-      <span class="settings-saved" id="scryContinuousSaved" style="font-size: 12px; color: var(--success-text); display: none;">Saved</span>
+      <span class="settings-saved" id="scryClaudeEnabledSaved" style="font-size: 12px; color: var(--success-text); display: none;">Saved</span>
+      <div class="example">On by default. Turning this off hides the Claude tab on the dashboard and stops every claude.ai request from this extension (no listing, no organization lookup, no background sync).</div>
+      <div id="claudeEnabledFields" style="margin-left: 26px;">
+        <label for="scryContinuous" style="margin-top: 12px; display: flex; align-items: center; gap: 8px;">
+          <input type="checkbox" id="scryContinuous" checked style="margin: 0;">
+          Continuous background sync for Claude
+        </label>
+        <span class="settings-saved" id="scryContinuousSaved" style="font-size: 12px; color: var(--success-text); display: none;">Saved</span>
+        <div class="example">Every 15 minutes, push new/changed claude.ai conversations to Scry, plus a daily deep reconcile. A red "!" badge appears after repeated failures. Unchecking stops the background wakes; manual sync from the dashboard still works.</div>
 
-      <label for="orgId" style="margin-top: 14px; display: block;">Organization ID:</label>
-      <input type="text" id="orgId" placeholder="Auto-detected — xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
-      <div class="example">Auto-detected from claude.ai on the dashboard's first load each session. Set it here only to override — e.g. from <a href="https://claude.ai/settings/account" target="_blank">claude.ai/settings/account</a>.</div>
-      <div class="button-row">
-        <button id="saveBtn">Save Org ID</button>
-        <button id="testBtn">Test Connection</button>
+        <label for="orgId" style="margin-top: 14px; display: block;">Organization ID:</label>
+        <input type="text" id="orgId" placeholder="Auto-detected — xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+        <div class="example">Auto-detected from claude.ai on the dashboard's first load each session. Set it here only to override — e.g. from <a href="https://claude.ai/settings/account" target="_blank">claude.ai/settings/account</a>.</div>
+        <div class="button-row">
+          <button id="saveBtn">Save Org ID</button>
+          <button id="testBtn">Test Connection</button>
+        </div>
+        <div id="status" class="status"></div>
+        <div id="testStatus" class="status"></div>
       </div>
-      <div id="status" class="status"></div>
-      <div id="testStatus" class="status"></div>
     </div>
 
     <div style="padding: 14px 0;">

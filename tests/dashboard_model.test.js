@@ -12,7 +12,64 @@ const {
   badgeFromReconcile,
   badgeNeedsSync,
   detectSyncTarget,
+  pickActiveSource,
+  continuousStatusParts,
+  syncDisabledMessage,
 } = require('../chrome/dashboard_model.js');
+
+describe('visibleSourceTabs: Claude is a per-source enable', () => {
+  it('shows Claude when claudeEnabled is absent (existing installs keep working) or true', () => {
+    expect(visibleSourceTabs({ scry: {} })).toEqual(['claude']);
+    expect(visibleSourceTabs({ scry: { claudeEnabled: true } })).toEqual(['claude']);
+  });
+  it('hides Claude when claudeEnabled is false', () => {
+    expect(visibleSourceTabs({ scry: { claudeEnabled: false } })).toEqual([]);
+  });
+  it('can show only ChatGPT', () => {
+    expect(visibleSourceTabs({ scry: { claudeEnabled: false, chatgptEnabled: true }, signedIn: {} })).toEqual(['chatgpt']);
+  });
+  it('can show nothing at all (empty-state case)', () => {
+    expect(visibleSourceTabs({ scry: { claudeEnabled: false, chatgptEnabled: true }, signedIn: { chatgpt: false } })).toEqual([]);
+  });
+});
+
+describe('pickActiveSource', () => {
+  it('keeps the remembered tab when it is visible', () => {
+    expect(pickActiveSource(['claude', 'chatgpt'], 'chatgpt')).toBe('chatgpt');
+  });
+  it('falls back to the first visible tab', () => {
+    expect(pickActiveSource(['chatgpt'], 'claude')).toBe('chatgpt');
+    expect(pickActiveSource(['claude', 'chatgpt'], undefined)).toBe('claude');
+  });
+  it('is null when nothing is visible', () => {
+    expect(pickActiveSource([], 'claude')).toBeNull();
+  });
+});
+
+describe('continuousStatusParts', () => {
+  const fmt = (label, enabled) => `${label}:${enabled ? 'on' : 'off'}`;
+  it('omits Claude when claudeEnabled is false', () => {
+    expect(continuousStatusParts({ claudeEnabled: false }, {}, fmt)).toEqual([]);
+    expect(continuousStatusParts({ claudeEnabled: false, chatgptEnabled: true }, {}, fmt)).toEqual(['ChatGPT:on']);
+  });
+  it('includes Claude by default, off when its sub-toggle is off', () => {
+    expect(continuousStatusParts({}, {}, fmt)).toEqual(['Claude:on']);
+    expect(continuousStatusParts({ continuousSync: false }, {}, fmt)).toEqual(['Claude:off']);
+  });
+  it('omits ChatGPT unless enabled', () => {
+    expect(continuousStatusParts({ chatgptEnabled: true, chatgptContinuousSync: false }, {}, fmt)).toEqual(['Claude:on', 'ChatGPT:off']);
+  });
+});
+
+describe('syncDisabledMessage', () => {
+  it('names Claude when it is disabled in Options', () => {
+    expect(syncDisabledMessage('claude', { claudeEnabled: false })).toMatch(/Claude is disabled.*Options/);
+  });
+  it('is null when the source is enabled', () => {
+    expect(syncDisabledMessage('claude', {})).toBeNull();
+    expect(syncDisabledMessage('chatgpt', {})).toBeNull();
+  });
+});
 
 describe('visibleSourceTabs', () => {
   it('Claude only when ChatGPT is not enabled', () => {

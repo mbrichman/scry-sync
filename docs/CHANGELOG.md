@@ -1,5 +1,8 @@
 # Changelog
 
+## [3.1.0] — Claude is a per-source enable; ChatGPT backs off
+
+- **Claude is now switched on/off like ChatGPT.** New **Claude.ai — enable** checkbox in Options (on by default, so existing installs keep working); "Continuous background sync for Claude" and the Organization ID controls sit beneath it. With Claude off: no Claude tab on the dashboard, no organization lookup, no listing, no reconcile status pass, no background wakes, no Claude line in the popup or dashboard footer, and the popup's *Sync this conversation* on a claude.ai tab says Claude is disabled in Options. If no source at all is enabled, the dashboard shows a plain "enable a source in Options" message and makes no network calls. The earlier "Claude always on" ruling is reversed.
 ## [3.0.1] — The Synced badge is Scry's answer, not this browser's memory
 
 - **Bug:** the dashboard's per-row Synced badge came from the browser-local `scrySyncedMap` (what *this* Chrome had pushed). On a fresh profile that map is empty, so every conversation read "missing" regardless of what Scry holds — the owner hit it after restoring Scry on another machine. The approved design always said the column comes from Scry's reconcile.

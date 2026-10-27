@@ -611,6 +611,14 @@ describe('SOURCES.claude.isEnabled (unchanged: default-on)', () => {
   it('explicit false → false', () => {
     expect(SOURCES.claude.isEnabled({ continuousSync: false })).toBe(false);
   });
+  it('is off when the Claude source itself is disabled, whatever the sub-toggle says', () => {
+    expect(SOURCES.claude.isEnabled({ claudeEnabled: false })).toBe(false);
+    expect(SOURCES.claude.isEnabled({ claudeEnabled: false, continuousSync: true })).toBe(false);
+  });
+  it('is on when claudeEnabled is true or absent and the sub-toggle is not false', () => {
+    expect(SOURCES.claude.isEnabled({ claudeEnabled: true })).toBe(true);
+    expect(SOURCES.claude.isEnabled({ claudeEnabled: true, continuousSync: false })).toBe(false);
+  });
 });
 
 describe('badgeStateAfterAll', () => {

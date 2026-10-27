@@ -179,6 +179,11 @@ function scryOriginPattern(url) {
 // Show/hide the ChatGPT continuous-sync sub-fields based on the "Enable
 // ChatGPT" checkbox. Elements stay in the DOM (just display:none) so their
 // values/listeners are unaffected.
+function syncClaudeFieldsVisibility() {
+  const enabled = document.getElementById('scryClaudeEnabled').checked;
+  document.getElementById('claudeEnabledFields').style.display = enabled ? '' : 'none';
+}
+
 function syncChatGptFieldsVisibility() {
   const enabled = document.getElementById('scryChatGptEnabled').checked;
   document.getElementById('chatGptEnabledFields').style.display = enabled ? '' : 'none';
@@ -215,6 +220,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (scry.token) document.getElementById('scryToken').value = scry.token;
     document.getElementById('scryConcurrency').value = scry.concurrency || 4;
     // Absent = enabled (default-on): only an explicit false unchecks.
+    document.getElementById('scryClaudeEnabled').checked = scry.claudeEnabled !== false;
+    syncClaudeFieldsVisibility();
     document.getElementById('scryContinuous').checked = scry.continuousSync !== false;
     // ChatGPT is the OPPOSITE default: absent/undefined = OFF, so an existing
     // install never starts hitting chatgpt.com just because this shipped.
@@ -223,6 +230,11 @@ document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('scryChatGptContinuous').checked = scry.chatgptContinuousSync !== false;
     syncChatGptFieldsVisibility();
   });
+});
+
+document.getElementById('scryClaudeEnabled').addEventListener('change', (e) => {
+  syncClaudeFieldsVisibility();
+  persistScrySetting('claudeEnabled', e.target.checked, 'scryClaudeEnabledSaved');
 });
 
 document.getElementById('scryContinuous').addEventListener('change', (e) => {

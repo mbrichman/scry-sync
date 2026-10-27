@@ -118,7 +118,10 @@ const SOURCES = {
   claude: {
     name: 'claude',
     stateKey: 'continuousSync',
-    isEnabled: (scry) => scry.continuousSync !== false,
+    // Two gates, parallel to chatgpt: claudeEnabled (the source on/off,
+    // DEFAULT ON when absent so existing installs keep working) AND the
+    // continuousSync background-wake sub-toggle.
+    isEnabled: (scry) => scry.claudeEnabled !== false && scry.continuousSync !== false,
     configure: async (scry) => {
       const orgId = await readOrgIdFromStorage();
       return { configured: Boolean(scry && scry.url && orgId), ctx: { orgId } };
