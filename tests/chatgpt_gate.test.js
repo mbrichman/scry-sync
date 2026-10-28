@@ -18,6 +18,7 @@ const {
   CHATGPT_MIN_SPACING_MS,
   CHATGPT_COOLDOWN_SCHEDULE_MS,
   CHATGPT_IMAGE_POOL_DEFAULT,
+  CHATGPT_REQUEST_TIMEOUT_MS,
 } = adapter;
 
 // A fake clock: sleep() advances time instantly.
@@ -268,5 +269,59 @@ describe('withChatGptRateLimitRetry waits on the gate cooldown', () => {
     expect(calls).toBe(4);
     expect(retries).toHaveLength(3);
     expect(env.sleeps.length).toBeGreaterThan(0);
+  });
+});
+
+
+describe('gate: request timeout', () => {
+  function timerEnv() {
+    const timers = [];
+    return {
+      timers,
+      setTimeout: (fn, ms) => { const h = { fn, ms, cleared: false }; timers.push(h); return h; },
+      clearTimeout: (h) => { h.cleared = true; },
+    };
+  }
+  afterEach(() => { delete global.fetch; });
+
+  it('the timeout constant lives with the other tunables', () => {
+    expect(CHATGPT_REQUEST_TIMEOUT_MS).toBe(60000);
+  });
+
+  it('aborts a hung fetch as an ordinary failure (not a 429) and does not wedge the queue', async () => {
+    const te = timerEnv();
+    const { gate } = makeGate({ setTimeout: te.setTimeout, clearTimeout: te.clearTimeout });
+    global.fetch = (url, init) => new Promise((resolve, reject) => {
+      if (url.includes('hang')) init.signal.addEventListener('abort', () => reject(new Error('aborted')));
+      else resolve({ ok: true, status: 200, headers: new Headers(), json: async () => ({ fine: true }) });
+    });
+    const hung = gate.run('body', () => gate.fetchWith('hung req', 'https://x/hang', {}, async (r) => r.json()));
+    const next = gate.run('body', () => gate.fetchWith('next req', 'https://x/ok', {}, async (r) => r.json()));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(te.timers[0].ms).toBe(60000);
+    te.timers[0].fn(); // the 60s timer fires
+    const err = await hung.catch((e) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(ChatGptRateLimitError);
+    expect(err.message).toMatch(/hung req.*timed out after 60s/);
+    await expect(next).resolves.toEqual({ fine: true });
+    expect(gate.getState().cooldownUntil).toBe(0);
+    expect(gate.getState().cooldownsThisRun).toBe(0);
+  });
+
+  it('also covers a stalled body read, and clears the timer on success', async () => {
+    const te = timerEnv();
+    const { gate } = makeGate({ setTimeout: te.setTimeout, clearTimeout: te.clearTimeout });
+    global.fetch = async () => ({ ok: true, status: 200, headers: new Headers(), json: async () => ({}) });
+    await gate.run('body', () => gate.fetchWith('ok', 'https://x', {}, async (r) => r.json()));
+    expect(te.timers[0].cleared).toBe(true);
+    global.fetch = async (url, init) => ({
+      ok: true, status: 200, headers: new Headers(),
+      json: () => new Promise((_, rej) => init.signal.addEventListener('abort', () => rej(new Error('aborted')))),
+    });
+    const p = gate.run('body', () => gate.fetchWith('slow body', 'https://x', {}, async (r) => r.json()));
+    await new Promise((r) => setTimeout(r, 0));
+    te.timers[1].fn();
+    await expect(p).rejects.toThrow(/slow body.*timed out/);
   });
 });

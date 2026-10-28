@@ -8,8 +8,9 @@
   - **Long waits keep the service worker alive** (a ping every 20 s).
   - **Catch-up in slices.** The deep reconcile pushes at most 150 conversations per pass; if more are wanted, a one-shot alarm (`continuousSync:chatgpt:catchup`) runs another pass 20 minutes later until nothing is left. The popup and dashboard footer show "ChatGPT: catching up - N remaining". Claude's deep pass is unchanged.
   - **Cooldowns carry across wakes.** A wake that ends inside a cooldown pushes `nextAllowedAt` out to it; a wake that hits 3 cooldowns stops starting new conversations.
+  - **Review hardening.** The cooldown (end time and escalation level) is written to storage the moment a 429 starts it and restored at the next wake start (if the last cooldown ended under 10 minutes ago), so a recycled service worker cannot walk back into the 429. A live wake refreshes its `running` stamp every 5 minutes (and on the gate's keepalive tick), so a 15-minute cooldown wait is never mistaken for an abandoned run. Catch-up passes skip conversations that already failed in the chain (the daily deep pass retries them), so persistent failures cannot starve the slice. A Scry-side failure (reconcile or ingest) no longer re-arms the catch-up chain; the daily deep pass does. Each gated request times out after 60 s as an ordinary failure, so one hung fetch cannot block the queue.
   - Tunables are all in one block at the top of `chrome/chatgpt_adapter.js`.
-- +61 tests (398 total), all with injected clocks. Not yet exercised against live chatgpt.com.
+- +77 tests (414 total), all with injected clocks. Not yet exercised against live chatgpt.com.
 
 ## [3.0.1] — The Synced badge is Scry's answer, not this browser's memory
 

@@ -22,6 +22,9 @@ const {
   scheduleChatGptCatchUp,
   runChatGptCatchUp,
   _runDeepReconcile,
+  runContinuousSync,
+  makeHeartbeat,
+  RUNNING_HEARTBEAT_MS,
 } = require('../chrome/continuous_sync.js');
 
 function conv(uuid, updatedAt) {
@@ -914,7 +917,7 @@ describe('catch-up alarm scheduling', () => {
       getState: async () => ({ catchUpRemaining: 30 }),
       alarms, now: () => NOW,
     });
-    expect(calls).toEqual([['deep', 'chatgpt']]);
+    expect(calls).toEqual([['catchup', 'chatgpt']]);
     expect(alarms.created).toHaveLength(1);
     expect(out.scheduled).toBe(true);
   });
@@ -924,5 +927,240 @@ describe('catch-up alarm scheduling', () => {
       runOne: async () => ({ ran: true }), getState: async () => ({ catchUpRemaining: 0 }), alarms, now: () => NOW,
     });
     expect(alarms.created).toEqual([]);
+  });
+});
+
+
+// ===== review round: persisted cooldown, heartbeat, starvation, scry-down =====
+
+const { createChatGptGate } = require('../chrome/chatgpt_adapter.js');
+
+function wakeEnv() {
+  let t = 10_000_000;
+  return { now: () => t, advance: (ms) => { t += ms; }, set: (v) => { t = v; } };
+}
+const flush = () => new Promise((r) => setTimeout(r, 0));
+
+// A SOURCES.chatgpt-shaped source around a REAL gate on the shared fake clock.
+function gatedSource(env, gate, overrides = {}) {
+  return {
+    name: 'chatgpt', stateKey: 'k', deepSlice: 150,
+    isEnabled: () => true,
+    configure: async () => ({ configured: true, ctx: {} }),
+    beginWake: () => gate.resetRun(),
+    seedCooldown: (p) => gate.seed(p),
+    onCooldown: (cb) => { gate.setOnCooldown(cb); return () => gate.setOnCooldown(null); },
+    onKeepalive: (cb) => { gate.setOnKeepalive(cb); return () => gate.setOnKeepalive(null); },
+    cooldownState: () => gate.getState(),
+    enumerate: async () => [conv('c0', '2026-07-01T00:00:00Z')],
+    reconcile: async (scry, items) => ({ to_resync: items.map((i) => i.uuid) }),
+    syncOne: async () => ({ status: 'ok' }),
+    isStubError: () => false, errorDomain: () => 'chatgpt',
+    ...overrides,
+  };
+}
+function newGate(env) {
+  return createChatGptGate({ now: env.now, sleep: async (ms) => { env.advance(ms); }, keepalive: () => {}, warn: () => {} });
+}
+const baseDeps = (env, storage, source) => ({
+  storage, now: env.now, sources: { chatgpt: source }, loadSettings: async () => ({ url: 'http://x' }),
+  applyBadge: () => {}, timers: { setInterval: () => 1, clearInterval: () => {} },
+});
+
+describe('cooldown is persisted at the moment of the 429 (worker death)', () => {
+  it('a worker killed mid-cooldown leaves nextAllowedAt + level in storage; the next wake is gated / escalates from the stored level', async () => {
+    const env = wakeEnv();
+    const t0 = env.now();
+    const storage = makeStorageStub();
+    const gate1 = newGate(env);
+    let snapshot;
+    const src1 = gatedSource(env, gate1, {
+      syncOne: async () => {
+        gate1.report429({ status: 429, headers: new Headers({ 'Retry-After': '3600' }) });
+        await flush();
+        snapshot = JSON.parse(JSON.stringify(storage._store)); // the worker dies right here
+        throw new Error('worker died');
+      },
+    });
+    await runContinuousSync('deep', 'chatgpt', baseDeps(env, storage, src1)).catch(() => {});
+    expect(snapshot.k.nextAllowedAt).toBe(t0 + 3600_000);
+    expect(snapshot.k.cooldownLevel).toBe(1);
+    expect(typeof snapshot.k.running).toBe('number'); // never cleaned up
+
+    // New worker: fresh module state (new gate), same storage contents, running is stale.
+    env.advance(11 * 60 * 1000);
+    const storage2 = makeStorageStub(snapshot);
+    const gate2 = newGate(env);
+    const r = await runContinuousSync('deep', 'chatgpt', baseDeps(env, storage2, gatedSource(env, gate2)));
+    expect(r).toEqual({ ran: false, reason: 'backoff' });
+  });
+
+  it('escalation continues from the stored level when the last cooldown ended < 10 minutes ago', async () => {
+    const env = wakeEnv();
+    const storage = makeStorageStub();
+    const gate1 = newGate(env);
+    let snapshot;
+    const src1 = gatedSource(env, gate1, {
+      syncOne: async () => {
+        gate1.report429({ status: 429, headers: new Headers() }); // 60s, level -> 1
+        await flush();
+        snapshot = JSON.parse(JSON.stringify(storage._store));
+        throw new Error('worker died');
+      },
+    });
+    await runContinuousSync('deep', 'chatgpt', baseDeps(env, storage, src1)).catch(() => {});
+    env.advance(5 * 60 * 1000); // cooldown over; still inside the 10-minute reset window
+    const gate2 = newGate(env);
+    let nextCooldown;
+    const src2 = gatedSource(env, gate2, {
+      syncOne: async () => { nextCooldown = gate2.report429({ status: 429, headers: new Headers() }); return { status: 'ok' }; },
+    });
+    // stale `running` from the dead worker is younger than 10 min here, so clear it as an operator-free restart would
+    snapshot.k.running = null;
+    await runContinuousSync('deep', 'chatgpt', baseDeps(env, makeStorageStub(snapshot), src2));
+    expect(nextCooldown).toBe(120000);
+  });
+
+  it('escalation starts over when the stored cooldown ended > 10 minutes ago', () => {
+    const env = wakeEnv();
+    const g = newGate(env);
+    g.seed({ cooldownUntil: env.now() - 11 * 60 * 1000, level: 3 });
+    expect(g.report429({ status: 429, headers: new Headers() })).toBe(60000);
+  });
+
+  it('the wake-end write keeps the cooldown fields too', async () => {
+    const env = wakeEnv();
+    const storage = makeStorageStub();
+    const gate = newGate(env);
+    const src = gatedSource(env, gate, { syncOne: async () => { gate.report429({ status: 429, headers: new Headers() }); return { status: 'ok' }; } });
+    await runContinuousSync('deep', 'chatgpt', baseDeps(env, storage, src));
+    expect(storage._store.k.cooldownLevel).toBe(1);
+    expect(storage._store.k.nextAllowedAt).toBeGreaterThan(env.now());
+  });
+});
+
+describe('running heartbeat', () => {
+  it('RUNNING_HEARTBEAT_MS is well under the 10-minute stale window', () => {
+    expect(RUNNING_HEARTBEAT_MS).toBeLessThanOrEqual(5 * 60 * 1000);
+    expect(RUNNING_HEARTBEAT_MS).toBeLessThan(RUNNING_STALE_MS);
+  });
+
+  it('makeHeartbeat writes at most once per interval', () => {
+    const env = wakeEnv();
+    const writes = [];
+    const beat = makeHeartbeat({ write: (t) => writes.push(t), now: env.now, everyMs: 1000 });
+    expect(beat()).toBe(false);
+    env.advance(1000); expect(beat()).toBe(true);
+    env.advance(500); expect(beat()).toBe(false);
+    env.advance(500); expect(beat()).toBe(true);
+    expect(writes).toHaveLength(2);
+  });
+
+  it('a live wake refreshes `running` (interval tick) so a later wake does not see it as stale', async () => {
+    const env = wakeEnv();
+    const storage = makeStorageStub();
+    const gate = newGate(env);
+    let tick; let during;
+    const deps = baseDeps(env, storage, gatedSource(env, gate, {
+      enumerate: async () => {
+        env.advance(6 * 60 * 1000);
+        tick(); // interval fires while the wake is still alive
+        await flush();
+        during = storage._store.k.running;
+        env.advance(6 * 60 * 1000); // 12 minutes after start: past the stale window of the ORIGINAL stamp
+        const st = storage._store.k;
+        expect(shouldRun(st, env.now())).toEqual({ run: false, reason: 'already-running' });
+        return [];
+      },
+    }));
+    deps.timers = { setInterval: (f) => { tick = f; return 7; }, clearInterval: () => {} };
+    const start = env.now();
+    await runContinuousSync('incremental', 'chatgpt', deps);
+    expect(during).toBe(start + 6 * 60 * 1000);
+  });
+
+  it('the gate keepalive tick also drives the heartbeat during a long cooldown wait', async () => {
+    const env = wakeEnv();
+    const storage = makeStorageStub();
+    const runningWrites = [];
+    const origSet = storage.set;
+    storage.set = (obj, cb) => { runningWrites.push(obj.k && obj.k.running); origSet(obj, cb); };
+    const gate = newGate(env);
+    const start = env.now();
+    const deps = baseDeps(env, storage, gatedSource(env, gate, {
+      enumerate: async () => {
+        gate.report429({ status: 429, headers: new Headers({ 'Retry-After': '900' }) });
+        await gate.waitForCooldown(); // 15 minutes of keepalive ticks on the fake clock
+        return [];
+      },
+    }));
+    await runContinuousSync('incremental', 'chatgpt', deps);
+    const stamps = runningWrites.filter((v) => typeof v === 'number');
+    expect(stamps.some((v) => v >= start + 5 * 60 * 1000)).toBe(true); // refreshed during the wait
+    expect(storage._store.k.running).toBeNull();
+    expect(env.now() - start).toBeGreaterThanOrEqual(900_000);
+  });
+});
+
+describe('catch-up starvation and Scry-down', () => {
+  function chain(n, slice, failing, extra = {}) {
+    const synced = [];
+    return {
+      synced,
+      source: {
+        name: 'fake', deepSlice: slice,
+        enumerate: async () => Array.from({ length: n }, (_, i) => conv(`c${i}`, '2026-07-01T00:00:00Z')),
+        reconcile: async (scry, items) => ({ to_resync: items.map((i) => i.uuid) }),
+        syncOne: async (ctx, it) => { if (failing.has(it.uuid)) throw new Error('permanent'); synced.push(it.uuid); return { status: 'ok' }; },
+        isStubError: () => false, errorDomain: () => 'fake',
+        ...extra,
+      },
+    };
+  }
+
+  it('150 persistently failing ids at the head do not starve the next slice', async () => {
+    const failing = new Set(Array.from({ length: 150 }, (_, i) => `c${i}`));
+    const { source, synced } = chain(400, 150, failing);
+    const r1 = await _runDeepReconcile(source, {}, {});
+    expect(r1.catchUpFailedUuids).toHaveLength(150);
+    expect(r1.catchUpRemaining).toBe(250);
+    const st = applyResult({}, r1, 1);
+    const r2 = await _runDeepReconcile(source, {}, {}, { excludeUuids: st.catchUpFailedUuids });
+    expect(synced).toContain('c150');
+    expect(synced).toHaveLength(150);
+    expect(r2.catchUpRemaining).toBe(100);
+  });
+
+  it('the daily deep pass starts with no exclusions (retries them) while a catchup pass keeps them', async () => {
+    const env = wakeEnv();
+    const attempted = [];
+    const gate = newGate(env);
+    const mk = () => gatedSource(env, gate, {
+      deepSlice: 5,
+      enumerate: async () => [conv('c0', '2026-07-01T00:00:00Z'), conv('c1', '2026-07-01T00:00:00Z')],
+      syncOne: async (ctx, it) => { attempted.push(it.uuid); return { status: 'ok' }; },
+    });
+    const seeded = { k: { catchUpFailedUuids: ['c0'] } };
+    await runContinuousSync('catchup', 'chatgpt', baseDeps(env, makeStorageStub(seeded), mk()));
+    expect(attempted).toEqual(['c1']);
+    attempted.length = 0;
+    await runContinuousSync('deep', 'chatgpt', baseDeps(env, makeStorageStub({ k: { catchUpFailedUuids: ['c0'] } }), mk()));
+    expect(attempted.sort()).toEqual(['c0', 'c1']);
+  });
+
+  it('a Scry-side reconcile failure does not re-arm the catch-up chain', async () => {
+    const { source } = chain(10, 3, new Set(), { reconcile: async () => { throw new Error('reconcile HTTP 502'); } });
+    const r = await _runDeepReconcile(source, {}, {});
+    expect(r).toMatchObject({ ok: false, domain: 'scry', catchUpRemaining: 0 });
+    const st = applyResult({ catchUpRemaining: 40 }, r, 1000);
+    expect(st.catchUpRemaining).toBe(0);
+    expect(planCatchUp(st, { ran: true }, 1000)).toBeNull();
+  });
+
+  it('a Scry-side ingest failure for the whole slice also stops the chain', async () => {
+    const { source } = chain(10, 3, new Set(['c0', 'c1', 'c2']), { errorDomain: () => 'scry' });
+    const r = await _runDeepReconcile(source, {}, {});
+    expect(r.ok).toBe(false);
+    expect(r.catchUpRemaining).toBe(0);
   });
 });

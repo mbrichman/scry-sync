@@ -59,6 +59,10 @@ const CHATGPT_BATCH_CONCURRENCY = 1;
 const CHATGPT_DEEP_SLICE = 150;
 const CHATGPT_CATCHUP_DELAY_MS = 20 * 60 * 1000;
 const CHATGPT_CATCHUP_ALARM = 'continuousSync:chatgpt:catchup';
+// A gated request (headers AND body) that takes longer than this is aborted
+// and fails like any ordinary error (NOT as a 429), so one hung fetch cannot
+// wedge the single global queue.
+const CHATGPT_REQUEST_TIMEOUT_MS = 60000;
 // Rate-limit retries per request (each one waits on the gate's cooldown).
 const CHATGPT_RATE_LIMIT_RETRIES = 3;
 
@@ -469,6 +473,11 @@ function createChatGptGate(opts = {}) {
   const spacing = opts.spacing || CHATGPT_MIN_SPACING_MS;
   const schedule = opts.schedule || CHATGPT_COOLDOWN_SCHEDULE_MS;
   const resetAfterMs = opts.resetAfterMs != null ? opts.resetAfterMs : CHATGPT_COOLDOWN_RESET_MS;
+  const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : CHATGPT_REQUEST_TIMEOUT_MS;
+  const setT = opts.setTimeout || ((fn, ms) => setTimeout(fn, ms));
+  const clearT = opts.clearTimeout || ((h) => clearTimeout(h));
+  let onCooldown = opts.onCooldown || null;   // (cooldownUntil, level) -> void, at the moment of a 429
+  let onKeepalive = opts.onKeepalive || null; // () -> void, on every keepalive tick of a long wait
 
   let tail = Promise.resolve();
   let lastStart = -Infinity;
@@ -485,6 +494,7 @@ function createChatGptGate(opts = {}) {
     let left = ms;
     while (left > 0) {
       keepalive();
+      if (onKeepalive) { try { onKeepalive(); } catch (_e) { /* best-effort */ } }
       const step = Math.min(left, CHATGPT_KEEPALIVE_MS);
       await sleep(step);
       left -= step;
@@ -526,8 +536,49 @@ function createChatGptGate(opts = {}) {
     cooldownsThisRun++;
     // Whether a real 429 carries Retry-After was UNKNOWN when this was written
     // (a 200 carries no rate-limit headers at all) -- log everything, once.
+    if (onCooldown) { try { onCooldown(cooldownUntil, level); } catch (_e) { /* persistence is best-effort */ } }
     warn(`Scry ChatGPT 429 headers: status ${(resp && resp.status) || 429} | ${_headerDump(resp && resp.headers)}`);
     return dur;
+  }
+
+  // Restore a persisted cooldown after the service worker was recycled: carry
+  // the cooldown end and the escalation level forward unless the last cooldown
+  // ended more than the reset window ago (then escalation starts over).
+  function seed(persisted) {
+    const until = persisted && persisted.cooldownUntil;
+    if (typeof until !== 'number') return;
+    if (now() - until >= resetAfterMs) return;
+    cooldownUntil = Math.max(cooldownUntil, until);
+    level = Math.max(level, Number(persisted.level) || 0);
+  }
+
+  // One gated fetch, bounded by a timeout. `handler(resp)` reads the response
+  // (429 check, status, body) INSIDE the timeout, so a stalled body read is
+  // covered too. A timeout throws an ordinary Error (not a rate limit); an
+  // error thrown by fetch() itself is tagged `fetchPhase`.
+  async function fetchWith(label, url, init, handler) {
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    let timedOut = false;
+    const timer = setT(() => { timedOut = true; if (ac) ac.abort(); }, timeoutMs);
+    const timeoutErr = () => new Error(`${label}: request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    try {
+      let resp;
+      try {
+        resp = await fetch(url, ac ? { ...init, signal: ac.signal } : init);
+      } catch (e) {
+        if (timedOut) throw timeoutErr();
+        e.fetchPhase = true;
+        throw e;
+      }
+      try {
+        return await handler(resp);
+      } catch (e) {
+        if (timedOut && !(e instanceof ChatGptRateLimitError)) throw timeoutErr();
+        throw e;
+      }
+    } finally {
+      clearT(timer);
+    }
   }
 
   async function waitForCooldown() {
@@ -538,6 +589,10 @@ function createChatGptGate(opts = {}) {
   return {
     run,
     report429,
+    fetchWith,
+    seed,
+    setOnCooldown(fn) { onCooldown = fn || null; },
+    setOnKeepalive(fn) { onKeepalive = fn || null; },
     waitForCooldown,
     resetRun() { cooldownsThisRun = 0; },
     getState() { return { cooldownUntil, cooldownsThisRun, level }; },
@@ -559,15 +614,14 @@ function _throwIfRateLimited(resp) {
 // Relies on the browser's chatgpt.com session cookies (host_permissions grants
 // credentialed cross-origin fetch from the extension page).
 async function getChatGptAccessToken() {
-  const data = await chatGptGate.run('list', async () => {
-    const resp = await fetch(`${CHATGPT_ORIGIN}/api/auth/session`, {
-      credentials: 'include',
-      headers: { 'Accept': 'application/json' },
-    });
-    _throwIfRateLimited(resp);
-    if (!resp.ok) throw new Error(`auth/session ${resp.status} — are you signed in to chatgpt.com?`);
-    return resp.json();
-  });
+  const data = await chatGptGate.run('list', () => chatGptGate.fetchWith(
+    'auth/session', `${CHATGPT_ORIGIN}/api/auth/session`,
+    { credentials: 'include', headers: { 'Accept': 'application/json' } },
+    async (resp) => {
+      _throwIfRateLimited(resp);
+      if (!resp.ok) throw new Error(`auth/session ${resp.status} — are you signed in to chatgpt.com?`);
+      return resp.json();
+    }));
   if (!data || !data.accessToken) throw new Error('No access token in session — sign in to chatgpt.com first.');
   return data.accessToken;
 }
@@ -590,12 +644,13 @@ function chatGptAuthHeaders(token, accountId) {
 // Credentialed backend-api GET with 429 awareness, through the global gate.
 // `kind` ('list' | 'body' | 'asset') picks the gate's minimum spacing.
 async function chatGptApiGet(url, token, accountId, kind = 'body') {
-  return chatGptGate.run(kind, async () => {
-    const resp = await fetch(url, { credentials: 'include', headers: chatGptAuthHeaders(token, accountId) });
-    _throwIfRateLimited(resp);
-    if (!resp.ok) throw new Error(`${url}: ${resp.status}`);
-    return resp.json();
-  });
+  return chatGptGate.run(kind, () => chatGptGate.fetchWith(
+    url, url, { credentials: 'include', headers: chatGptAuthHeaders(token, accountId) },
+    async (resp) => {
+      _throwIfRateLimited(resp);
+      if (!resp.ok) throw new Error(`${url}: ${resp.status}`);
+      return resp.json();
+    }));
 }
 
 // One page of the conversation list.
@@ -836,17 +891,20 @@ async function _fetchChatGptAsset(token, pointer, accountId, conversationId) {
   // backend-api call.
   const fetchOpts = _bytesFetchOptions(meta.download_url, token, accountId);
   const { resp, raw } = await chatGptGate.run('asset', async () => {
-    let r;
+    let host = '?';
+    try { host = new URL(meta.download_url).host; } catch { /* leave ? */ }
     try {
-      r = await fetch(meta.download_url, fetchOpts);
+      return await chatGptGate.fetchWith('bytes', meta.download_url, fetchOpts, async (r) => {
+        _throwIfRateLimited(r);
+        if (!r.ok) throw new Error(`bytes ${r.status} from ${host}`);
+        return { resp: r, raw: await _blobToDataUrl(await r.blob()) };
+      });
     } catch (e) {
-      let host = '?';
-      try { host = new URL(meta.download_url).host; } catch { /* leave ? */ }
-      throw new Error(`bytes fetch threw for host ${host} (${e.message}) -- is that host in manifest host_permissions?`);
+      if (e && e.fetchPhase) {
+        throw new Error(`bytes fetch threw for host ${host} (${e.message}) -- is that host in manifest host_permissions?`);
+      }
+      throw e;
     }
-    _throwIfRateLimited(r);
-    if (!r.ok) throw new Error(`bytes ${r.status} from ${new URL(meta.download_url).host}`);
-    return { resp: r, raw: await _blobToDataUrl(await r.blob()) };
   });
   // Prefer the real content-type over FileReader's guess.
   const ct = resp.headers.get('content-type') || meta.mime_type;
@@ -987,6 +1045,7 @@ if (typeof module !== 'undefined' && module.exports) {
     CHATGPT_CATCHUP_DELAY_MS,
     CHATGPT_CATCHUP_ALARM,
     CHATGPT_RATE_LIMIT_RETRIES,
+    CHATGPT_REQUEST_TIMEOUT_MS,
     chatGptAssetId,
     buildChatGptFileBlob,
     chatGptPageReachesWatermark,

@@ -179,6 +179,12 @@ const SOURCES = {
     deepSlice: _CG.CHATGPT_DEEP_SLICE,
     beginWake: () => _CG.gate().resetRun(),
     cooldownState: () => _CG.gate().getState(),
+    // Persisted-cooldown plumbing (continuous_sync.js): restore the gate's
+    // cooldown/level at wake start, be told the moment a 429 starts one, and
+    // be ticked from the gate's keepalive during long waits (heartbeat).
+    seedCooldown: (persisted) => _CG.gate().seed(persisted),
+    onCooldown: (cb) => { _CG.gate().setOnCooldown(cb); return () => _CG.gate().setOnCooldown(null); },
+    onKeepalive: (cb) => { _CG.gate().setOnKeepalive(cb); return () => _CG.gate().setOnKeepalive(null); },
     abortSignal: () => cooldownAbortSignal(() => _CG.gate().getState(), _CG.CHATGPT_ABORT_AFTER_COOLDOWNS),
     // Unlike claude, "configured" here does NOT check auth — a missing/expired
     // chatgpt.com session is the SEPARATE signed-out path, checked per wake by
