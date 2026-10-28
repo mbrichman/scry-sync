@@ -195,9 +195,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   renderConnStatus();
   renderContinuousFooter();
 
-  activeSource = await loadActiveSourceTabPref();
+  const preferredSource = await loadActiveSourceTabPref();
   const initialTabs = computeVisibleTabs();
-  if (!initialTabs.includes(activeSource)) activeSource = 'claude';
+  if (initialTabs.length === 0) {
+    // No source enabled: plain empty state, and NOTHING touches the network
+    // (no org-id detection, no enumeration, no reconcile status pass).
+    renderNoSourcesState();
+    return;
+  }
+  activeSource = pickActiveSource(initialTabs, preferredSource);
   renderTabs();
   showLoadingTable();
 
@@ -210,10 +216,29 @@ document.addEventListener('DOMContentLoaded', async () => {
   // ChatGPT may have just been discovered signed-out — recompute visibility
   // and fall back to Claude if the active tab disappeared out from under it.
   const finalTabs = computeVisibleTabs();
-  if (!finalTabs.includes(activeSource)) activeSource = 'claude';
+  if (finalTabs.length === 0) {
+    renderNoSourcesState();
+    return;
+  }
+  activeSource = pickActiveSource(finalTabs, activeSource);
   renderTabs();
   renderActiveSource();
 });
+
+// Shown when no source is enabled (e.g. Claude switched off and ChatGPT never
+// enabled, or signed out). Static copy only — no network.
+function renderNoSourcesState() {
+  const tabsEl = document.getElementById('sourceTabs');
+  if (tabsEl) { tabsEl.style.display = 'none'; tabsEl.innerHTML = ''; }
+  const stats = document.getElementById('stats');
+  if (stats) stats.textContent = '';
+  const tableContent = document.getElementById('tableContent');
+  if (tableContent) {
+    tableContent.innerHTML = '<div class="loading"><div>No sources are enabled. Enable Claude.ai or ChatGPT in <a href="#" id="noSourcesOpenOptions">Options</a> to see conversations here.</div></div>';
+    const link = document.getElementById('noSourcesOpenOptions');
+    if (link) link.addEventListener('click', (e) => { e.preventDefault(); chrome.runtime.openOptionsPage(); });
+  }
+}
 
 // ===== source tabs =====
 
@@ -238,13 +263,8 @@ async function renderContinuousFooter() {
   const el = document.getElementById('continuousFooter');
   if (!el) return;
   const scry = scrySettingsCache || {};
-  const claudeEnabled = scry.continuousSync !== false;
-  const chatgptSourceEnabled = scry.chatgptEnabled === true;
-  const chatgptSyncEnabled = chatgptSourceEnabled && scry.chatgptContinuousSync !== false;
   const states = await getContinuousSyncStates();
-  const claudeLine = formatSourceStatus('Claude', claudeEnabled, states.claude);
-  const chatgptLine = chatgptSourceEnabled ? formatSourceStatus('ChatGPT', chatgptSyncEnabled, states.chatgpt) : null;
-  const parts = [claudeLine, chatgptLine].filter(Boolean);
+  const parts = continuousStatusParts(scry, states, formatSourceStatus);
   el.textContent = parts.length ? `Continuous: ${parts.join(' · ')}` : '';
 }
 
@@ -252,9 +272,9 @@ function renderTabs() {
   const container = document.getElementById('sourceTabs');
   if (!container) return;
   const tabs = computeVisibleTabs();
-  if (!tabs.includes(activeSource)) activeSource = 'claude';
+  if (tabs.length > 0 && !tabs.includes(activeSource)) activeSource = pickActiveSource(tabs, activeSource);
 
-  // A single visible source (Claude, always) means no switcher at all.
+  // A single visible source means no switcher at all.
   if (tabs.length <= 1) {
     container.style.display = 'none';
     container.innerHTML = '';
@@ -335,6 +355,9 @@ async function ensureOrgId() {
 
 async function loadSource(source) {
   if (source === 'claude') {
+    // Defensive: a disabled Claude must never reach org-id detection or any
+    // claude.ai request (the tab is hidden, but a stale call must stay inert).
+    if (scrySettingsCache && scrySettingsCache.claudeEnabled === false) { sourceItems.claude = []; return; }
     const orgId = await ensureOrgId();
     const raw = await SOURCES.claude.enumerate({ orgId });
     sourceItems.claude = raw.map((conv) => ({ ...conv, model: inferModel(conv) }));
@@ -713,6 +736,7 @@ const reconcileStatusTokens = {}; // per-source: only the newest in-flight pass 
 // only lets permissions.request() prompt inside a user gesture. The page-load
 // pass checks silently and, if access is missing, says how to grant it.
 async function refreshReconcileStatus(source, { allowPrompt = false } = {}) {
+  if (source === 'claude' && scrySettingsCache && scrySettingsCache.claudeEnabled === false) return;
   const items = (sourceItems[source] || []).filter((c) => c && c.uuid);
   const myToken = (reconcileStatusTokens[source] || 0) + 1;
   reconcileStatusTokens[source] = myToken;

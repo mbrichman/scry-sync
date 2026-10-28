@@ -122,6 +122,9 @@ function formatSourceStatus(label, enabled, state) {
     return `${label}: failing since ${since} — ${shortError}`;
   }
 
+  // A ChatGPT catch-up is spreading a large backlog over many passes.
+  if (state.catchUpRemaining > 0) return `${label}: catching up — ${state.catchUpRemaining} remaining`;
+
   if (state.lastError && !(state.consecutiveFailures > 0)) {
     return `${label}: ${state.lastError}`;
   }

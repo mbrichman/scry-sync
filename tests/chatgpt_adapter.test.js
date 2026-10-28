@@ -4,7 +4,7 @@
 // across content types, normalize to the source-agnostic shape, and render
 // markdown/JSON.
 
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 
 const {
   getChatGptBranch,
@@ -19,6 +19,14 @@ const {
   chatGptConversationToJson,
   slugifyChatGptTitle,
 } = require('../chrome/chatgpt_adapter.js');
+
+// The adapter's requests all run through one global gate with real spacing
+// (hundreds of ms per request); these tests are about the adapter's logic, not
+// pacing (tests/chatgpt_gate.test.js covers that), so use a zero-spacing gate.
+beforeEach(() => {
+  const { createChatGptGate, _setChatGptGate } = require('../chrome/chatgpt_adapter.js');
+  _setChatGptGate(createChatGptGate({ spacing: { list: 0, body: 0, asset: 0 }, warn: () => {} }));
+});
 
 // A conversation with a multimodal image (user upload) and a code-interpreter
 // output image (tool). current_node = out.
@@ -706,7 +714,7 @@ describe('fetchChatGptFileBlobs — bounded concurrency', () => {
 
   afterEach(() => { delete global.fetch; delete global.FileReader; });
 
-  it('never exceeds the default concurrency (3) for 10 pointers', async () => {
+  it('never exceeds the pool bound for 10 pointers (the global gate serializes the requests themselves)', async () => {
     let inFlight = 0, peak = 0;
     global.fetch = async (url) => {
       if (url.includes('/files/') && url.includes('/download')) {
@@ -724,25 +732,48 @@ describe('fetchChatGptFileBlobs — bounded concurrency', () => {
 
     const out = await fetchChatGptFileBlobs('tok', bodyWithNImages(10), null);
     expect(out.blobs).toHaveLength(10);
-    expect(peak).toBeLessThanOrEqual(3);
-    expect(peak).toBeGreaterThan(1); // proves it's actually running concurrently, not serially
+    expect(peak).toBeLessThanOrEqual(2);
+    expect(peak).toBe(1); // one chatgpt.com request in flight at a time, whatever the pool size
   });
 
-  it('honors an explicit opts.concurrency', async () => {
-    let inFlight = 0, peak = 0;
+  // The global gate serializes the requests themselves, so the pool bound is
+  // observed where it is still visible: how many pointers have been handed to
+  // the asset fetcher (each pending gate.run is one worker) while the first
+  // request is still unresolved.
+  async function poolBoundSeen(opts) {
+    const { createChatGptGate, _setChatGptGate } = require('../chrome/chatgpt_adapter.js');
+    const real = createChatGptGate({ spacing: { list: 0, body: 0, asset: 0 }, warn: () => {} });
+    let pending = 0, seen = 0;
+    _setChatGptGate({
+      ...real,
+      run(kind, fn) { pending++; seen = Math.max(seen, pending); return real.run(kind, fn).finally(() => { pending--; }); },
+    });
+    let release;
+    const gateOpen = new Promise((r) => { release = r; });
     global.fetch = async (url) => {
-      if (url.includes('/files/') && url.includes('/download')) {
-        inFlight++; peak = Math.max(peak, inFlight);
-        await new Promise((r) => setTimeout(r, 5));
-        inFlight--;
-        return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ status: 'success', download_url: 'https://files.oaiusercontent.com/x', file_name: 'a.png', mime_type: 'image/png' }) };
+      if (url.includes('/download')) {
+        await gateOpen;
+        return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ status: 'success', download_url: 'https://files.oaiusercontent.com/x', mime_type: 'image/png' }) };
       }
       return { ok: true, status: 200, headers: { get: (h) => (h === 'content-type' ? 'image/png' : null) }, blob: async () => ({}) };
     };
     global.FileReader = class { readAsDataURL() { this.result = 'data:image/png;base64,AAAA'; this.onloadend(); } };
+    const done = fetchChatGptFileBlobs('tok', bodyWithNImages(10), null, null, opts);
+    await new Promise((r) => setTimeout(r, 10));
+    const handedOut = pending; // workers blocked on the first unresolved request
+    release();
+    const out = await done;
+    expect(out.blobs).toHaveLength(10);
+    return handedOut;
+  }
 
-    await fetchChatGptFileBlobs('tok', bodyWithNImages(10), null, null, { concurrency: 2 });
-    expect(peak).toBeLessThanOrEqual(2);
+  it('hands out at most the default pool (2) pointers while the first request is unresolved', async () => {
+    expect(await poolBoundSeen(undefined)).toBe(2);
+  });
+
+  it('honors an explicit opts.concurrency', async () => {
+    expect(await poolBoundSeen({ concurrency: 3 })).toBe(3);
+    expect(await poolBoundSeen({ concurrency: 1 })).toBe(1);
   });
 });
 

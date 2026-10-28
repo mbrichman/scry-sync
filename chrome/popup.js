@@ -36,8 +36,9 @@ async function updateSyncButtonForActiveTab() {
     button.disabled = true;
     button.title = `Open a specific ${source === 'claude' ? 'Claude' : 'ChatGPT'} conversation to sync it`;
   } else {
-    button.disabled = false;
-    button.title = '';
+    const disabledMsg = syncDisabledMessage(source, await loadScrySettings());
+    button.disabled = Boolean(disabledMsg);
+    button.title = disabledMsg || '';
   }
 }
 
@@ -85,22 +86,12 @@ async function renderAutoSyncStatus() {
 
   const scry = await new Promise((resolve) =>
     chrome.storage.local.get(['scry'], (r) => resolve(r.scry || {})));
-  const claudeEnabled = scry.continuousSync !== false;
-  // ChatGPT has two gates (SOURCES.chatgpt.isEnabled in sources.js):
-  // the source itself (default OFF) and its continuous sub-toggle.
-  const chatgptSourceEnabled = scry.chatgptEnabled === true;
-  const chatgptSyncEnabled = chatgptSourceEnabled && scry.chatgptContinuousSync !== false;
-
   const states = await getContinuousSyncStates();
 
-  const claudeLine = formatSourceStatus('Claude', claudeEnabled, states.claude);
-  // ChatGPT never turned on at all → omit its line entirely rather than
-  // showing "ChatGPT: off" or a stale "not signed in".
-  const chatgptLine = chatgptSourceEnabled
-    ? formatSourceStatus('ChatGPT', chatgptSyncEnabled, states.chatgpt)
-    : null;
-
-  const parts = [claudeLine, chatgptLine].filter(Boolean);
+  // A source that is not enabled at all (Claude: claudeEnabled === false;
+  // ChatGPT: chatgptEnabled !== true) has its line omitted entirely rather
+  // than showing "off" or a stale "not signed in" (dashboard_model.js).
+  const parts = continuousStatusParts(scry, states, formatSourceStatus);
   if (parts.length === 0) {
     el.textContent = '';
     el.className = 'auto-sync-status';
@@ -126,6 +117,8 @@ document.getElementById('syncCurrent').addEventListener('click', async () => {
     const { source, uuid } = await getActiveTabSyncTarget();
     if (!source) throw new Error('Open a claude.ai or chatgpt.com conversation first.');
     if (!uuid) throw new Error(`No conversation detected — open a specific ${source === 'claude' ? 'Claude' : 'ChatGPT'} chat.`);
+    const disabledMsg = syncDisabledMessage(source, scry);
+    if (disabledMsg) throw new Error(disabledMsg);
 
     const granted = await ensureScryPermission(scry.url);
     if (!granted) throw new Error('Host permission for Scry was declined.');

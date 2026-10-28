@@ -191,6 +191,38 @@ describe('syncBatch', () => {
     expect(peak).toBeGreaterThan(1);
   });
 
+  it('honours source.concurrency ahead of scry.concurrency and the default (ChatGPT runs at 1)', async () => {
+    let inFlight = 0, peak = 0;
+    const source = fakeSource({
+      concurrency: 1,
+      syncOne: async () => {
+        inFlight++; peak = Math.max(peak, inFlight);
+        await new Promise((r) => setTimeout(r, 2));
+        inFlight--;
+        return { status: 'ok' };
+      },
+    });
+    const items = Array.from({ length: 6 }, (_, i) => item(`c${i}`));
+    await syncBatch(source, {}, { concurrency: 8 }, items);
+    expect(peak).toBe(1);
+  });
+
+  it('an explicit opts.concurrency still beats source.concurrency', async () => {
+    let inFlight = 0, peak = 0;
+    const source = fakeSource({
+      concurrency: 1,
+      syncOne: async () => {
+        inFlight++; peak = Math.max(peak, inFlight);
+        await new Promise((r) => setTimeout(r, 5));
+        inFlight--;
+        return { status: 'ok' };
+      },
+    });
+    const items = Array.from({ length: 8 }, (_, i) => item(`c${i}`));
+    await syncBatch(source, {}, {}, items, { concurrency: 3 });
+    expect(peak).toBeGreaterThan(1);
+  });
+
   it('falls back to scry.concurrency when no explicit concurrency option is given (matches the pre-extraction default)', async () => {
     let inFlight = 0, peak = 0;
     const source = fakeSource({
@@ -341,5 +373,26 @@ describe('single shared implementation (no duplicate sync loop)', () => {
     const continuousSync = require('../chrome/continuous_sync.js');
     expect(continuousSync.syncBatch).toBe(syncCore.syncBatch);
     expect(continuousSync.reconcileAndSync).toBe(syncCore.reconcileAndSync);
+  });
+});
+
+
+describe('reconcileAndSync: cap and totalWanted', () => {
+  it('reports the uncapped wanted count so a caller can tell the cap bit', async () => {
+    const source = fakeSource({
+      reconcile: async (scry, items) => ({ to_resync: items.map((i) => i.uuid) }),
+    });
+    const items = Array.from({ length: 5 }, (_, i) => item(`c${i}`));
+    const out = await reconcileAndSync(source, {}, {}, items, { cap: 2 });
+    expect(out.toSync).toHaveLength(2);
+    expect(out.totalWanted).toBe(5);
+    expect(out.pushed).toBe(2);
+  });
+  it('passes the signal through to the batch', async () => {
+    const source = fakeSource({ reconcile: async (s, items) => ({ to_resync: items.map((i) => i.uuid) }) });
+    const items = Array.from({ length: 3 }, (_, i) => item(`c${i}`));
+    const out = await reconcileAndSync(source, {}, {}, items, { signal: { aborted: true } });
+    expect(out.pushed).toBe(0);
+    expect(out.failed).toEqual([]);
   });
 });

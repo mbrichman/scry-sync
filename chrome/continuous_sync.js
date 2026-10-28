@@ -22,6 +22,10 @@ const CONTINUOUS_STORAGE_KEY_CHATGPT = 'continuousSync:chatgpt';
 // wake proceeds anyway (the service worker can be terminated mid-run with no
 // chance to clear the flag itself).
 const RUNNING_STALE_MS = 10 * 60 * 1000;
+// A live wake refreshes `running` at least this often (interval timer and the
+// gate's keepalive tick), so a long cooldown wait is never mistaken for an
+// abandoned run. Must stay well under RUNNING_STALE_MS.
+const RUNNING_HEARTBEAT_MS = 5 * 60 * 1000;
 
 // Incremental wakes sync at most this many conversations per wake; anything
 // beyond that is left pending for the next wake (overflow: true).
@@ -43,6 +47,12 @@ function defaultContinuousSyncState() {
     backoffMs: null,          // current claude-domain backoff amount (for escalation)
     nextAllowedAt: null,      // ms epoch; claude.ai enumeration gated until this passes
     running: null,            // ms epoch a run started, or null; guards overlapping wakes
+    cooldownUntil: null,      // chatgpt: end of the last rate-limit cooldown (ms epoch), persisted at the 429
+    cooldownLevel: 0,         // chatgpt: escalation level of the gate at that moment
+    catchUpFailedUuids: [],   // chatgpt catch-up chain: conversations that failed this chain; excluded
+                              // from slicing so persistent failures cannot starve it (reset by the daily deep pass)
+    catchUpRemaining: 0,      // chatgpt deep catch-up: conversations still wanted after the last
+                              // capped pass (0 = nothing left); drives the catch-up alarm + status line
     skipUuids: [],            // uuids tombstoned in Scry (server-confirmed): they enumerate
                               // at claude.ai forever but must never sync or pin the watermark
   };
@@ -196,6 +206,8 @@ function applyResult(state, result, nowMs) {
     s.lastSyncAt = nowMs;
     s.lastPushed = typeof result.pushed === 'number' ? result.pushed : 0;
     if (result.newWatermark !== undefined) s.watermark = result.newWatermark;
+    if (typeof result.catchUpRemaining === 'number') s.catchUpRemaining = result.catchUpRemaining;
+    if (Array.isArray(result.catchUpFailedUuids)) s.catchUpFailedUuids = result.catchUpFailedUuids;
     return _mergeSkipUuids(s, result);
   }
 
@@ -209,6 +221,8 @@ function applyResult(state, result, nowMs) {
     s.nextAllowedAt = nowMs + s.backoffMs;
   }
   // scry-domain failure: backoffMs / nextAllowedAt intentionally untouched.
+  if (result && typeof result.catchUpRemaining === 'number') s.catchUpRemaining = result.catchUpRemaining;
+  if (result && Array.isArray(result.catchUpFailedUuids)) s.catchUpFailedUuids = result.catchUpFailedUuids;
   return _mergeSkipUuids(s, result);
 }
 
@@ -233,6 +247,80 @@ function filterSkippedConversations(conversations, skipUuids) {
 function planDeepReconcile(conversations, toResyncIds) {
   const idSet = new Set(toResyncIds || []);
   return (conversations || []).filter((c) => c && idSet.has(c.uuid));
+}
+
+// A wake that ends while the source's request gate is still in a rate-limit
+// cooldown must make the NEXT wake honour it, or the next alarm would walk
+// straight back into a 429: nextAllowedAt = max(existing, cooldownUntil).
+// Pure; `cooldown` is the gate's getState() ({ cooldownUntil, ... }) or null.
+function applyCooldownCarry(state, cooldown, nowMs) {
+  const until = cooldown && cooldown.cooldownUntil;
+  if (typeof until !== 'number' || until <= nowMs) return state;
+  const existing = typeof state.nextAllowedAt === 'number' ? state.nextAllowedAt : 0;
+  return Object.assign({}, state, {
+    nextAllowedAt: Math.max(existing, until),
+    cooldownUntil: until,
+    cooldownLevel: cooldown.level || 0,
+  });
+}
+
+// Heartbeat: `beat()` refreshes `running` via `write`, at most once per
+// `everyMs` however often it is called (interval tick + gate keepalive tick).
+function makeHeartbeat({ write, now = Date.now, everyMs = RUNNING_HEARTBEAT_MS }) {
+  let last = now();
+  return function beat() {
+    const t = now();
+    if (t - last < everyMs) return false;
+    last = t;
+    write(t);
+    return true;
+  };
+}
+
+// ChatGPT catch-up: a capped deep pass that left conversations behind
+// (state.catchUpRemaining > 0) schedules a one-shot alarm CATCHUP_DELAY later,
+// which runs another chatgpt-only deep pass, until a pass leaves nothing. A
+// pass the shouldRun gate turned away for a TEMPORARY reason (backoff /
+// overlapping run) keeps the chain alive; a disabled / unconfigured /
+// signed-out source ends it (the daily deep reconcile restarts it).
+// Returns { when } (ms epoch) or null. Pure.
+function planCatchUp(state, runResult, nowMs, delayMs = _chatGptCatchUpConst().delay) {
+  if (!state || !(state.catchUpRemaining > 0)) return null;
+  if (runResult && runResult.ran === false
+      && runResult.reason !== 'backoff' && runResult.reason !== 'already-running') return null;
+  const notBefore = typeof state.nextAllowedAt === 'number' ? state.nextAllowedAt : 0;
+  return { when: Math.max(nowMs + delayMs, notBefore) };
+}
+
+function _chatGptCatchUpConst() {
+  return (typeof CHATGPT_CATCHUP_ALARM !== 'undefined')
+    ? { alarm: CHATGPT_CATCHUP_ALARM, delay: CHATGPT_CATCHUP_DELAY_MS }
+    : (() => { const m = require('./chatgpt_adapter.js'); return { alarm: m.CHATGPT_CATCHUP_ALARM, delay: m.CHATGPT_CATCHUP_DELAY_MS }; })();
+}
+
+// Read the chatgpt state and, if work remains, create the one-shot catch-up
+// alarm. `alarms` is chrome.alarms (injectable); `keepExisting` (used at
+// browser startup) leaves an already-pending alarm alone instead of pushing
+// it out. Returns { scheduled, when? }.
+async function scheduleChatGptCatchUp({ getState, alarms, now = Date.now, runResult = null, keepExisting = false } = {}) {
+  const { alarm } = _chatGptCatchUpConst();
+  const state = await getState();
+  const plan = planCatchUp(state, runResult, now());
+  if (!plan) return { scheduled: false };
+  if (keepExisting && alarms.get) {
+    const existing = await alarms.get(alarm);
+    if (existing) return { scheduled: false, existing: true };
+  }
+  alarms.create(alarm, { when: plan.when });
+  return { scheduled: true, when: plan.when };
+}
+
+// The catch-up alarm's body: one chatgpt-only deep pass, then schedule the next.
+async function runChatGptCatchUp({ runOne = runContinuousSync, getState, alarms, now = Date.now } = {}) {
+  // kind 'catchup' = a deep pass inside the chain: it honours (and extends)
+  // catchUpFailedUuids, which the daily 'deep' pass resets.
+  const runResult = await runOne('catchup', 'chatgpt');
+  return scheduleChatGptCatchUp({ getState, alarms, now, runResult });
 }
 
 // --- impure orchestrator -----------------------------------------------
@@ -308,7 +396,10 @@ function badgeStateAfterAll(states) {
 // Returns { pushed, succeeded: [{item, result}], failed, firstFailure,
 // tombstonedSkips } — see sync_core.js for the full contract.
 function _syncBatch(source, ctx, scry, items) {
-  return _syncCore().syncBatch(source, ctx, scry, items);
+  // A source with a rate-limit gate (chatgpt) supplies an abort signal that
+  // flips after too many cooldowns in one wake.
+  const signal = source.abortSignal ? source.abortSignal() : undefined;
+  return _syncCore().syncBatch(source, ctx, scry, items, { signal });
 }
 
 // Classify an enumerate() failure: for chatgpt, "not signed in" is not a
@@ -384,7 +475,7 @@ async function _runIncremental(source, ctx, scry, state) {
 // 'scry' — reconcileAndSync deliberately rethrows rather than guessing which
 // domain that is, since it doesn't know whether it's being called from the
 // continuous engine (always 'scry' for a reconcile failure) or a manual UI.
-async function _runDeepReconcile(source, ctx, scry) {
+async function _runDeepReconcile(source, ctx, scry, opts = {}) {
   let conversations;
   try {
     conversations = await source.enumerate(ctx);
@@ -392,23 +483,49 @@ async function _runDeepReconcile(source, ctx, scry) {
     return _classifyEnumerateError(source, e);
   }
 
-  let outcome;
-  try {
-    outcome = await _syncCore().reconcileAndSync(source, ctx, scry, conversations);
-  } catch (e) {
-    return { ok: false, domain: 'scry', error: e.message || String(e) };
+  // Catch-up passes leave out conversations that already failed in this chain
+  // (they would otherwise be re-sliced at the head of the newest-first list
+  // forever); the daily deep pass passes none, so it retries them.
+  const priorFailed = Array.isArray(opts.excludeUuids) ? opts.excludeUuids : [];
+  if (priorFailed.length) {
+    const ex = new Set(priorFailed);
+    conversations = conversations.filter((c) => c && !ex.has(c.uuid));
   }
 
-  const { toSync, pushed, succeeded, firstFailure, tombstonedSkips } = outcome;
-  if (toSync.length === 0) return { ok: true, pushed: 0 };
+  let outcome;
+  try {
+    // A source with a deepSlice (chatgpt) pushes at most that many per pass;
+    // the remainder is picked up by scheduled catch-up passes.
+    outcome = await _syncCore().reconcileAndSync(source, ctx, scry, conversations, {
+      cap: source.deepSlice,
+      signal: source.abortSignal ? source.abortSignal() : undefined,
+    });
+  } catch (e) {
+    // Scry unreachable: do NOT re-arm the catch-up chain (each pass re-lists
+    // the whole account); the daily deep pass recomputes and re-arms it.
+    return { ok: false, domain: 'scry', error: e.message || String(e), catchUpRemaining: 0 };
+  }
+
+  const { toSync, totalWanted, pushed, succeeded, failed, firstFailure, tombstonedSkips } = outcome;
+  if (toSync.length === 0) return { ok: true, pushed: 0, catchUpRemaining: 0, catchUpFailedUuids: priorFailed };
+
+  // Still wanted and NOT attempted this pass: beyond the slice, or never
+  // started because the batch aborted. (Items that were tried and failed are
+  // left to the daily deep reconcile, so a permanently failing conversation
+  // cannot keep the catch-up chain alive forever.)
+  let catchUpRemaining = Math.max(0, totalWanted - succeeded.length - failed.length);
+  const catchUpFailedUuids = Array.from(new Set([...priorFailed, ...failed.map((f) => f.item.uuid)]));
 
   if (pushed === 0 && succeeded.length === 0) {
     const err = firstFailure ? firstFailure.error : new Error('all conversations in to_resync failed to sync');
-    return { ok: false, domain: source.errorDomain(err), error: err.message || String(err), addSkipUuids: tombstonedSkips };
+    const domain = source.errorDomain(err);
+    // Scry-side failure (ingest down): same rule as a failed reconcile.
+    if (domain === 'scry') catchUpRemaining = 0;
+    return { ok: false, domain, error: err.message || String(err), addSkipUuids: tombstonedSkips, catchUpRemaining, catchUpFailedUuids };
   }
   // Deep reconcile doesn't move the incremental watermark — it's an
   // independent, exhaustive catch-up pass, not a walk from a cursor.
-  return { ok: true, pushed, addSkipUuids: tombstonedSkips };
+  return { ok: true, pushed, addSkipUuids: tombstonedSkips, catchUpRemaining, catchUpFailedUuids };
 }
 
 // Run one wake of continuous sync for one source. kind is 'incremental' or
@@ -418,14 +535,22 @@ async function _runDeepReconcile(source, ctx, scry) {
 // chrome.alarms listener — reads/writes all its state from
 // chrome.storage.local so it tolerates the service worker being recycled
 // between wakes.
-async function runContinuousSync(kind, sourceName = 'claude') {
-  const source = _sources()[sourceName];
+async function runContinuousSync(kind, sourceName = 'claude', deps = {}) {
+  // `deps` are test seams only (storage, settings loader, source registry,
+  // timers, badge); production callers pass nothing.
+  const source = (deps.sources || _sources())[sourceName];
   if (!source) throw new Error(`Scry continuous sync: unknown source "${sourceName}"`);
+  const storage = deps.storage || (typeof chrome !== 'undefined' ? chrome.storage.local : null);
+  const key = source.stateKey;
+  const getState = () => _getState(key, storage);
+  const setState = (st) => _setState(st, key, storage);
+  const now = deps.now || Date.now;
+  const applyBadge = deps.applyBadge || _applyBadge;
 
-  const nowMs = Date.now();
-  const state = await _getState(source.stateKey);
+  const nowMs = now();
+  const state = await getState();
 
-  const scry = await loadScrySettings();
+  const scry = await (deps.loadSettings || loadScrySettings)();
   const { configured, ctx } = await source.configure(scry);
 
   const gate = shouldRun(Object.assign({}, state, {
@@ -434,34 +559,81 @@ async function runContinuousSync(kind, sourceName = 'claude') {
   }), nowMs);
   if (!gate.run) return { ran: false, reason: gate.reason };
 
-  await _setState(Object.assign({}, state, { running: nowMs }), source.stateKey);
+  await setState(Object.assign({}, state, { running: nowMs }));
+
+  // Mid-wake writes (heartbeat, cooldown) are read-merge-write on the stored
+  // blob, serialized so they never interleave with each other or the final write.
+  let chain = Promise.resolve();
+  const patchStored = (fn) => {
+    chain = chain.then(async () => {
+      const cur = await getState();
+      await setState(Object.assign({}, cur, fn(cur)));
+    }).catch((e) => console.error('Scry continuous sync: state write failed', e));
+    return chain;
+  };
+
+  // Fresh per-wake cooldown count for sources with a rate-limit gate; restore
+  // a cooldown persisted by a previous (possibly killed) worker, and persist a
+  // new one the moment a 429 starts it -- not just at wake end.
+  if (source.beginWake) source.beginWake();
+  if (source.seedCooldown) source.seedCooldown({ cooldownUntil: state.cooldownUntil, level: state.cooldownLevel });
+  const unsubs = [];
+  if (source.onCooldown) {
+    unsubs.push(source.onCooldown((until, level) => patchStored((cur) => ({
+      nextAllowedAt: Math.max(typeof cur.nextAllowedAt === 'number' ? cur.nextAllowedAt : 0, until),
+      cooldownUntil: until,
+      cooldownLevel: level,
+    }))));
+  }
+
+  // Heartbeat so a long cooldown wait is never mistaken for an abandoned run.
+  const beat = makeHeartbeat({
+    write: (t) => { patchStored(() => ({ running: t })); },
+    now, everyMs: deps.heartbeatMs || RUNNING_HEARTBEAT_MS,
+  });
+  if (source.onKeepalive) unsubs.push(source.onKeepalive(beat));
+  const timers = deps.timers || { setInterval: (f, ms) => setInterval(f, ms), clearInterval: (h) => clearInterval(h) };
+  const hb = timers.setInterval(beat, Math.min(deps.heartbeatMs || RUNNING_HEARTBEAT_MS, RUNNING_HEARTBEAT_MS));
 
   let result;
   try {
-    result = kind === 'deep'
-      ? await _runDeepReconcile(source, ctx, scry)
-      : await _runIncremental(source, ctx, scry, state);
+    if (kind === 'deep' || kind === 'catchup') {
+      // The daily 'deep' pass starts a fresh failed-set; a 'catchup' pass in
+      // the chain honours the one built so far.
+      result = await _runDeepReconcile(source, ctx, scry, {
+        excludeUuids: kind === 'catchup' ? state.catchUpFailedUuids : [],
+      });
+    } else {
+      result = await _runIncremental(source, ctx, scry, state);
+    }
   } catch (e) {
     // Anything unexpected (a bug, not a modeled source/scry failure) — file it
     // under scry so it never throttles the source's own enumeration on a guess.
     result = { ok: false, domain: 'scry', error: e.message || String(e) };
+  } finally {
+    timers.clearInterval(hb);
+    for (const u of unsubs) { try { u(); } catch (_e) { /* ignore */ } }
+    await chain;
   }
 
   if (result && result.signedOut) {
     // Signed-out is not a failure (point 3): leave consecutiveFailures/
     // backoff/badge bookkeeping untouched, just clear `running` and record
     // why, so the popup can say so without it reading as a failure streak.
-    const revertedState = Object.assign({}, state, {
+    let revertedState = Object.assign({}, state, {
       running: null,
       lastError: result.error || 'not signed in',
     });
-    await _setState(revertedState, source.stateKey);
+    if (source.cooldownState) revertedState = applyCooldownCarry(revertedState, source.cooldownState(), now());
+    await setState(revertedState);
     return { ran: false, reason: 'signed-out', state: revertedState };
   }
 
-  const newState = applyResult(state, result, nowMs);
-  await _setState(newState, source.stateKey);
-  _applyBadge(newState);
+  let newState = applyResult(state, result, nowMs);
+  // A wake that ended inside a rate-limit cooldown makes the next wake honour it.
+  if (source.cooldownState) newState = applyCooldownCarry(newState, source.cooldownState(), now());
+  await setState(newState);
+  applyBadge(newState);
   return { ran: true, result, state: newState };
 }
 
@@ -513,6 +685,11 @@ if (typeof module !== 'undefined' && module.exports) {
     badgeStateAfter,
     applyResult,
     planDeepReconcile,
+    applyCooldownCarry,
+    planCatchUp,
+    scheduleChatGptCatchUp,
+    runChatGptCatchUp,
+    _runDeepReconcile,
     isStubFetchError,
     classifyStubAfterReconcile,
     filterSkippedConversations,
@@ -531,6 +708,8 @@ if (typeof module !== 'undefined' && module.exports) {
     CONTINUOUS_STORAGE_KEY,
     CONTINUOUS_STORAGE_KEY_CHATGPT,
     RUNNING_STALE_MS,
+    RUNNING_HEARTBEAT_MS,
+    makeHeartbeat,
     INCREMENTAL_BATCH_CAP,
     _getState,
     _setState,

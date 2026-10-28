@@ -28,6 +28,33 @@ function _ChatGptRateLimitErrorCtor() {
     : require('./chatgpt_adapter.js').ChatGptRateLimitError;
 }
 
+// The chatgpt back-off knobs and the global request gate live in
+// chatgpt_adapter.js (browser: bare globals; Node: module).
+function _chatGptAdapter() {
+  return (typeof CHATGPT_DEEP_SLICE !== 'undefined')
+    ? {
+        CHATGPT_DEEP_SLICE, CHATGPT_BATCH_CONCURRENCY, CHATGPT_ABORT_AFTER_COOLDOWNS,
+        gate: () => chatGptGate,
+      }
+    : (() => {
+        const m = require('./chatgpt_adapter.js');
+        return {
+          CHATGPT_DEEP_SLICE: m.CHATGPT_DEEP_SLICE,
+          CHATGPT_BATCH_CONCURRENCY: m.CHATGPT_BATCH_CONCURRENCY,
+          CHATGPT_ABORT_AFTER_COOLDOWNS: m.CHATGPT_ABORT_AFTER_COOLDOWNS,
+          gate: () => m.chatGptGate,
+        };
+      })();
+}
+const _CG = _chatGptAdapter();
+
+// An AbortSignal-like { aborted } that reads true once the wake has hit
+// `limit` rate-limit cooldowns (syncBatch checks `.aborted` before starting
+// each item). Getter-backed, so it reflects the gate live.
+function cooldownAbortSignal(getState, limit) {
+  return { get aborted() { return ((getState() || {}).cooldownsThisRun || 0) >= limit; } };
+}
+
 // Normalize one item from ChatGPT's conversation-list endpoint to the
 // {uuid, updated_at, title} shape the planning helpers share with Claude
 // (they only ever look at uuid/updated_at). The list endpoint's update_time
@@ -118,7 +145,10 @@ const SOURCES = {
   claude: {
     name: 'claude',
     stateKey: 'continuousSync',
-    isEnabled: (scry) => scry.continuousSync !== false,
+    // Two gates, parallel to chatgpt: claudeEnabled (the source on/off,
+    // DEFAULT ON when absent so existing installs keep working) AND the
+    // continuousSync background-wake sub-toggle.
+    isEnabled: (scry) => scry.claudeEnabled !== false && scry.continuousSync !== false,
     configure: async (scry) => {
       const orgId = await readOrgIdFromStorage();
       return { configured: Boolean(scry && scry.url && orgId), ctx: { orgId } };
@@ -139,6 +169,23 @@ const SOURCES = {
     // chatgpt.com on its next wake just because this shipped) AND the
     // continuous-sync sub-toggle (default-on once the source itself is on).
     isEnabled: (scry) => scry.chatgptEnabled === true && scry.chatgptContinuousSync !== false,
+    // Back-off (see the tuning block at the top of chatgpt_adapter.js):
+    // batches run one conversation at a time; a deep pass pushes at most
+    // deepSlice conversations (the rest is caught up by scheduled passes);
+    // each wake starts with a clean cooldown count, carries an unexpired
+    // cooldown into nextAllowedAt, and aborts its batch after
+    // CHATGPT_ABORT_AFTER_COOLDOWNS cooldowns.
+    concurrency: _CG.CHATGPT_BATCH_CONCURRENCY,
+    deepSlice: _CG.CHATGPT_DEEP_SLICE,
+    beginWake: () => _CG.gate().resetRun(),
+    cooldownState: () => _CG.gate().getState(),
+    // Persisted-cooldown plumbing (continuous_sync.js): restore the gate's
+    // cooldown/level at wake start, be told the moment a 429 starts one, and
+    // be ticked from the gate's keepalive during long waits (heartbeat).
+    seedCooldown: (persisted) => _CG.gate().seed(persisted),
+    onCooldown: (cb) => { _CG.gate().setOnCooldown(cb); return () => _CG.gate().setOnCooldown(null); },
+    onKeepalive: (cb) => { _CG.gate().setOnKeepalive(cb); return () => _CG.gate().setOnKeepalive(null); },
+    abortSignal: () => cooldownAbortSignal(() => _CG.gate().getState(), _CG.CHATGPT_ABORT_AFTER_COOLDOWNS),
     // Unlike claude, "configured" here does NOT check auth — a missing/expired
     // chatgpt.com session is the SEPARATE signed-out path, checked per wake by
     // enumerate() below, not a persistent configuration gate.
@@ -215,6 +262,7 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     SOURCES,
     SOURCE_ORDER,
+    cooldownAbortSignal,
     normalizeChatGptListItem,
     isChatGptSignedOutError,
     chatgptErrorDomain,

@@ -84,9 +84,14 @@ async function syncBatch(source, ctx, scry, items, opts = {}) {
   const { onProgress, signal, onStubReconcile, onStatus } = opts;
   const pool = _runPool();
   const classify = _classifyStubAfterReconcile();
+  // Precedence: explicit option > the source's own setting (ChatGPT runs at 1:
+  // it is rate limited, and one global request gate serializes it anyway) >
+  // the user's scry.concurrency > 4.
   const concurrency = (opts.concurrency && opts.concurrency > 0)
     ? opts.concurrency
-    : ((scry && scry.concurrency && scry.concurrency > 0) ? scry.concurrency : 4);
+    : ((source && source.concurrency && source.concurrency > 0)
+      ? source.concurrency
+      : ((scry && scry.concurrency && scry.concurrency > 0) ? scry.concurrency : 4));
 
   const hadOwnOnStatus = Object.prototype.hasOwnProperty.call(ctx || {}, 'onStatus');
   const priorOnStatus = ctx ? ctx.onStatus : undefined;
@@ -170,14 +175,17 @@ async function syncBatch(source, ctx, scry, items, opts = {}) {
 // wants that — deep reconcile today passes no cap, matching its "exhaustive
 // catch-up pass" behavior).
 //
-// Returns { report, toSync, ...syncBatch's result }.
+// Returns { report, toSync, totalWanted, ...syncBatch's result } --
+// `totalWanted` is the wanted count BEFORE the cap, so a caller can tell the
+// cap bit and how much is left for a later pass.
 async function reconcileAndSync(source, ctx, scry, conversations, opts = {}) {
   const { onProgress, signal, cap } = opts;
   const report = await source.reconcile(scry, conversations);
   let toSync = _mapToResync(conversations, report && report.to_resync);
+  const totalWanted = toSync.length;
   if (typeof cap === 'number' && cap >= 0) toSync = toSync.slice(0, cap);
   const batchResult = await syncBatch(source, ctx, scry, toSync, { onProgress, signal });
-  return { report, toSync, ...batchResult };
+  return { report, toSync, totalWanted, ...batchResult };
 }
 
 // Browser: expose globally. Node (vitest): export.

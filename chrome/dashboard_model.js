@@ -14,8 +14,9 @@
 const SOURCE_LABELS = { claude: 'Claude', chatgpt: 'ChatGPT' };
 
 // Ordered list of source names whose TAB should be shown on the dashboard.
-// Claude is always on (never gated — "Claude always on" per the owner's
-// ruling). ChatGPT's tab requires BOTH the source being enabled
+// Claude is a per-source enable like ChatGPT, but DEFAULT ON when absent
+// (scry.claudeEnabled !== false) so existing installs keep working — the
+// owner reversed the earlier "Claude always on" ruling. ChatGPT's tab requires BOTH the source being enabled
 // (scry.chatgptEnabled === true) AND not being known-signed-out —
 // `signedIn.chatgpt === false` is the only thing that hides it; `undefined`/
 // `null` (not checked yet, or checked and fine) still shows it. A signed-out
@@ -29,11 +30,48 @@ const SOURCE_LABELS = { claude: 'Claude', chatgpt: 'ChatGPT' };
 function visibleSourceTabs({ scry, signedIn } = {}) {
   const s = scry || {};
   const signed = signedIn || {};
-  const tabs = ['claude'];
+  const tabs = [];
+  if (s.claudeEnabled !== false) tabs.push('claude');
   const chatgptEnabled = s.chatgptEnabled === true;
   const chatgptSignedOut = signed.chatgpt === false;
   if (chatgptEnabled && !chatgptSignedOut) tabs.push('chatgpt');
   return tabs;
+}
+
+// Which tab is active: the remembered one if still visible, else the first
+// visible one; null when no source is visible (the dashboard shows its
+// "enable a source in Options" empty state and makes no network calls).
+function pickActiveSource(tabs, preferred) {
+  if (!Array.isArray(tabs) || tabs.length === 0) return null;
+  return tabs.includes(preferred) ? preferred : tabs[0];
+}
+
+// The per-source fragments for the popup / dashboard-footer status line.
+// `format(label, enabled, state)` is formatSourceStatus (scry_client.js),
+// injected to keep this file pure. A disabled source's line is omitted
+// entirely (no "Claude: off"), mirroring how ChatGPT's line was always handled;
+// a source whose background-wake sub-toggle is off still shows "<Label>: off".
+function continuousStatusParts(scry, states, format) {
+  const s = scry || {};
+  const st = states || {};
+  const parts = [];
+  if (s.claudeEnabled !== false) {
+    parts.push(format('Claude', s.continuousSync !== false, st.claude));
+  }
+  if (s.chatgptEnabled === true) {
+    parts.push(format('ChatGPT', s.chatgptContinuousSync !== false, st.chatgpt));
+  }
+  return parts.filter(Boolean);
+}
+
+// Popup "sync current conversation": a message when the active tab's source is
+// switched off in Options (so we say so rather than sync), else null.
+function syncDisabledMessage(source, scry) {
+  const s = scry || {};
+  if (source === 'claude' && s.claudeEnabled === false) {
+    return 'Claude is disabled in Options — enable it there to sync Claude conversations.';
+  }
+  return null;
 }
 
 // "Claude  1,204" — the tab label the mockup calls "keep the numbers" for.
@@ -142,6 +180,9 @@ if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     SOURCE_LABELS,
     visibleSourceTabs,
+    pickActiveSource,
+    continuousStatusParts,
+    syncDisabledMessage,
     tabLabel,
     toRow,
     badgeFromReconcile,

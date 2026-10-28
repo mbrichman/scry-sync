@@ -24,6 +24,48 @@
 const CHATGPT_ORIGIN = 'https://chatgpt.com';
 const CHATGPT_API = 'https://chatgpt.com/backend-api';
 
+// --- Back-off tuning: ALL the knobs in one place -----------------------------
+// Context: the 15-minute incremental sync is fine, but the INITIAL catch-up
+// against a fresh Scry host (a deep reconcile finding thousands of missing
+// conversations and pushing them all at once, several conversations x several
+// images in parallel) gets heavily rate limited by chatgpt.com. The owner's
+// ruling: "we need to back off significantly". So every chatgpt.com request
+// goes through ONE serialized gate (createChatGptGate below); a 429 puts every
+// lane in a shared cooldown; and the deep pass runs in capped slices.
+//
+// Minimum gap between request STARTS, by kind (ms). One request in flight at a
+// time, so these are also the ceiling on request rate.
+const CHATGPT_MIN_SPACING_MS = { list: 400, body: 1000, asset: 750 };
+// Shared cooldown after a 429 with no usable Retry-After: escalates per
+// consecutive cooldown, capped at the last entry.
+const CHATGPT_COOLDOWN_SCHEDULE_MS = [60000, 120000, 240000, 480000, 900000];
+// The escalation resets after this long with no 429 (measured from the end of
+// the previous cooldown, so a 15-minute cooldown does not itself count).
+const CHATGPT_COOLDOWN_RESET_MS = 10 * 60 * 1000;
+// Never honour a Retry-After longer than this.
+const CHATGPT_COOLDOWN_MAX_MS = 60 * 60 * 1000;
+// A wait longer than this pings chrome.runtime every KEEPALIVE_MS so the MV3
+// service worker is not killed mid-batch.
+const CHATGPT_KEEPALIVE_MS = 20000;
+// A wake that hits this many cooldowns aborts its remaining batch.
+const CHATGPT_ABORT_AFTER_COOLDOWNS = 3;
+// Per-conversation image pool default (the gate serializes anyway; this just
+// bounds how much work sits queued).
+const CHATGPT_IMAGE_POOL_DEFAULT = 2;
+// Batch concurrency for ChatGPT (SOURCES.chatgpt.concurrency).
+const CHATGPT_BATCH_CONCURRENCY = 1;
+// The deep reconcile pushes at most this many conversations per pass; the rest
+// is left for catch-up passes scheduled CHATGPT_CATCHUP_DELAY_MS apart.
+const CHATGPT_DEEP_SLICE = 150;
+const CHATGPT_CATCHUP_DELAY_MS = 20 * 60 * 1000;
+const CHATGPT_CATCHUP_ALARM = 'continuousSync:chatgpt:catchup';
+// A gated request (headers AND body) that takes longer than this is aborted
+// and fails like any ordinary error (NOT as a 429), so one hung fetch cannot
+// wedge the single global queue.
+const CHATGPT_REQUEST_TIMEOUT_MS = 60000;
+// Rate-limit retries per request (each one waits on the gate's cooldown).
+const CHATGPT_RATE_LIMIT_RETRIES = 3;
+
 // --- resolver for scry_sync.js's runPool (browser global / Node module) ---
 // Mirrors the pattern sources.js/sync_core.js use for each other's globals.
 // scry_sync.js loads before this file everywhere (browse.html, chatgpt
@@ -368,27 +410,218 @@ function slugifyChatGptTitle(title) {
 // These are only exercised in the browser (the PoC page). They reference the
 // global `fetch`, so they are intentionally excluded from the Node export block.
 
-// Thrown on HTTP 429, carrying the server's Retry-After (ms). Mirrors
+// Thrown on HTTP 429, carrying how long to wait (ms). Mirrors
 // chatgpt-exporter's RateLimitError so callers can back off instead of failing.
+// `cooldownMs`, when given (the gate's actual shared cooldown), wins over the
+// Retry-After header; with neither, the legacy 30s default.
 class ChatGptRateLimitError extends Error {
-  constructor(retryAfterHeader) {
+  constructor(retryAfterHeader, cooldownMs) {
     super('ChatGPT rate limit (429) — wait and retry.');
     this.name = 'ChatGptRateLimitError';
     const secs = retryAfterHeader != null ? parseInt(retryAfterHeader, 10) : NaN;
-    this.retryAfterMs = Number.isFinite(secs) && secs > 0 ? secs * 1000 : 30000;
+    this.retryAfterMs = Number.isFinite(cooldownMs) && cooldownMs > 0
+      ? cooldownMs
+      : (Number.isFinite(secs) && secs > 0 ? secs * 1000 : 30000);
   }
+}
+
+// ===== IMPURE: the global request gate =====
+//
+// EVERY chatgpt.com request (auth/session, list pages, conversation bodies,
+// asset metadata and bytes) runs through chatGptGate.run(kind, fn):
+//   - serialized: at most ONE request in flight;
+//   - spaced: a request does not START until CHATGPT_MIN_SPACING_MS[kind] after
+//     the previous start;
+//   - cooled down: when ANY request gets a 429 (report429), no lane sends
+//     anything until the cooldown ends.
+// `now`/`sleep`/`keepalive`/`warn` are injectable so it is testable with a fake
+// clock. State is in-memory; the continuous-sync engine carries a cooldown
+// across service-worker restarts via nextAllowedAt.
+function _defaultKeepalive() {
+  try {
+    if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.getPlatformInfo === 'function') {
+      // Any extension API call resets the MV3 service-worker idle timer.
+      const r = chrome.runtime.getPlatformInfo(() => {});
+      if (r && typeof r.catch === 'function') r.catch(() => {});
+    }
+  } catch (_e) { /* keepalive is best-effort */ }
+}
+
+function _headerDump(headers) {
+  const out = [];
+  if (headers && typeof headers.forEach === 'function') {
+    headers.forEach((value, name) => out.push(`${name}: ${value}`));
+  }
+  return out.join(' | ');
+}
+
+function _parseRetryAfterMs(headers, nowMs) {
+  const raw = headers && typeof headers.get === 'function' ? headers.get('Retry-After') : null;
+  if (raw == null || raw === '') return null;
+  const secs = Number(raw);
+  if (Number.isFinite(secs) && secs > 0) return Math.min(secs * 1000, CHATGPT_COOLDOWN_MAX_MS);
+  const date = Date.parse(raw);
+  if (!Number.isNaN(date) && date > nowMs) return Math.min(date - nowMs, CHATGPT_COOLDOWN_MAX_MS);
+  return null;
+}
+
+function createChatGptGate(opts = {}) {
+  const now = opts.now || (() => Date.now());
+  const sleep = opts.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  const keepalive = opts.keepalive || _defaultKeepalive;
+  const warn = opts.warn || ((...a) => console.warn(...a));
+  const spacing = opts.spacing || CHATGPT_MIN_SPACING_MS;
+  const schedule = opts.schedule || CHATGPT_COOLDOWN_SCHEDULE_MS;
+  const resetAfterMs = opts.resetAfterMs != null ? opts.resetAfterMs : CHATGPT_COOLDOWN_RESET_MS;
+  const timeoutMs = opts.timeoutMs != null ? opts.timeoutMs : CHATGPT_REQUEST_TIMEOUT_MS;
+  const setT = opts.setTimeout || ((fn, ms) => setTimeout(fn, ms));
+  const clearT = opts.clearTimeout || ((h) => clearTimeout(h));
+  let onCooldown = opts.onCooldown || null;   // (cooldownUntil, level) -> void, at the moment of a 429
+  let onKeepalive = opts.onKeepalive || null; // () -> void, on every keepalive tick of a long wait
+
+  let tail = Promise.resolve();
+  let lastStart = -Infinity;
+  let cooldownUntil = 0;
+  let last429At = -Infinity;
+  let level = 0;
+  let cooldownsThisRun = 0;
+
+  // Sleep `ms`; a wait longer than CHATGPT_KEEPALIVE_MS is chopped into
+  // KEEPALIVE_MS slices with a keepalive ping around each.
+  async function wait(ms) {
+    if (!(ms > 0)) return;
+    if (ms <= CHATGPT_KEEPALIVE_MS) { await sleep(ms); return; }
+    let left = ms;
+    while (left > 0) {
+      keepalive();
+      if (onKeepalive) { try { onKeepalive(); } catch (_e) { /* best-effort */ } }
+      const step = Math.min(left, CHATGPT_KEEPALIVE_MS);
+      await sleep(step);
+      left -= step;
+    }
+  }
+
+  async function waitReady(kind) {
+    const gap = spacing[kind] != null ? spacing[kind] : spacing.body;
+    for (;;) {
+      const t = now();
+      const readyAt = Math.max(cooldownUntil, lastStart + gap);
+      if (t >= readyAt) return;
+      await wait(readyAt - t);
+    }
+  }
+
+  function run(kind, fn) {
+    const p = tail.then(async () => {
+      await waitReady(kind);
+      lastStart = now();
+      return fn();
+    });
+    tail = p.then(() => {}, () => {});
+    return p;
+  }
+
+  // Record a 429 (`resp`: anything with .status and .headers). Starts a shared
+  // cooldown and returns its length in ms; a 429 landing INSIDE an existing
+  // cooldown neither extends nor escalates it.
+  function report429(resp) {
+    const t = now();
+    if (t < cooldownUntil) return cooldownUntil - t;
+    if (t - Math.max(last429At, cooldownUntil) >= resetAfterMs) level = 0;
+    const retryAfter = _parseRetryAfterMs(resp && resp.headers, t);
+    const dur = retryAfter != null ? retryAfter : schedule[Math.min(level, schedule.length - 1)];
+    level++;
+    cooldownUntil = t + dur;
+    last429At = t;
+    cooldownsThisRun++;
+    // Whether a real 429 carries Retry-After was UNKNOWN when this was written
+    // (a 200 carries no rate-limit headers at all) -- log everything, once.
+    if (onCooldown) { try { onCooldown(cooldownUntil, level); } catch (_e) { /* persistence is best-effort */ } }
+    warn(`Scry ChatGPT 429 headers: status ${(resp && resp.status) || 429} | ${_headerDump(resp && resp.headers)}`);
+    return dur;
+  }
+
+  // Restore a persisted cooldown after the service worker was recycled: carry
+  // the cooldown end and the escalation level forward unless the last cooldown
+  // ended more than the reset window ago (then escalation starts over).
+  function seed(persisted) {
+    const until = persisted && persisted.cooldownUntil;
+    if (typeof until !== 'number') return;
+    if (now() - until >= resetAfterMs) return;
+    cooldownUntil = Math.max(cooldownUntil, until);
+    level = Math.max(level, Number(persisted.level) || 0);
+  }
+
+  // One gated fetch, bounded by a timeout. `handler(resp)` reads the response
+  // (429 check, status, body) INSIDE the timeout, so a stalled body read is
+  // covered too. A timeout throws an ordinary Error (not a rate limit); an
+  // error thrown by fetch() itself is tagged `fetchPhase`.
+  async function fetchWith(label, url, init, handler) {
+    const ac = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    let timedOut = false;
+    const timer = setT(() => { timedOut = true; if (ac) ac.abort(); }, timeoutMs);
+    const timeoutErr = () => new Error(`${label}: request timed out after ${Math.round(timeoutMs / 1000)}s`);
+    try {
+      let resp;
+      try {
+        resp = await fetch(url, ac ? { ...init, signal: ac.signal } : init);
+      } catch (e) {
+        if (timedOut) throw timeoutErr();
+        e.fetchPhase = true;
+        throw e;
+      }
+      try {
+        return await handler(resp);
+      } catch (e) {
+        if (timedOut && !(e instanceof ChatGptRateLimitError)) throw timeoutErr();
+        throw e;
+      }
+    } finally {
+      clearT(timer);
+    }
+  }
+
+  async function waitForCooldown() {
+    const ms = cooldownUntil - now();
+    if (ms > 0) await wait(ms);
+  }
+
+  return {
+    run,
+    report429,
+    fetchWith,
+    seed,
+    setOnCooldown(fn) { onCooldown = fn || null; },
+    setOnKeepalive(fn) { onKeepalive = fn || null; },
+    waitForCooldown,
+    resetRun() { cooldownsThisRun = 0; },
+    getState() { return { cooldownUntil, cooldownsThisRun, level }; },
+  };
+}
+
+let chatGptGate = createChatGptGate();
+// Test seam: swap in a gate with a fake clock.
+function _setChatGptGate(gate) { chatGptGate = gate; }
+
+// On a 429 response: start the shared cooldown and throw the typed error.
+function _throwIfRateLimited(resp) {
+  if (resp.status !== 429) return;
+  const ms = chatGptGate.report429(resp);
+  throw new ChatGptRateLimitError(resp.headers && resp.headers.get ? resp.headers.get('Retry-After') : null, ms);
 }
 
 // Pull the session access token. Every backend-api read needs it as a bearer.
 // Relies on the browser's chatgpt.com session cookies (host_permissions grants
 // credentialed cross-origin fetch from the extension page).
 async function getChatGptAccessToken() {
-  const resp = await fetch(`${CHATGPT_ORIGIN}/api/auth/session`, {
-    credentials: 'include',
-    headers: { 'Accept': 'application/json' },
-  });
-  if (!resp.ok) throw new Error(`auth/session ${resp.status} — are you signed in to chatgpt.com?`);
-  const data = await resp.json();
+  const data = await chatGptGate.run('list', () => chatGptGate.fetchWith(
+    'auth/session', `${CHATGPT_ORIGIN}/api/auth/session`,
+    { credentials: 'include', headers: { 'Accept': 'application/json' } },
+    async (resp) => {
+      _throwIfRateLimited(resp);
+      if (!resp.ok) throw new Error(`auth/session ${resp.status} — are you signed in to chatgpt.com?`);
+      return resp.json();
+    }));
   if (!data || !data.accessToken) throw new Error('No access token in session — sign in to chatgpt.com first.');
   return data.accessToken;
 }
@@ -408,18 +641,22 @@ function chatGptAuthHeaders(token, accountId) {
   return h;
 }
 
-// Credentialed backend-api GET with 429 awareness.
-async function chatGptApiGet(url, token, accountId) {
-  const resp = await fetch(url, { credentials: 'include', headers: chatGptAuthHeaders(token, accountId) });
-  if (resp.status === 429) throw new ChatGptRateLimitError(resp.headers.get('Retry-After'));
-  if (!resp.ok) throw new Error(`${url}: ${resp.status}`);
-  return resp.json();
+// Credentialed backend-api GET with 429 awareness, through the global gate.
+// `kind` ('list' | 'body' | 'asset') picks the gate's minimum spacing.
+async function chatGptApiGet(url, token, accountId, kind = 'body') {
+  return chatGptGate.run(kind, () => chatGptGate.fetchWith(
+    url, url, { credentials: 'include', headers: chatGptAuthHeaders(token, accountId) },
+    async (resp) => {
+      _throwIfRateLimited(resp);
+      if (!resp.ok) throw new Error(`${url}: ${resp.status}`);
+      return resp.json();
+    }));
 }
 
 // One page of the conversation list.
 async function listChatGptConversations(token, { offset = 0, limit = 28, accountId = null } = {}) {
   const url = `${CHATGPT_API}/conversations?offset=${offset}&limit=${limit}`;
-  return chatGptApiGet(url, token, accountId);
+  return chatGptApiGet(url, token, accountId, 'list');
 }
 
 // Enumerate ALL conversations by paginating until exhausted. `onProgress(count)`
@@ -480,7 +717,7 @@ async function listChatGptConversationsSince(token, watermarkIso, accountId, onP
 // Fetch one conversation's full body (the mapping tree).
 async function fetchChatGptConversation(token, conversationId, accountId) {
   const url = `${CHATGPT_API}/conversation/${conversationId}`;
-  return chatGptApiGet(url, token, accountId);
+  return chatGptApiGet(url, token, accountId, 'body');
 }
 
 // ===== PURE: asset ids + the files[] record =====
@@ -637,7 +874,7 @@ async function _fetchChatGptAsset(token, pointer, accountId, conversationId) {
   const errors = [];
   for (const url of attempts) {
     try {
-      const m = await chatGptApiGet(url, token, accountId);
+      const m = await chatGptApiGet(url, token, accountId, 'asset');
       if (m && m.status === 'success' && m.download_url) { meta = m; break; }
       errors.push(`${url.replace(CHATGPT_API, '')}: status=${m && m.status}`);
     } catch (e) {
@@ -652,17 +889,23 @@ async function _fetchChatGptAsset(token, pointer, accountId, conversationId) {
   // estuary/content route, measured live 2026-09-21: 403 with credentials
   // omitted) wants the session -> cookies + bearer, like every other
   // backend-api call.
-  let resp;
   const fetchOpts = _bytesFetchOptions(meta.download_url, token, accountId);
-  try {
-    resp = await fetch(meta.download_url, fetchOpts);
-  } catch (e) {
+  const { resp, raw } = await chatGptGate.run('asset', async () => {
     let host = '?';
     try { host = new URL(meta.download_url).host; } catch { /* leave ? */ }
-    throw new Error(`bytes fetch threw for host ${host} (${e.message}) -- is that host in manifest host_permissions?`);
-  }
-  if (!resp.ok) throw new Error(`bytes ${resp.status} from ${new URL(meta.download_url).host}`);
-  const raw = await _blobToDataUrl(await resp.blob());
+    try {
+      return await chatGptGate.fetchWith('bytes', meta.download_url, fetchOpts, async (r) => {
+        _throwIfRateLimited(r);
+        if (!r.ok) throw new Error(`bytes ${r.status} from ${host}`);
+        return { resp: r, raw: await _blobToDataUrl(await r.blob()) };
+      });
+    } catch (e) {
+      if (e && e.fetchPhase) {
+        throw new Error(`bytes fetch threw for host ${host} (${e.message}) -- is that host in manifest host_permissions?`);
+      }
+      throw e;
+    }
+  });
   // Prefer the real content-type over FileReader's guess.
   const ct = resp.headers.get('content-type') || meta.mime_type;
   const dataUrl = ct ? raw.replace(/^data:[^;,]*/, `data:${ct.split(';')[0].trim()}`) : raw;
@@ -692,7 +935,7 @@ async function fetchChatGptImageDataUrl(token, pointer, accountId, conversationI
 // 2026-09-21: every route 404s for such a pointer while the on-branch images
 // fetch fine. The page reports the two differently.
 //
-// Pointers are run through a BOUNDED pool (default concurrency 3), not
+// Pointers are run through a BOUNDED pool (default concurrency CHATGPT_IMAGE_POOL_DEFAULT), not
 // Promise.all — measured live: a 36-image conversation firing all 36
 // metadata+byte fetches at once earned a 429 storm that exhausted
 // withChatGptRateLimitRetry's two retries and lost every single image.
@@ -704,7 +947,7 @@ async function fetchChatGptFileBlobs(token, body, accountId, onEach, opts = {}) 
   const conversationId = body && (body.conversation_id || body.id) || null;
   const blobs = [];
   const failures = [];
-  const concurrency = (opts.concurrency && opts.concurrency > 0) ? opts.concurrency : 3;
+  const concurrency = (opts.concurrency && opts.concurrency > 0) ? opts.concurrency : CHATGPT_IMAGE_POOL_DEFAULT;
   const pool = _runPool();
   await pool(pointers, concurrency, async (pointer) => {
     const onBranch = branchPointers.has(pointer);
@@ -758,19 +1001,22 @@ function buildChatGptIngestPayload(body, fileBlobs = [], fallbackConversationId 
   return payload;
 }
 
-// Run `fn` and, on a ChatGptRateLimitError, wait the server's Retry-After and
-// try again (up to `maxRetries` more times). Any other error propagates
-// untouched. `sleep`/`onRetry` are injectable so this is testable in Node and
-// so the page can show "rate limited, waiting Ns" instead of going quiet.
-async function withChatGptRateLimitRetry(fn, { maxRetries = 2, sleep = null, onRetry = null } = {}) {
-  const doSleep = sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+// Run `fn` and, on a ChatGptRateLimitError, wait out the gate's shared
+// cooldown and try again (up to `maxRetries` more times). Only THIS request is
+// retried; the wait is the gate's cooldown (which every other lane honours too),
+// not a private timer. Any other error propagates untouched. `sleep` (when
+// given) replaces the gate wait with the error's retryAfterMs -- kept for
+// callers/tests that inject a clock; `gate` is injectable too; `onRetry(ms)`
+// lets the page show "rate limited, waiting Ns" instead of going quiet.
+async function withChatGptRateLimitRetry(fn, { maxRetries = CHATGPT_RATE_LIMIT_RETRIES, sleep = null, onRetry = null, gate = null } = {}) {
   for (let attempt = 0; ; attempt++) {
     try {
       return await fn();
     } catch (e) {
       if (!(e instanceof ChatGptRateLimitError) || attempt >= maxRetries) throw e;
       if (onRetry) onRetry(e.retryAfterMs);
-      await doSleep(e.retryAfterMs);
+      if (sleep) await sleep(e.retryAfterMs);
+      else await (gate || chatGptGate).waitForCooldown();
     }
   }
 }
@@ -783,6 +1029,23 @@ if (typeof module !== 'undefined' && module.exports) {
     buildChatGptIngestPayload,
     withChatGptRateLimitRetry,
     ChatGptRateLimitError,
+    createChatGptGate,
+    _setChatGptGate,
+    get chatGptGate() { return chatGptGate; },
+    chatGptApiGet,
+    listChatGptConversations,
+    fetchChatGptConversation,
+    CHATGPT_MIN_SPACING_MS,
+    CHATGPT_COOLDOWN_SCHEDULE_MS,
+    CHATGPT_COOLDOWN_RESET_MS,
+    CHATGPT_ABORT_AFTER_COOLDOWNS,
+    CHATGPT_IMAGE_POOL_DEFAULT,
+    CHATGPT_BATCH_CONCURRENCY,
+    CHATGPT_DEEP_SLICE,
+    CHATGPT_CATCHUP_DELAY_MS,
+    CHATGPT_CATCHUP_ALARM,
+    CHATGPT_RATE_LIMIT_RETRIES,
+    CHATGPT_REQUEST_TIMEOUT_MS,
     chatGptAssetId,
     buildChatGptFileBlob,
     chatGptPageReachesWatermark,

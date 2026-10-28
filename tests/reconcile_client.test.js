@@ -5,7 +5,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
-const { reconcileWithScry, chunkIds, mergeReconcileReports } = require('../chrome/scry_client.js');
+const { reconcileWithScry, chunkIds, mergeReconcileReports, formatSourceStatus } = require('../chrome/scry_client.js');
 
 let lastRequest;
 
@@ -146,5 +146,17 @@ describe('mergeReconcileReports — chunk semantics', () => {
   });
   it('a single chunk keeps its extra as is', () => {
     expect(mergeReconcileReports([{ to_resync: [], extra: ['q'], summary: {} }]).extra).toEqual(['q']);
+  });
+});
+
+
+describe('formatSourceStatus: catching up', () => {
+  it('shows how many conversations are left while a ChatGPT catch-up is in progress', () => {
+    const line = formatSourceStatus('ChatGPT', true, { lastSyncAt: Date.now(), catchUpRemaining: 312 });
+    expect(line).toBe('ChatGPT: catching up — 312 remaining');
+  });
+  it('shows nothing extra when nothing remains, or when the source is off', () => {
+    expect(formatSourceStatus('ChatGPT', true, { lastSyncAt: Date.now(), catchUpRemaining: 0 })).toMatch(/synced/);
+    expect(formatSourceStatus('ChatGPT', false, { catchUpRemaining: 5 })).toBe('ChatGPT: off');
   });
 });
