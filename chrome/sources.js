@@ -211,7 +211,7 @@ const SOURCES = {
     // `ctx.onStatus(text)`, when present (set by sync_core.js's syncBatch from
     // its `opts.onStatus`), gets the SUB-item status the phase-2 refactor into
     // the shared sync core dropped: "rate limited — waiting Ns" while
-    // fetchChatGptConversation backs off a 429, and "images N/M" while each
+    // fetchChatGptConversation backs off a 429, and "files N/M" while each
     // image is fetched. Both are best-effort UI hints — never called when no
     // caller asked for them.
     syncOne: async (ctx, item, scry) => {
@@ -224,10 +224,12 @@ const SOURCES = {
       let blobs = [];
       let imageFailures = [];
       if (wantImages) {
-        const total = collectChatGptImagePointers(body, { wholeTree: true }).length;
+        const total = collectChatGptImagePointers(body, { wholeTree: true }).length
+          + (typeof collectChatGptDocumentAttachments === 'function'
+            ? collectChatGptDocumentAttachments(body, { wholeTree: true }).length : 0);
         let done = 0;
         const onEach = ctx.onStatus
-          ? () => { done++; ctx.onStatus(`images ${done}/${total}`); }
+          ? () => { done++; ctx.onStatus(`files ${done}/${total}`); }
           : undefined;
         const got = await fetchChatGptFileBlobs(token, body, null, onEach);
         blobs = got.blobs;

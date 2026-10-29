@@ -62,7 +62,7 @@ describe('SOURCES.chatgpt.syncOne — ctx.onStatus', () => {
     expect(statuses).toEqual([]);
   });
 
-  it('reports "images N/M" via ctx.onStatus as each image is fetched', async () => {
+  it('reports "files N/M" via ctx.onStatus as each image is fetched', async () => {
     global.withChatGptRateLimitRetry = async (fn) => fn();
     global.collectChatGptImagePointers = () => ['p1', 'p2', 'p3']; // total = 3
     global.fetchChatGptFileBlobs = async (token, body, accountId, onEach) => {
@@ -74,7 +74,7 @@ describe('SOURCES.chatgpt.syncOne — ctx.onStatus', () => {
     const ctx = { token: 'tok', wantImages: true, onStatus: (t) => statuses.push(t) };
     await SOURCES.chatgpt.syncOne(ctx, { uuid: 'conv-1' }, { url: 'http://x' });
 
-    expect(statuses).toEqual(['images 1/3', 'images 2/3', 'images 3/3']);
+    expect(statuses).toEqual(['files 1/3', 'files 2/3', 'files 3/3']);
   });
 
   it('no ctx.onStatus set → fetchChatGptFileBlobs gets no onEach callback (undefined, not a no-op function)', async () => {
