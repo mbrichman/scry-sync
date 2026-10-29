@@ -55,6 +55,8 @@ const CHATGPT_IMAGE_POOL_DEFAULT = 2;
 // Largest document upload (metadata `size`, bytes) the extension will fetch and
 // push. Bigger ones are reported in failures[], never silently dropped.
 const CHATGPT_DOCUMENT_MAX_BYTES = 25 * 1024 * 1024;
+// Same cap for vendor-resolved generated-UI pictures (images.openai.com).
+const CHATGPT_GENUI_MAX_BYTES = 25 * 1024 * 1024;
 // Batch concurrency for ChatGPT (SOURCES.chatgpt.concurrency).
 const CHATGPT_BATCH_CONCURRENCY = 1;
 // The deep reconcile pushes at most this many conversations per pass; the rest
@@ -320,6 +322,58 @@ function collectChatGptDocumentAttachments(data, { wholeTree = false } = {}) {
       if (isImage) continue;
       seen.add(a.id);
       out.push({ id: a.id, name: a.name, mime_type: a.mime_type, size: a.size });
+    }
+  }
+  return out;
+}
+
+// ===== PURE: generated-UI pictures (AsyncImage / AsyncImageGroup) =====
+
+// CONTRACT shared with the Scry server renderer: the files[] file_uuid of a
+// generated-UI picture is "genui_" + the first 32 hex chars of the SHA-256 of
+// its content_url string (UTF-8). Do not change without changing the server.
+async function genuiFileUuid(contentUrl) {
+  const bytes = new TextEncoder().encode(String(contentUrl));
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+  const hex = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+  return 'genui_' + hex.slice(0, 32);
+}
+
+// Pictures the vendor already resolved for <AsyncImage/> tags live in the
+// conversation body: message.metadata.model_dil_v2.appData.opGenui
+// .componentResults{ id: { componentName, status, state:{ images:[...] } } }.
+// Non-image components (link cards, carousels, maps) have no images array and
+// are ignored. Same message walk as the other collectors; de-duplicated by
+// content_url. Async only because the derived id uses Web Crypto.
+async function collectChatGptGenuiImages(data, { wholeTree = false } = {}) {
+  const messages = wholeTree
+    ? Object.values((data && data.mapping) || {}).map((n) => n && n.message).filter(Boolean)
+    : getChatGptBranch(data).filter((m) => !shouldSkipChatGptMessage(m));
+  const out = [];
+  const seen = new Set();
+  for (const message of messages) {
+    const md = message && message.metadata;
+    const results = md && md.model_dil_v2 && md.model_dil_v2.appData
+      && md.model_dil_v2.appData.opGenui && md.model_dil_v2.appData.opGenui.componentResults;
+    if (!results || typeof results !== 'object') continue;
+    for (const comp of Object.values(results)) {
+      const images = comp && comp.state && comp.state.images;
+      if (!Array.isArray(images) || !images.length) continue;
+      for (const img of images) {
+        const url = img && img.content_url;
+        if (typeof url !== 'string' || !url || seen.has(url)) continue;
+        seen.add(url);
+        out.push({
+          id: await genuiFileUuid(url),
+          content_url: url,
+          thumbnail_url: img.thumbnail_url || null,
+          title: typeof img.title === 'string' ? img.title : '',
+          query: typeof img.image_search_query === 'string' ? img.image_search_query : '',
+          source_url: img.original_content_url || img.url || null,
+          message_id: (message && message.id) || null,
+          index: out.length,
+        });
+      }
     }
   }
   return out;
@@ -864,6 +918,57 @@ function buildChatGptDocumentBlob(att, meta, dataUrl) {
   };
 }
 
+// files[] record for a generated-UI picture. file_uuid is the derived id (see
+// genuiFileUuid). Type: response content-type if it is an image/*, else
+// magic-byte sniff, else the generic fallback. Name: sanitized title/query.
+function buildChatGptGenuiBlob(entry, meta, dataUrl) {
+  if (!entry || !entry.id || typeof dataUrl !== 'string' || !dataUrl) return null;
+  const m = meta || {};
+  const urlMime = (/^data:([^;,]+)/.exec(dataUrl) || [])[1] || null;
+  let fileType = (m.mime_type || urlMime || '').split(';')[0].trim().toLowerCase();
+  if (!fileType.startsWith('image/')) {
+    fileType = _sniffImageMimeFromDataUrl(dataUrl) || 'application/octet-stream';
+  }
+  const ext = _MIME_EXT[fileType] || (fileType.split('/')[1] || 'bin');
+  const base = String(entry.title || entry.query || entry.id)
+    .replace(/[^A-Za-z0-9._ -]+/g, '').trim().replace(/\s+/g, '_').slice(0, 80) || entry.id;
+  return {
+    file_uuid: entry.id,
+    file_name: `${base}.${ext}`,
+    file_type: fileType,
+    file_variant: 'original',
+    data: dataUrl.replace(/^data:[^;,]*/, `data:${fileType}`),
+  };
+}
+
+// Anonymous, gated fetch of one generated-UI picture. images.openai.com serves
+// it with no cookies/auth (credentials omitted, no Authorization header).
+async function _fetchChatGptGenuiBytes(contentUrl) {
+  let u = null;
+  try { u = new URL(contentUrl); } catch { throw new Error('unusable content_url'); }
+  const host = u.host;
+  const { resp, raw } = await chatGptGate.run('asset', async () => {
+    try {
+      return await chatGptGate.fetchWith('bytes', contentUrl, { credentials: 'omit' }, async (r) => {
+        _throwIfRateLimited(r);
+        if (!r.ok) throw new Error(`bytes ${r.status} from ${host}`);
+        const len = Number(r.headers && r.headers.get && r.headers.get('content-length'));
+        if (len > CHATGPT_GENUI_MAX_BYTES) throw new Error(`skipped: ${len} bytes exceeds CHATGPT_GENUI_MAX_BYTES`);
+        const blob = await r.blob();
+        if (blob && blob.size > CHATGPT_GENUI_MAX_BYTES) throw new Error(`skipped: ${blob.size} bytes exceeds CHATGPT_GENUI_MAX_BYTES`);
+        return { resp: r, raw: await _blobToDataUrl(blob) };
+      });
+    } catch (e) {
+      if (e && e.fetchPhase) {
+        throw new Error(`bytes fetch threw for host ${host} (${e.message}) -- is that host in manifest host_permissions?`);
+      }
+      throw e;
+    }
+  });
+  const ct = (resp.headers.get('content-type') || '').split(';')[0].trim();
+  return { meta: { mime_type: ct }, dataUrl: raw };
+}
+
 // ===== IMPURE: image byte capture =====
 
 function _blobToDataUrl(blob) {
@@ -1042,6 +1147,28 @@ async function fetchChatGptFileBlobs(token, body, accountId, onEach, opts = {}) 
       if (onEach) onEach();
     }
   });
+  // Vendor-resolved generated-UI pictures: same gate, pool and retry.
+  const branchGenui = new Set((await collectChatGptGenuiImages(body)).map((g) => g.id));
+  const genui = await collectChatGptGenuiImages(body, { wholeTree: true });
+  // The collector already de-dups by content_url (and so by derived id); every
+  // collected item is fetched and calls onEach, so "files N/M" reaches M.
+  await pool(genui, concurrency, async (g) => {
+    const onBranch = branchGenui.has(g.id);
+    let pointer = g.content_url;
+    try { const u = new URL(g.content_url); pointer = u.host + u.pathname; } catch { pointer = 'unparseable-url'; }
+    const name = g.title || g.query || g.id;
+    try {
+      const got = await withChatGptRateLimitRetry(() => _fetchChatGptGenuiBytes(g.content_url));
+      const rec = buildChatGptGenuiBlob(g, got.meta, got.dataUrl);
+      if (rec) blobs.push(rec);
+      else failures.push({ pointer, id: g.id, name, onBranch, error: 'could not build files[] record (empty bytes)' });
+    } catch (e) {
+      if (onBranch) console.warn('ChatGPT push: generated picture fetch failed for', pointer, e);
+      failures.push({ pointer, id: g.id, name, onBranch, error: e.message || String(e) });
+    } finally {
+      if (onEach) onEach();
+    }
+  });
   return { blobs, failures };
 }
 
@@ -1120,6 +1247,10 @@ if (typeof module !== 'undefined' && module.exports) {
     CHATGPT_IMAGE_POOL_DEFAULT,
     CHATGPT_DOCUMENT_MAX_BYTES,
     collectChatGptDocumentAttachments,
+    collectChatGptGenuiImages,
+    genuiFileUuid,
+    buildChatGptGenuiBlob,
+    CHATGPT_GENUI_MAX_BYTES,
     buildChatGptDocumentBlob,
     CHATGPT_BATCH_CONCURRENCY,
     CHATGPT_DEEP_SLICE,
