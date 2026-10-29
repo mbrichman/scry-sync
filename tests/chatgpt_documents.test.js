@@ -163,7 +163,7 @@ describe('fetchChatGptFileBlobs — documents', () => {
     expect(out.blobs).toEqual([]);
     expect(calls).toEqual([]);
     expect(out.failures).toHaveLength(1);
-    expect(out.failures[0]).toMatchObject({ id: DOC_ID, name: 'big.pdf' });
+    expect(out.failures[0]).toMatchObject({ pointer: DOC_ID, id: DOC_ID, name: 'big.pdf' });
     expect(out.failures[0].error).toBe(`skipped: ${size} bytes exceeds CHATGPT_DOCUMENT_MAX_BYTES`);
   });
 
@@ -179,7 +179,7 @@ describe('fetchChatGptFileBlobs — documents', () => {
     const out = await fetchChatGptFileBlobs('tok', convo([['n1', null, img], ['n2', 'n1', doc]], 'n2'), null);
     expect(out.blobs.map((b) => b.file_uuid)).toEqual([IMG_ID]);
     expect(out.failures).toHaveLength(1);
-    expect(out.failures[0]).toMatchObject({ id: DOC_ID, name: 'gone.md' });
+    expect(out.failures[0]).toMatchObject({ pointer: DOC_ID, id: DOC_ID, name: 'gone.md' });
     expect(out.failures[0].error).toMatch(/404/);
   });
 });

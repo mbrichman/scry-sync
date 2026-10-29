@@ -1026,7 +1026,7 @@ async function fetchChatGptFileBlobs(token, body, accountId, onEach, opts = {}) 
     const onBranch = branchDocIds.has(att.id);
     try {
       if (typeof att.size === 'number' && att.size > CHATGPT_DOCUMENT_MAX_BYTES) {
-        failures.push({ id: att.id, name: att.name, onBranch,
+        failures.push({ pointer: att.id, id: att.id, name: att.name, onBranch,
           error: `skipped: ${att.size} bytes exceeds CHATGPT_DOCUMENT_MAX_BYTES` });
         return;
       }
@@ -1034,10 +1034,10 @@ async function fetchChatGptFileBlobs(token, body, accountId, onEach, opts = {}) 
         () => _fetchChatGptAsset(token, att.id, accountId, conversationId));
       const rec = buildChatGptDocumentBlob(att, got.meta, got.dataUrl);
       if (rec) blobs.push(rec);
-      else failures.push({ id: att.id, name: att.name, onBranch, error: 'could not build files[] record (empty bytes)' });
+      else failures.push({ pointer: att.id, id: att.id, name: att.name, onBranch, error: 'could not build files[] record (empty bytes)' });
     } catch (e) {
       if (onBranch) console.warn('ChatGPT push: document fetch failed for', att.id, e);
-      failures.push({ id: att.id, name: att.name, onBranch, error: e.message || String(e) });
+      failures.push({ pointer: att.id, id: att.id, name: att.name, onBranch, error: e.message || String(e) });
     } finally {
       if (onEach) onEach();
     }

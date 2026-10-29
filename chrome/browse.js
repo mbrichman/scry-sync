@@ -769,7 +769,7 @@ async function refreshReconcileStatus(source, { allowPrompt = false } = {}) {
 // Sync a list of raw items (from sourceItems[activeSource]) via the shared
 // sync core, with the bounded pool + progress modal. Returns
 // { synced, failed, cancelled }. ctx.onStatus (wired through syncBatch's
-// opts.onStatus) surfaces ChatGPT's "images N/M" / "rate limited — waiting
+// opts.onStatus) surfaces ChatGPT's "files N/M" / "rate limited — waiting
 // Ns" sub-status as a transient suffix on the progress text, reverting to the
 // base header once the in-flight item finishes.
 async function syncCandidateList(candidates, scry, headerText) {
