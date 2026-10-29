@@ -1150,9 +1150,9 @@ async function fetchChatGptFileBlobs(token, body, accountId, onEach, opts = {}) 
   // Vendor-resolved generated-UI pictures: same gate, pool and retry.
   const branchGenui = new Set((await collectChatGptGenuiImages(body)).map((g) => g.id));
   const genui = await collectChatGptGenuiImages(body, { wholeTree: true });
-  const have = new Set(blobs.map((b) => b.file_uuid));
-  const todo = genui.filter((g) => !have.has(g.id));
-  await pool(todo, concurrency, async (g) => {
+  // The collector already de-dups by content_url (and so by derived id); every
+  // collected item is fetched and calls onEach, so "files N/M" reaches M.
+  await pool(genui, concurrency, async (g) => {
     const onBranch = branchGenui.has(g.id);
     let pointer = g.content_url;
     try { const u = new URL(g.content_url); pointer = u.host + u.pathname; } catch { pointer = 'unparseable-url'; }

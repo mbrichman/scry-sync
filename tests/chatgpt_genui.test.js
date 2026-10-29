@@ -54,6 +54,12 @@ describe('genuiFileUuid', () => {
     expect(await genuiFileUuid(url)).toBe('genui_' + hex);
     expect(hex).toHaveLength(32);
   });
+
+  it('hashes non-ASCII URLs as UTF-8', async () => {
+    const url = 'https://images.openai.com/static-rsc-4/caf\u00e9-\u65e5\u672c?purpose=inline';
+    const hex = createHash('sha256').update(Buffer.from(url, 'utf8')).digest('hex').slice(0, 32);
+    expect(await genuiFileUuid(url)).toBe('genui_' + hex);
+  });
 });
 
 describe('collectChatGptGenuiImages', () => {
@@ -167,11 +173,12 @@ describe('fetchChatGptFileBlobs — generated pictures', () => {
     expect(out.failures[0].error).toMatch(/429|rate/i);
   });
 
-  it('skips pictures whose id is already in blobs and counts onEach per picture', async () => {
+  it('fetches each collected picture once and calls onEach per picture', async () => {
     install(() => okResp('image/jpeg'));
     let n = 0;
     const out = await fetchChatGptFileBlobs('tok', convo([['n1', null, asst('m1', { a: { state: { images: [img(1), img(2)] } } })]], 'n1'), null, () => { n++; });
     expect(out.blobs).toHaveLength(2);
     expect(n).toBe(2);
+    expect(calls).toHaveLength(2);
   });
 });
