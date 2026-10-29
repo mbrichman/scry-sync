@@ -226,7 +226,9 @@ const SOURCES = {
       if (wantImages) {
         const total = collectChatGptImagePointers(body, { wholeTree: true }).length
           + (typeof collectChatGptDocumentAttachments === 'function'
-            ? collectChatGptDocumentAttachments(body, { wholeTree: true }).length : 0);
+            ? collectChatGptDocumentAttachments(body, { wholeTree: true }).length : 0)
+          + (typeof collectChatGptGenuiImages === 'function'
+            ? (await collectChatGptGenuiImages(body, { wholeTree: true })).length : 0);
         let done = 0;
         const onEach = ctx.onStatus
           ? () => { done++; ctx.onStatus(`files ${done}/${total}`); }
