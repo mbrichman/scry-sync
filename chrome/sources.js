@@ -224,7 +224,9 @@ const SOURCES = {
       let blobs = [];
       let imageFailures = [];
       if (wantImages) {
-        const total = collectChatGptImagePointers(body, { wholeTree: true }).length;
+        const total = collectChatGptImagePointers(body, { wholeTree: true }).length
+          + (typeof collectChatGptDocumentAttachments === 'function'
+            ? collectChatGptDocumentAttachments(body, { wholeTree: true }).length : 0);
         let done = 0;
         const onEach = ctx.onStatus
           ? () => { done++; ctx.onStatus(`images ${done}/${total}`); }

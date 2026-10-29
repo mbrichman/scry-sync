@@ -52,6 +52,9 @@ const CHATGPT_ABORT_AFTER_COOLDOWNS = 3;
 // Per-conversation image pool default (the gate serializes anyway; this just
 // bounds how much work sits queued).
 const CHATGPT_IMAGE_POOL_DEFAULT = 2;
+// Largest document upload (metadata `size`, bytes) the extension will fetch and
+// push. Bigger ones are reported in failures[], never silently dropped.
+const CHATGPT_DOCUMENT_MAX_BYTES = 25 * 1024 * 1024;
 // Batch concurrency for ChatGPT (SOURCES.chatgpt.concurrency).
 const CHATGPT_BATCH_CONCURRENCY = 1;
 // The deep reconcile pushes at most this many conversations per pass; the rest
@@ -283,6 +286,40 @@ function collectChatGptImagePointers(data, { wholeTree = false } = {}) {
       for (const m of message.metadata.aggregate_result.messages) {
         if (m && m.message_type === 'image') push(m.image_url);
       }
+    }
+  }
+  return out;
+}
+
+// Collect fresh DOCUMENT uploads (md, txt, pdf, docx, csv...). chatgpt.com
+// records them ONLY in message.metadata.attachments[] -- there is no content
+// part -- as { id, name, mime_type, size }. Images appear there too (with the
+// same id as their image_asset_pointer), so image/* entries (or a missing mime
+// with an image extension) and any id collectChatGptImagePointers already
+// yields are excluded: those are fetched by the image path. Same walk as the
+// image collector; on the branch pass hidden/tool messages are skipped, while
+// wholeTree (the Scry push) visits every node. De-duplicated by id. Pure.
+function collectChatGptDocumentAttachments(data, { wholeTree = false } = {}) {
+  const imageIds = new Set(
+    collectChatGptImagePointers(data, { wholeTree }).map(chatGptAssetId).filter(Boolean));
+  const out = [];
+  const seen = new Set();
+  const messages = wholeTree
+    ? Object.values((data && data.mapping) || {}).map((n) => n && n.message).filter(Boolean)
+    : getChatGptBranch(data).filter((m) => !shouldSkipChatGptMessage(m));
+  for (const message of messages) {
+    const atts = message && message.metadata && message.metadata.attachments;
+    if (!Array.isArray(atts)) continue;
+    for (const a of atts) {
+      if (!a || typeof a !== 'object' || typeof a.id !== 'string' || !a.id) continue;
+      if (seen.has(a.id) || imageIds.has(a.id)) continue;
+      const mime = typeof a.mime_type === 'string' ? a.mime_type : '';
+      const isImage = mime
+        ? mime.toLowerCase().startsWith('image/')
+        : _mimeFromFileName(a.name) !== null;
+      if (isImage) continue;
+      seen.add(a.id);
+      out.push({ id: a.id, name: a.name, mime_type: a.mime_type, size: a.size });
     }
   }
   return out;
@@ -810,6 +847,23 @@ function buildChatGptFileBlob(pointer, meta, dataUrl) {
   };
 }
 
+// files[] record for a document attachment. file_uuid is the attachment id
+// itself (documents have no pointer). Name/type prefer the message metadata,
+// then the download route's answer, then the byte response's content-type.
+function buildChatGptDocumentBlob(att, meta, dataUrl) {
+  if (!att || !att.id || typeof dataUrl !== 'string' || !dataUrl) return null;
+  const m = meta || {};
+  const urlMime = (/^data:([^;,]+)/.exec(dataUrl) || [])[1] || null;
+  const fileType = att.mime_type || m.mime_type || urlMime || 'application/octet-stream';
+  return {
+    file_uuid: att.id,
+    file_name: att.name || m.file_name || att.id,
+    file_type: fileType,
+    file_variant: 'original',
+    data: dataUrl.replace(/^data:[^;,]*/, `data:${fileType.split(';')[0].trim()}`),
+  };
+}
+
 // ===== IMPURE: image byte capture =====
 
 function _blobToDataUrl(blob) {
@@ -964,6 +1018,30 @@ async function fetchChatGptFileBlobs(token, body, accountId, onEach, opts = {}) 
       if (onEach) onEach();
     }
   });
+
+  // Fresh document uploads: same gate, same pool, same failure surfacing.
+  const branchDocIds = new Set(collectChatGptDocumentAttachments(body).map((d) => d.id));
+  const docs = collectChatGptDocumentAttachments(body, { wholeTree: true });
+  await pool(docs, concurrency, async (att) => {
+    const onBranch = branchDocIds.has(att.id);
+    try {
+      if (typeof att.size === 'number' && att.size > CHATGPT_DOCUMENT_MAX_BYTES) {
+        failures.push({ id: att.id, name: att.name, onBranch,
+          error: `skipped: ${att.size} bytes exceeds CHATGPT_DOCUMENT_MAX_BYTES` });
+        return;
+      }
+      const got = await withChatGptRateLimitRetry(
+        () => _fetchChatGptAsset(token, att.id, accountId, conversationId));
+      const rec = buildChatGptDocumentBlob(att, got.meta, got.dataUrl);
+      if (rec) blobs.push(rec);
+      else failures.push({ id: att.id, name: att.name, onBranch, error: 'could not build files[] record (empty bytes)' });
+    } catch (e) {
+      if (onBranch) console.warn('ChatGPT push: document fetch failed for', att.id, e);
+      failures.push({ id: att.id, name: att.name, onBranch, error: e.message || String(e) });
+    } finally {
+      if (onEach) onEach();
+    }
+  });
   return { blobs, failures };
 }
 
@@ -1040,6 +1118,9 @@ if (typeof module !== 'undefined' && module.exports) {
     CHATGPT_COOLDOWN_RESET_MS,
     CHATGPT_ABORT_AFTER_COOLDOWNS,
     CHATGPT_IMAGE_POOL_DEFAULT,
+    CHATGPT_DOCUMENT_MAX_BYTES,
+    collectChatGptDocumentAttachments,
+    buildChatGptDocumentBlob,
     CHATGPT_BATCH_CONCURRENCY,
     CHATGPT_DEEP_SLICE,
     CHATGPT_CATCHUP_DELAY_MS,
