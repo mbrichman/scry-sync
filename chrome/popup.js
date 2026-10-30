@@ -66,6 +66,10 @@ document.addEventListener('DOMContentLoaded', () => {
   renderAutoSyncStatus();
   updateSyncButtonForActiveTab();
   updateAllowAccessButton();
+  // The worker may seed settings after the popup opened.
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.scry) updateAllowAccessButton();
+  });
   document.getElementById('allowAccess').addEventListener('click', async () => {
     // Runs inside the click gesture: the only place Chrome lets
     // permissions.request() prompt.

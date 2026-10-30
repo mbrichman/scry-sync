@@ -53,11 +53,14 @@ function seedScrySettings(existing, cfg) {
 // Silent on every failure: a missing file is a normal unbundled install.
 async function seedFromBundledConfig() {
   try {
-    const stored = await new Promise((resolve) =>
+    const readScry = () => new Promise((resolve) =>
       chrome.storage.local.get(['scry'], (r) => resolve(r && r.scry)));
     const resp = await fetch(chrome.runtime.getURL('scry-config.json'));
     if (!resp.ok) return false;
-    const next = seedScrySettings(stored, await resp.json());
+    const cfg = await resp.json();
+    // Read storage AFTER the fetch, immediately before the write, so an
+    // Options Save that landed during the fetch is not overwritten.
+    const next = seedScrySettings(await readScry(), cfg);
     if (!next) return false;
     await new Promise((resolve) => chrome.storage.local.set({ scry: next }, resolve));
     return true;
