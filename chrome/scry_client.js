@@ -233,12 +233,30 @@ async function fetchConversationImageDataUrls(convData) {
 // tree (images, PDFs, scanned docs, binaries) as base64 data URLs. These are the
 // bytes the Anthropic export omits; only the extension's authenticated session
 // can retrieve them. Returned shape matches Scry's ingest `files[]` contract.
-async function fetchConversationFileBlobs(convData) {
+// `opts.failures`, when an array, receives one {id, name, kind:'claude_file',
+// reason, status, onBranch:true, error} per file that could not be fetched.
+function _classifyClaudeFetch(err) {
+  return typeof classifyFetchFailure === 'function'
+    ? classifyFetchFailure(err) : { reason: 'other', status: (err && err.status) || null };
+}
+
+async function fetchConversationFileBlobs(convData, opts = {}) {
   const out = [];
+  const failures = opts && Array.isArray(opts.failures) ? opts.failures : null;
+  const note = (f, err) => {
+    if (!failures) return;
+    const { reason, status } = _classifyClaudeFetch(err);
+    failures.push({ id: f.file_uuid, name: f.file_name, kind: 'claude_file', reason, status,
+      onBranch: true, error: (err && err.message) || String(err) });
+  };
   for (const f of collectAllFiles(convData)) {
     try {
       const resp = await fetch(f.url, { credentials: 'include' });
-      if (!resp.ok) { console.warn(`Scry sync: file fetch ${resp.status} for ${f.url}`); continue; }
+      if (!resp.ok) {
+        console.warn(`Scry sync: file fetch ${resp.status} for ${f.url}`);
+        const e = new Error(`file fetch ${resp.status}`); e.status = resp.status; note(f, e);
+        continue;
+      }
       out.push({
         file_uuid: f.file_uuid,
         file_name: f.file_name,
@@ -248,6 +266,7 @@ async function fetchConversationFileBlobs(convData) {
       });
     } catch (e) {
       console.warn('Scry sync: file fetch error', f.url, e);
+      note(f, e);
     }
   }
   return out;
@@ -402,8 +421,12 @@ async function postToScry(scry, payload) {
 async function syncOneConversation(orgId, conversationUuid, scry) {
   const data = await fetchConversationBody(orgId, conversationUuid);
   const images = await fetchConversationImageDataUrls(data);
-  const fileBlobs = await fetchConversationFileBlobs(data);
-  const payload = buildIngestPayload(data, images, fileBlobs);
+  const fileFailures = [];
+  const fileBlobs = await fetchConversationFileBlobs(data, { failures: fileFailures });
+  const fetchReport = buildFetchReport(fileBlobs, fileFailures,
+    typeof getClientVersion === 'function' ? getClientVersion() : 'test');
+
+  const payload = buildIngestPayload(data, images, fileBlobs, fileFailures, fetchReport);
   // Retry transient failures — the Flask dev server can drop a large image-heavy
   // POST ("Failed to fetch"), and 5xx is worth another try; 4xx/auth is not.
   const resp = await withRetry(
@@ -414,7 +437,10 @@ async function syncOneConversation(orgId, conversationUuid, scry) {
   if (!resp.body || !resp.body.success) {
     throw new Error((resp.body && resp.body.error) || 'ingest rejected');
   }
-  return { status: resp.body.status, updatedAt: data.updated_at };
+  return {
+    status: resp.body.status, updatedAt: data.updated_at,
+    failuresRecorded: typeof resp.body.failures_recorded === 'number' ? resp.body.failures_recorded : 0,
+  };
 }
 
 // In Node (vitest), expose the pure helpers for testing (plus detectClaudeOrgId,
@@ -422,7 +448,7 @@ async function syncOneConversation(orgId, conversationUuid, scry) {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
     conversationBodyIsStub, partitionDeletableReport, reconcileWithScry,
-    chunkIds, mergeReconcileReports, reconcileStatusWithScry,
+    fetchConversationFileBlobs, chunkIds, mergeReconcileReports, reconcileStatusWithScry,
     selectClaudeOrgId, detectClaudeOrgId,
     formatRelativeTime, formatSourceStatus, getContinuousSyncStates,
   };

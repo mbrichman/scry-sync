@@ -610,9 +610,20 @@ function generateDiagnostics(onComplete) {
 }
 
 // Functions are available globally in the browser context
+// Manifest version for the ingest fetch_report; 'test' outside the extension.
+function getClientVersion() {
+  try {
+    if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.getManifest) {
+      return chrome.runtime.getManifest().version || 'test';
+    }
+  } catch { /* fall through */ }
+  return 'test';
+}
+
 // In Node (vitest), expose them via module.exports for testing
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
+    getClientVersion,
     getCurrentBranch,
     getImageExtension,
     imageAssetName,

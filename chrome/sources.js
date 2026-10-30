@@ -223,6 +223,7 @@ const SOURCES = {
       const wantImages = ctx.wantImages !== false;
       let blobs = [];
       let imageFailures = [];
+      let fetchReport = null;
       if (wantImages) {
         const total = collectChatGptImagePointers(body, { wholeTree: true }).length
           + (typeof collectChatGptDocumentAttachments === 'function'
@@ -236,8 +237,10 @@ const SOURCES = {
         const got = await fetchChatGptFileBlobs(token, body, null, onEach);
         blobs = got.blobs;
         imageFailures = got.failures;
+        // The require() fallback exists only for tests/sources.test.js (sets globals by hand); never evaluated in the extension, where the buildFetchReport global always exists.
+        fetchReport = (typeof buildFetchReport === 'function' ? buildFetchReport : require('./scry_sync.js').buildFetchReport)(blobs, imageFailures, typeof getClientVersion === 'function' ? getClientVersion() : 'test');
       }
-      const payload = buildChatGptIngestPayload(body, blobs, item.uuid);
+      const payload = buildChatGptIngestPayload(body, blobs, item.uuid, imageFailures, fetchReport);
       const resp = await withRetry(
         () => postToScry(scry, payload),
         { retries: 2, delayMs: 500, shouldRetry: ({ threw, result }) => threw || (result && result.status >= 500) }
@@ -249,6 +252,7 @@ const SOURCES = {
       return {
         status: resp.body.status,
         filesStored: typeof resp.body.files_stored === 'number' ? resp.body.files_stored : 0,
+        failuresRecorded: typeof resp.body.failures_recorded === 'number' ? resp.body.failures_recorded : 0,
         imageFailures,
       };
     },

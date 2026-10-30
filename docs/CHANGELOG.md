@@ -1,5 +1,10 @@
 # Changelog
 
+## [3.4.0] — Per-file fetch failures reach Scry
+
+- Every ingest push now carries `file_failures[]` (one `{file_uuid, kind, reason, status, on_branch, error}` per file that could not be fetched; omitted when empty) and a `fetch_report` `{attempted, stored, failed, client_version}` whenever file capture was attempted, for both ChatGPT and Claude. Scry can now tell "dead at the vendor" from "client never tried" and "transient". The ingest response's `failures_recorded` is surfaced as `failuresRecorded`.
+- `classifyFetchFailure` maps errors to `not_found | forbidden | gone | too_large | rate_limited | server_error | network | no_signed_url | other`. ChatGPT's metadata route answers dead ids with HTTP 200 `{status:'error', error_code:'file_not_found'}`; that is classed `not_found` (`user_mismatch` -> `forbidden`, other error codes stay `no_signed_url`).
+
 ## [3.1.0] — Claude is a per-source enable; ChatGPT backs off
 
 - **Claude is now switched on/off like ChatGPT.** New **Claude.ai — enable** checkbox in Options (on by default, so existing installs keep working); "Continuous background sync for Claude" and the Organization ID controls sit beneath it. With Claude off: no Claude tab on the dashboard, no organization lookup, no listing, no reconcile status pass, no background wakes, no Claude line in the popup or dashboard footer, and the popup's *Sync this conversation* on a claude.ai tab says Claude is disabled in Options. If no source at all is enabled, the dashboard shows a plain "enable a source in Options" message and makes no network calls. The earlier "Claude always on" ruling is reversed.- **ChatGPT backs off, significantly.** The 15-minute sync was fine; the *initial* catch-up against a fresh Scry host (thousands of conversations pushed at once, 4 conversations x 3 images in parallel) was heavily rate limited. Now:

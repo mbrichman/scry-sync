@@ -33,7 +33,16 @@ function _mimeFromDataUrl(dataUrl) {
 //                 binaries) as [{ file_uuid, file_name, file_type, file_variant,
 //                 data }]. These + raw_json are the full-fidelity capture Scry
 //                 needs before a conversation can be deleted from Claude.
-function buildIngestPayload(data, imageDataUrls = {}, fileBlobs = []) {
+// fetch_report for an ingest push. Counts only failures that are sendable (have
+// an id), so failed always equals file_failures.length. A capture-capable client
+// sends this on EVERY push it attempted capture for, including attempted:0.
+function buildFetchReport(blobs, failures, clientVersion) {
+  const sendable = (Array.isArray(failures) ? failures : []).filter((f) => f && f.id).length;
+  const stored = Array.isArray(blobs) ? blobs.length : 0;
+  return { attempted: stored + sendable, stored, failed: sendable, client_version: clientVersion };
+}
+
+function buildIngestPayload(data, imageDataUrls = {}, fileBlobs = [], fileFailures = [], fetchReport = null) {
   const chat_messages = _currentBranch(data).map((msg) => {
     // Clone so we never mutate the caller's conversation.
     const out = JSON.parse(JSON.stringify(msg));
@@ -52,7 +61,15 @@ function buildIngestPayload(data, imageDataUrls = {}, fileBlobs = []) {
     return out;
   });
 
-  return {
+  const wire = (Array.isArray(fileFailures) ? fileFailures : []).filter((f) => f && f.id).map((f) => ({
+    file_uuid: f.id,
+    kind: f.kind || 'claude_file',
+    reason: f.reason || 'other',
+    status: Number.isInteger(f.status) ? f.status : null,
+    on_branch: !!f.onBranch,
+    error: String(f.error == null ? '' : f.error).replace(/https?:\/\/\S+/g, '<url>').slice(0, 500),
+  }));
+  const payload = {
     uuid: data.uuid,
     name: data.name,
     created_at: data.created_at,
@@ -64,6 +81,9 @@ function buildIngestPayload(data, imageDataUrls = {}, fileBlobs = []) {
     // Original file bytes fetched by the sync loop (base64).
     files: fileBlobs,
   };
+  if (wire.length) payload.file_failures = wire;
+  if (fetchReport) payload.fetch_report = fetchReport;
+  return payload;
 }
 
 // Filter a conversation list to those updated at/after `sinceMs` (epoch ms).
@@ -131,6 +151,6 @@ async function runPool(items, concurrency, worker) {
 // Browser: expose globally. Node (vitest): export for testing.
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    buildIngestPayload, selectConversationsSince, filterUnsynced, withRetry, runPool,
+    buildIngestPayload, buildFetchReport, selectConversationsSince, filterUnsynced, withRetry, runPool,
   };
 }
