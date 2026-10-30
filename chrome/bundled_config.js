@@ -4,11 +4,14 @@
 // win: we seed only when BOTH url and token are absent/empty.
 // Pure logic only (testable); the fetch + storage glue lives in background.js.
 
+const MIN_TOKEN_LENGTH = 16;
+
 function parseBundledConfig(cfg) {
   if (!cfg || typeof cfg !== 'object' || Array.isArray(cfg)) return null;
   if (typeof cfg.url !== 'string' || typeof cfg.token !== 'string') return null;
   const token = cfg.token.trim();
-  if (!token) return null;
+  // Same minimum token length options.js enforces on Save.
+  if (token.length < MIN_TOKEN_LENGTH) return null;
   const raw = cfg.url.trim();
   let parsed;
   try { parsed = new URL(raw); } catch { return null; }
@@ -27,19 +30,31 @@ function shouldSeed(existing) {
 }
 
 // Returns the new `scry` object to store, or null when nothing should be written.
+//  - Nothing stored (url and token both blank): seed, and record `seeded`.
+//  - Stored url/token still equal what we seeded earlier (never hand-edited) and
+//    the file now differs (token rotation): update url/token/seeded.
+//  - Anything else (hand-edited settings, unchanged file, bad file): null.
 function seedScrySettings(existing, cfg) {
   const parsed = parseBundledConfig(cfg);
-  if (!parsed || !shouldSeed(existing)) return null;
-  return { ...(existing || {}), url: parsed.url, token: parsed.token };
+  if (!parsed) return null;
+  const base = existing || {};
+  const next = { ...base, url: parsed.url, token: parsed.token, seeded: { url: parsed.url, token: parsed.token } };
+  if (shouldSeed(base)) return next;
+  const seeded = base.seeded;
+  if (!seeded || typeof seeded !== 'object') return null;
+  if (base.url !== seeded.url || base.token !== seeded.token) return null; // edited by hand
+  if (seeded.url === parsed.url && seeded.token === parsed.token) return null; // unchanged
+  return next;
 }
 
-// Impure glue (service worker): fetch the packaged file, seed if appropriate.
+// Impure glue (service worker): fetch the packaged file, seed/re-seed if appropriate.
+// Never calls chrome.permissions.request (needs a user gesture; the popup's
+// "Allow access to Scry" button is the only prompting caller).
 // Silent on every failure: a missing file is a normal unbundled install.
 async function seedFromBundledConfig() {
   try {
     const stored = await new Promise((resolve) =>
       chrome.storage.local.get(['scry'], (r) => resolve(r && r.scry)));
-    if (!shouldSeed(stored)) return false;
     const resp = await fetch(chrome.runtime.getURL('scry-config.json'));
     if (!resp.ok) return false;
     const next = seedScrySettings(stored, await resp.json());
