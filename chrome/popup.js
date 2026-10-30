@@ -65,7 +65,30 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('header-version').textContent = `v${manifest.version}`;
   renderAutoSyncStatus();
   updateSyncButtonForActiveTab();
+  updateAllowAccessButton();
+  document.getElementById('allowAccess').addEventListener('click', async () => {
+    // Runs inside the click gesture: the only place Chrome lets
+    // permissions.request() prompt.
+    const scry = await loadScrySettings();
+    if (await ensureScryPermission(scry.url)) {
+      document.getElementById('allowAccess').style.display = 'none';
+      await updateSyncButtonForActiveTab();
+    } else {
+      showStatus('Access to Scry was declined.', 'error');
+    }
+  });
 });
+
+// Show "Allow access to Scry" when a URL + token are configured (e.g. seeded
+// from the installer's bundled scry-config.json) but the host permission for
+// that origin has not been granted yet. Never prompts on its own.
+async function updateAllowAccessButton() {
+  const button = document.getElementById('allowAccess');
+  if (!button) return;
+  const scry = await loadScrySettings();
+  const configured = Boolean(scry.url && scry.token);
+  button.style.display = configured && !(await hasScryPermission(scry.url)) ? '' : 'none';
+}
 
 // --- continuous background sync status line ---
 // Sourced from chrome.storage.local under each source's own state key

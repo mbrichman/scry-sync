@@ -3,3 +3,4 @@ tests/node_modules/
 package-lock.json
 tests/package-lock.json
 .DS_Store
+chrome/scry-config.json

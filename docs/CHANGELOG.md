@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.5.0] — Self-configures from a bundled scry-config.json
+
+- The Scry installer can drop `chrome/scry-config.json` (`{"url": "...", "token": "..."}`) next to `manifest.json`. On install and on every service-worker startup, if no Scry URL and token are stored, the extension reads that file and seeds the `scry` settings (trailing slashes stripped; other `scry` keys preserved). A missing or invalid file is ignored silently (normal unbundled install).
+- **Stored settings always win:** seeding happens only when BOTH url and token are absent or empty; a partially configured install is never touched. The file is gitignored so a real token is never committed.
+- The popup shows a single **Allow access to Scry** button when a URL and token are configured but host permission for that origin is not yet granted (Chrome only allows the prompt inside a click). It reuses `hasScryPermission`/`ensureScryPermission`.
+- New `chrome/bundled_config.js` (pure helpers + seeding glue) with `tests/bundled_config.test.js`. Not browser-tested.
+
 ## [3.4.0] — Per-file fetch failures reach Scry
 
 - Every ingest push now carries `file_failures[]` (one `{file_uuid, kind, reason, status, on_branch, error}` per file that could not be fetched; omitted when empty) and a `fetch_report` `{attempted, stored, failed, client_version}` whenever file capture was attempted, for both ChatGPT and Claude. Scry can now tell "dead at the vendor" from "client never tried" and "transient". The ingest response's `failures_recorded` is surfaced as `failuresRecorded`.
