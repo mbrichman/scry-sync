@@ -9,7 +9,13 @@
 // classifyStubAfterReconcile as a global) and before continuous_sync.js
 // (which resolves SOURCES/SOURCE_ORDER the same way); sync_core.js MUST load
 // before continuous_sync.js (which resolves syncBatch/reconcileAndSync).
-importScripts('utils.js', 'scry_sync.js', 'scry_client.js', 'chatgpt_adapter.js', 'sources.js', 'sync_core.js', 'continuous_sync.js');
+importScripts('bundled_config.js', 'utils.js', 'scry_sync.js', 'scry_client.js', 'chatgpt_adapter.js', 'sources.js', 'sync_core.js', 'continuous_sync.js');
+
+// Self-configure from a bundled scry-config.json (Scry installer). No-op unless
+// no url/token is stored. Runs on install and on every worker startup.
+chrome.runtime.onInstalled.addListener(() => { seedFromBundledConfig(); });
+chrome.runtime.onStartup.addListener(() => { seedFromBundledConfig(); });
+seedFromBundledConfig();
 
 const INCREMENTAL_ALARM = 'scry-incremental';
 const DEEP_RECONCILE_ALARM = 'scry-deep-reconcile';

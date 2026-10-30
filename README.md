@@ -16,6 +16,10 @@ Chrome only. (The Firefox tree was retired in v2.8.0.)
 2. Open the extension's Options: set your Scry URL and service token, then enable the sources you use.
 3. Sign in to claude.ai and/or chatgpt.com in this browser profile.
 
+### Bundled with the Scry installer
+
+The Scry installer may place a `scry-config.json` next to `manifest.json` (`{"url": "http://localhost:5001", "token": "..."}`). On first run the extension reads it and fills in your Scry URL and token, so Options needs no typing; the popup then shows **Allow access to Scry**, which you click once to grant host permission. The file is used when no URL and token are saved, and again when a rotated token appears in it, but only if you have not edited the saved URL/token by hand; your own edits always win. It is gitignored; never commit it.
+
 After updating the extension, also terminate its service worker (or toggle the extension off and on) — an MV3 reload does not refresh the running background worker.
 
 ## Development
