@@ -12,6 +12,48 @@ beforeEach(() => {
 
 const err = (message, props = {}) => Object.assign(new Error(message), props);
 
+describe('classifyFetchFailure hardening', () => {
+  const nsu = (props) => err('no signed URL (x)', { noSignedUrl: true, ...props });
+  it('metadata-route 404 -> not_found, 410 -> gone, 401/403 -> forbidden', () => {
+    expect(classifyFetchFailure(nsu({ status: 404, statuses: [404] })).reason).toBe('not_found');
+    expect(classifyFetchFailure(nsu({ status: 410, statuses: [410] })).reason).toBe('gone');
+    expect(classifyFetchFailure(nsu({ status: 401, statuses: [401] })).reason).toBe('forbidden');
+  });
+  it('precedence transient > forbidden > dead', () => {
+    expect(classifyFetchFailure(nsu({ status: 200, statuses: [503], vendorError: 'file_not_found', transient: true, transientReason: 'server_error' })).reason).toBe('server_error');
+    expect(classifyFetchFailure(nsu({ status: 404, statuses: [404, 403] })).reason).toBe('forbidden');
+    expect(classifyFetchFailure(nsu({ status: 200, vendorError: 'file_not_found', transient: true, transientReason: 'network' })).reason).toBe('network');
+  });
+  it('bytes hop: 403/404/410 are NOT dead; direct hop 404/410 are', () => {
+    for (const st of [403, 404, 410]) {
+      expect(classifyFetchFailure(err('bytes x', { status: st, hop: 'bytes' })).reason).toBe('other');
+      expect(classifyFetchFailure(err('bytes x', { status: st }), 'bytes').reason).toBe('other');
+    }
+    expect(classifyFetchFailure(err('bytes 500', { status: 500, hop: 'bytes' })).reason).toBe('server_error');
+    expect(classifyFetchFailure(err('bytes 404', { status: 404 }), 'direct').reason).toBe('not_found');
+    expect(classifyFetchFailure(err('bytes 410', { status: 410, hop: 'direct' })).reason).toBe('gone');
+  });
+  it('code-bug TypeError is not network; fetch TypeError is', () => {
+    expect(classifyFetchFailure(new TypeError("Cannot read properties of undefined (reading 'x')")).reason).toBe('other');
+    expect(classifyFetchFailure(new TypeError('Load failed')).reason).toBe('network');
+  });
+});
+
+describe('asset aggregation (end to end)', () => {
+  afterEach(() => { delete global.fetch; });
+  it('a 503 on one route plus file_not_found on another is transient', async () => {
+    let n = 0;
+    global.fetch = async () => (n++ === 0
+      ? { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ status: 'error', error_code: 'file_not_found' }) }
+      : { ok: false, status: 503, headers: { get: () => null }, json: async () => ({}) });
+    const { failures } = await fetchChatGptFileBlobs('tok', {
+      conversation_id: 'c', current_node: 'n1', mapping: { n1: { id: 'n1', parent: null, children: [], message: {
+        author: { role: 'user' }, recipient: 'all', content: { content_type: 'text', parts: ['x'] },
+        metadata: { attachments: [{ id: 'file_' + 'd'.repeat(32), name: 'a', size: 1 }] } } } } }, null);
+    expect(failures[0].reason).toBe('server_error');
+  });
+});
+
 describe('classifyFetchFailure', () => {
   it.each([
     [404, 'not_found'], [403, 'forbidden'], [401, 'forbidden'], [410, 'gone'],
@@ -43,8 +85,8 @@ describe('classifyFetchFailure', () => {
   it('no signed URL: other error codes stay transient; 403 is forbidden', () => {
     expect(classifyFetchFailure(err('no signed URL (x)', { noSignedUrl: true, status: 200, vendorErrorOther: 'weird_code' })).reason).toBe('no_signed_url');
     expect(classifyFetchFailure(err('no signed URL (x)', { noSignedUrl: true, status: 404, statuses: [404, 403] })).reason).toBe('forbidden');
-    expect(classifyFetchFailure(err('no signed URL (a: 404 | b: 404)', { noSignedUrl: true, status: 404, statuses: [404, 404] })))
-      .toEqual({ reason: 'no_signed_url', status: 404 });
+    expect(classifyFetchFailure(err('no signed URL (a)', { noSignedUrl: true, status: 200 })))
+      .toEqual({ reason: 'no_signed_url', status: 200 });
     expect(classifyFetchFailure(new Error('no signed URL (/x: 502)'))).toEqual({ reason: 'no_signed_url', status: 502 });
   });
   it('a rate-limit error that exhausted retries classifies as rate_limited', () => {
@@ -122,6 +164,15 @@ describe('buildChatGptIngestPayload failures + report', () => {
   });
 });
 
+describe('wire hardening', () => {
+  it('strips URLs from error text before truncating', () => {
+    const w = adapter.toWireFileFailures([{ id: 'f', error: 'bytes failed https://host.test/a/b?sig=SECRET ok' }]);
+    expect(w[0].error).toBe('bytes failed <url> ok');
+    const p = scrySync.buildIngestPayload({ uuid: 'u', chat_messages: [] }, {}, [], [{ id: 'f', error: 'x https://h.test/p?s=1' }], null);
+    expect(p.file_failures[0].error).toBe('x <url>');
+  });
+});
+
 describe('Claude path', () => {
   afterEach(() => { delete global.fetch; delete global.FileReader; delete global.classifyFetchFailure; delete global.collectAllFiles; });
   const convData = { uuid: 'u', chat_messages: [{ uuid: 'm1', files: [
@@ -145,6 +196,14 @@ describe('Claude path', () => {
     const p = scrySync.buildIngestPayload(convData, {}, blobs, failures, report);
     expect(p.file_failures.map((f) => [f.file_uuid, f.reason, f.on_branch])).toEqual([['a1', 'not_found', true], ['b2', 'network', true]]);
     expect(p.fetch_report).toEqual(report);
+  });
+
+  it('fetch_report counts only sendable failures, even with attempted 0', () => {
+    expect(scrySync.buildFetchReport([], [], 'v')).toEqual({ attempted: 0, stored: 0, failed: 0, client_version: 'v' });
+    const fs = [{ id: 'a' }, { name: 'no id' }];
+    const r = scrySync.buildFetchReport([{}], fs, 'v');
+    expect(r).toEqual({ attempted: 2, stored: 1, failed: 1, client_version: 'v' });
+    expect(scrySync.buildIngestPayload({ uuid: 'u', chat_messages: [] }, {}, [{}], fs, r).file_failures).toHaveLength(r.failed);
   });
 
   it('buildIngestPayload without failures is unchanged', () => {

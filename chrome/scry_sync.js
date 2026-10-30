@@ -33,6 +33,15 @@ function _mimeFromDataUrl(dataUrl) {
 //                 binaries) as [{ file_uuid, file_name, file_type, file_variant,
 //                 data }]. These + raw_json are the full-fidelity capture Scry
 //                 needs before a conversation can be deleted from Claude.
+// fetch_report for an ingest push. Counts only failures that are sendable (have
+// an id), so failed always equals file_failures.length. A capture-capable client
+// sends this on EVERY push it attempted capture for, including attempted:0.
+function buildFetchReport(blobs, failures, clientVersion) {
+  const sendable = (Array.isArray(failures) ? failures : []).filter((f) => f && f.id).length;
+  const stored = Array.isArray(blobs) ? blobs.length : 0;
+  return { attempted: stored + sendable, stored, failed: sendable, client_version: clientVersion };
+}
+
 function buildIngestPayload(data, imageDataUrls = {}, fileBlobs = [], fileFailures = [], fetchReport = null) {
   const chat_messages = _currentBranch(data).map((msg) => {
     // Clone so we never mutate the caller's conversation.
@@ -58,7 +67,7 @@ function buildIngestPayload(data, imageDataUrls = {}, fileBlobs = [], fileFailur
     reason: f.reason || 'other',
     status: Number.isInteger(f.status) ? f.status : null,
     on_branch: !!f.onBranch,
-    error: String(f.error == null ? '' : f.error).slice(0, 500),
+    error: String(f.error == null ? '' : f.error).replace(/https?:\/\/\S+/g, '<url>').slice(0, 500),
   }));
   const payload = {
     uuid: data.uuid,
@@ -142,6 +151,6 @@ async function runPool(items, concurrency, worker) {
 // Browser: expose globally. Node (vitest): export for testing.
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    buildIngestPayload, selectConversationsSince, filterUnsynced, withRetry, runPool,
+    buildIngestPayload, buildFetchReport, selectConversationsSince, filterUnsynced, withRetry, runPool,
   };
 }

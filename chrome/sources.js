@@ -237,12 +237,7 @@ const SOURCES = {
         const got = await fetchChatGptFileBlobs(token, body, null, onEach);
         blobs = got.blobs;
         imageFailures = got.failures;
-        fetchReport = {
-          attempted: blobs.length + imageFailures.length,
-          stored: blobs.length,
-          failed: imageFailures.length,
-          client_version: typeof getClientVersion === 'function' ? getClientVersion() : 'test',
-        };
+        fetchReport = (typeof buildFetchReport === 'function' ? buildFetchReport : require('./scry_sync.js').buildFetchReport)(blobs, imageFailures, typeof getClientVersion === 'function' ? getClientVersion() : 'test');
       }
       const payload = buildChatGptIngestPayload(body, blobs, item.uuid, imageFailures, fetchReport);
       const resp = await withRetry(

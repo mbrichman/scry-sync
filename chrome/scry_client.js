@@ -423,12 +423,9 @@ async function syncOneConversation(orgId, conversationUuid, scry) {
   const images = await fetchConversationImageDataUrls(data);
   const fileFailures = [];
   const fileBlobs = await fetchConversationFileBlobs(data, { failures: fileFailures });
-  const fetchReport = {
-    attempted: fileBlobs.length + fileFailures.length,
-    stored: fileBlobs.length,
-    failed: fileFailures.length,
-    client_version: typeof getClientVersion === 'function' ? getClientVersion() : 'test',
-  };
+  const fetchReport = buildFetchReport(fileBlobs, fileFailures,
+    typeof getClientVersion === 'function' ? getClientVersion() : 'test');
+
   const payload = buildIngestPayload(data, images, fileBlobs, fileFailures, fetchReport);
   // Retry transient failures — the Flask dev server can drop a large image-heavy
   // POST ("Failed to fetch"), and 5xx is worth another try; 4xx/auth is not.

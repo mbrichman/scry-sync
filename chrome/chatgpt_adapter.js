@@ -733,45 +733,64 @@ function chatGptAuthHeaders(token, accountId) {
 }
 
 // Error with an HTTP status attached, so classifyFetchFailure need not parse text.
-function _statusError(message, status) {
+function _statusError(message, status, hop) {
   const e = new Error(message);
   e.status = status;
+  if (hop) e.hop = hop;
   return e;
 }
 
 // Classify a thrown fetch error into the wire `reason` vocabulary + HTTP status.
 // Prefers e.status / e.vendorError; falls back to a status number in the message.
-function classifyFetchFailure(err) {
+function classifyFetchFailure(err, hop) {
   const msg = String((err && err.message) || err || '');
+  hop = hop || (err && err.hop) || 'metadata';
   let status = (err && Number.isInteger(err.status)) ? err.status : null;
-  const vendor = err && err.vendorError;
-  if (vendor === 'file_not_found') return { reason: 'not_found', status };
-  if (vendor === 'user_mismatch') return { reason: 'forbidden', status };
   if (/^skipped:/.test(msg) && /MAX_BYTES/.test(msg)) return { reason: 'too_large', status };
-  if (err && err.noSignedUrl) {
-    if (Array.isArray(err.statuses) && err.statuses.some((n) => n === 401 || n === 403)) {
-      return { reason: 'forbidden', status: err.statuses.find((n) => n === 401 || n === 403) };
-    }
-    return { reason: 'no_signed_url', status };
-  }
+  if (err && err.noSignedUrl) return _classifyNoSignedUrl(err, status);
   if (/^no signed URL/.test(msg)) {
     const m = msg.match(/\b([1-5]\d\d)\b/);
     return { reason: 'no_signed_url', status: status != null ? status : (m ? Number(m[1]) : null) };
   }
-  if (/bytes fetch threw|Failed to fetch|NetworkError|network/i.test(msg) || (err instanceof TypeError && status == null)) {
-    return { reason: 'network', status };
-  }
-  if (status == null) {
+  const vendor = err && err.vendorError;
+  if (vendor === 'file_not_found') return { reason: 'not_found', status };
+  if (vendor === 'user_mismatch') return { reason: 'forbidden', status };
+  if (status == null && !/fetch threw/.test(msg)) {
     const m = msg.match(/\b([1-5]\d\d)\b/);
     if (m) status = Number(m[1]);
   }
-  if (status === 404) return { reason: 'not_found', status };
-  if (status === 403 || status === 401) return { reason: 'forbidden', status };
-  if (status === 410) return { reason: 'gone', status };
   if (status === 429) return { reason: 'rate_limited', status };
   if (status != null && status >= 500 && status <= 599) return { reason: 'server_error', status };
+  // Bytes hop: a FRESH signed URL that fails 401/403/404/410 means signature,
+  // expiry or credentials -- not "dead at source". Only 'direct' (anonymous
+  // vendor-resolved pictures, no signed URL) treats 404/410 as the vendor's answer.
+  if (hop !== 'bytes') {
+    if (status === 404) return { reason: 'not_found', status };
+    if (status === 403 || status === 401) return { reason: 'forbidden', status };
+    if (status === 410) return { reason: 'gone', status };
+  }
   if (err instanceof ChatGptRateLimitError) return { reason: 'rate_limited', status: status != null ? status : 429 };
+  if (status == null) {
+    if (/bytes fetch threw|failed to fetch|networkerror|network|load failed/i.test(msg)) return { reason: 'network', status };
+    if (err instanceof TypeError && /fetch|network|load failed/i.test(msg)) return { reason: 'network', status };
+  }
   return { reason: 'other', status };
+}
+
+// Aggregate of the metadata routes. Precedence: transient > forbidden > dead.
+// A dead class is assigned only when EVERY attempt was a definite dead answer.
+function _classifyNoSignedUrl(err, status) {
+  if (err.transient) {
+    return { reason: err.transientReason || 'no_signed_url', status };
+  }
+  const statuses = Array.isArray(err.statuses) ? err.statuses : [];
+  if (err.vendorError === 'user_mismatch' || statuses.some((n) => n === 401 || n === 403)) {
+    return { reason: 'forbidden', status: statuses.find((n) => n === 401 || n === 403) || status };
+  }
+  if (err.vendorError === 'file_not_found') return { reason: 'not_found', status };
+  if (statuses.includes(404)) return { reason: 'not_found', status: 404 };
+  if (statuses.includes(410)) return { reason: 'gone', status: 410 };
+  return { reason: 'no_signed_url', status };
 }
 
 // Credentialed backend-api GET with 429 awareness, through the global gate.
@@ -781,7 +800,7 @@ async function chatGptApiGet(url, token, accountId, kind = 'body') {
     url, url, { credentials: 'include', headers: chatGptAuthHeaders(token, accountId) },
     async (resp) => {
       _throwIfRateLimited(resp);
-      if (!resp.ok) throw _statusError(`${url}: ${resp.status}`, resp.status);
+      if (!resp.ok) throw _statusError(`${url}: ${resp.status}`, resp.status, 'metadata');
       return resp.json();
     }));
 }
@@ -993,7 +1012,7 @@ async function _fetchChatGptGenuiBytes(contentUrl) {
     try {
       return await chatGptGate.fetchWith('bytes', contentUrl, { credentials: 'omit' }, async (r) => {
         _throwIfRateLimited(r);
-        if (!r.ok) throw _statusError(`bytes ${r.status} from ${host}`, r.status);
+        if (!r.ok) throw _statusError(`bytes ${r.status} from ${host}`, r.status, 'direct');
         const len = Number(r.headers && r.headers.get && r.headers.get('content-length'));
         if (len > CHATGPT_GENUI_MAX_BYTES) throw new Error(`skipped: ${len} bytes exceeds CHATGPT_GENUI_MAX_BYTES`);
         const blob = await r.blob();
@@ -1075,16 +1094,27 @@ async function _fetchChatGptAsset(token, pointer, accountId, conversationId) {
   const errors = [];
   const statuses = [];
   const vendorCodes = [];
+  let transient = null; // first transient attempt: {reason}
   for (const url of attempts) {
     try {
       const m = await chatGptApiGet(url, token, accountId, 'asset');
       if (m && m.status === 'success' && m.download_url) { meta = m; break; }
       const code = m && m.status === 'error' ? (m.error_code || 'unknown') : null;
       if (code) vendorCodes.push(code);
+      if (!code || (code !== 'file_not_found' && code !== 'user_mismatch')) {
+        transient = transient || { reason: 'no_signed_url' };
+      }
       errors.push(`${url.replace(CHATGPT_API, '')}: status=${m && m.status}${code ? ` error_code=${code}` : ''}`);
     } catch (e) {
       if (e instanceof ChatGptRateLimitError) throw e;
-      if (Number.isInteger(e && e.status)) statuses.push(e.status);
+      if (Number.isInteger(e && e.status)) {
+        statuses.push(e.status);
+        if (e.status === 429) transient = transient || { reason: 'rate_limited' };
+        else if (e.status >= 500) transient = transient || { reason: 'server_error' };
+        else if (![401, 403, 404, 410].includes(e.status)) transient = transient || { reason: 'no_signed_url' };
+      } else {
+        transient = transient || { reason: 'network' };
+      }
       errors.push(`${url.replace(CHATGPT_API, '')}: ${e.message}`);
     }
   }
@@ -1098,6 +1128,7 @@ async function _fetchChatGptAsset(token, pointer, accountId, conversationId) {
       : vendorCodes.includes('user_mismatch') ? 'user_mismatch' : null;
     if (vc) err.vendorError = vc;
     else if (vendorCodes.length) err.vendorErrorOther = vendorCodes[0];
+    if (transient) { err.transient = true; err.transientReason = transient.reason; }
     throw err;
   }
   // The signed download_url lives on one of two kinds of host. A separate media
@@ -1113,7 +1144,7 @@ async function _fetchChatGptAsset(token, pointer, accountId, conversationId) {
     try {
       return await chatGptGate.fetchWith('bytes', meta.download_url, fetchOpts, async (r) => {
         _throwIfRateLimited(r);
-        if (!r.ok) throw _statusError(`bytes ${r.status} from ${host}`, r.status);
+        if (!r.ok) throw _statusError(`bytes ${r.status} from ${host}`, r.status, 'bytes');
         return { resp: r, raw: await _blobToDataUrl(await r.blob()) };
       });
     } catch (e) {
@@ -1222,7 +1253,7 @@ async function fetchChatGptFileBlobs(token, body, accountId, onEach, opts = {}) 
       else failures.push({ pointer, id: g.id, kind: 'genui', name, reason: 'other', status: null, onBranch, error: 'could not build files[] record (empty bytes)' });
     } catch (e) {
       if (onBranch) console.warn('ChatGPT push: generated picture fetch failed for', pointer, e);
-      failures.push({ pointer, id: g.id, kind: 'genui', name, ...classifyFetchFailure(e), onBranch, error: e.message || String(e) });
+      failures.push({ pointer, id: g.id, kind: 'genui', name, ...classifyFetchFailure(e, 'direct'), onBranch, error: e.message || String(e) });
     } finally {
       if (onEach) onEach();
     }
@@ -1264,7 +1295,7 @@ function toWireFileFailures(failures) {
     reason: f.reason || 'other',
     status: Number.isInteger(f.status) ? f.status : null,
     on_branch: !!f.onBranch,
-    error: String(f.error == null ? '' : f.error).slice(0, 500),
+    error: String(f.error == null ? '' : f.error).replace(/https?:\/\/\S+/g, '<url>').slice(0, 500),
   }));
 }
 
