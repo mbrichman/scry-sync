@@ -732,6 +732,48 @@ function chatGptAuthHeaders(token, accountId) {
   return h;
 }
 
+// Error with an HTTP status attached, so classifyFetchFailure need not parse text.
+function _statusError(message, status) {
+  const e = new Error(message);
+  e.status = status;
+  return e;
+}
+
+// Classify a thrown fetch error into the wire `reason` vocabulary + HTTP status.
+// Prefers e.status / e.vendorError; falls back to a status number in the message.
+function classifyFetchFailure(err) {
+  const msg = String((err && err.message) || err || '');
+  let status = (err && Number.isInteger(err.status)) ? err.status : null;
+  const vendor = err && err.vendorError;
+  if (vendor === 'file_not_found') return { reason: 'not_found', status };
+  if (vendor === 'user_mismatch') return { reason: 'forbidden', status };
+  if (/^skipped:/.test(msg) && /MAX_BYTES/.test(msg)) return { reason: 'too_large', status };
+  if (err && err.noSignedUrl) {
+    if (Array.isArray(err.statuses) && err.statuses.some((n) => n === 401 || n === 403)) {
+      return { reason: 'forbidden', status: err.statuses.find((n) => n === 401 || n === 403) };
+    }
+    return { reason: 'no_signed_url', status };
+  }
+  if (/^no signed URL/.test(msg)) {
+    const m = msg.match(/\b([1-5]\d\d)\b/);
+    return { reason: 'no_signed_url', status: status != null ? status : (m ? Number(m[1]) : null) };
+  }
+  if (/bytes fetch threw|Failed to fetch|NetworkError|network/i.test(msg) || (err instanceof TypeError && status == null)) {
+    return { reason: 'network', status };
+  }
+  if (status == null) {
+    const m = msg.match(/\b([1-5]\d\d)\b/);
+    if (m) status = Number(m[1]);
+  }
+  if (status === 404) return { reason: 'not_found', status };
+  if (status === 403 || status === 401) return { reason: 'forbidden', status };
+  if (status === 410) return { reason: 'gone', status };
+  if (status === 429) return { reason: 'rate_limited', status };
+  if (status != null && status >= 500 && status <= 599) return { reason: 'server_error', status };
+  if (err instanceof ChatGptRateLimitError) return { reason: 'rate_limited', status: status != null ? status : 429 };
+  return { reason: 'other', status };
+}
+
 // Credentialed backend-api GET with 429 awareness, through the global gate.
 // `kind` ('list' | 'body' | 'asset') picks the gate's minimum spacing.
 async function chatGptApiGet(url, token, accountId, kind = 'body') {
@@ -739,7 +781,7 @@ async function chatGptApiGet(url, token, accountId, kind = 'body') {
     url, url, { credentials: 'include', headers: chatGptAuthHeaders(token, accountId) },
     async (resp) => {
       _throwIfRateLimited(resp);
-      if (!resp.ok) throw new Error(`${url}: ${resp.status}`);
+      if (!resp.ok) throw _statusError(`${url}: ${resp.status}`, resp.status);
       return resp.json();
     }));
 }
@@ -951,7 +993,7 @@ async function _fetchChatGptGenuiBytes(contentUrl) {
     try {
       return await chatGptGate.fetchWith('bytes', contentUrl, { credentials: 'omit' }, async (r) => {
         _throwIfRateLimited(r);
-        if (!r.ok) throw new Error(`bytes ${r.status} from ${host}`);
+        if (!r.ok) throw _statusError(`bytes ${r.status} from ${host}`, r.status);
         const len = Number(r.headers && r.headers.get && r.headers.get('content-length'));
         if (len > CHATGPT_GENUI_MAX_BYTES) throw new Error(`skipped: ${len} bytes exceeds CHATGPT_GENUI_MAX_BYTES`);
         const blob = await r.blob();
@@ -1031,17 +1073,33 @@ async function _fetchChatGptAsset(token, pointer, accountId, conversationId) {
   }
   let meta = null;
   const errors = [];
+  const statuses = [];
+  const vendorCodes = [];
   for (const url of attempts) {
     try {
       const m = await chatGptApiGet(url, token, accountId, 'asset');
       if (m && m.status === 'success' && m.download_url) { meta = m; break; }
-      errors.push(`${url.replace(CHATGPT_API, '')}: status=${m && m.status}`);
+      const code = m && m.status === 'error' ? (m.error_code || 'unknown') : null;
+      if (code) vendorCodes.push(code);
+      errors.push(`${url.replace(CHATGPT_API, '')}: status=${m && m.status}${code ? ` error_code=${code}` : ''}`);
     } catch (e) {
       if (e instanceof ChatGptRateLimitError) throw e;
+      if (Number.isInteger(e && e.status)) statuses.push(e.status);
       errors.push(`${url.replace(CHATGPT_API, '')}: ${e.message}`);
     }
   }
-  if (!meta) throw new Error(`no signed URL (${errors.join(' | ')})`);
+  if (!meta) {
+    const err = new Error(`no signed URL (${errors.join(' | ')})`);
+    err.noSignedUrl = true;
+    err.statuses = statuses;
+    // The metadata route answers HTTP 200 {status:'error', error_code} for dead ids.
+    err.status = vendorCodes.length ? 200 : (statuses.length ? statuses[0] : null);
+    const vc = vendorCodes.includes('file_not_found') ? 'file_not_found'
+      : vendorCodes.includes('user_mismatch') ? 'user_mismatch' : null;
+    if (vc) err.vendorError = vc;
+    else if (vendorCodes.length) err.vendorErrorOther = vendorCodes[0];
+    throw err;
+  }
   // The signed download_url lives on one of two kinds of host. A separate media
   // host (*.oaiusercontent.com) is authorised by the signature alone and
   // rejects cookies/headers -> credentials omitted. chatgpt.com itself (the
@@ -1055,7 +1113,7 @@ async function _fetchChatGptAsset(token, pointer, accountId, conversationId) {
     try {
       return await chatGptGate.fetchWith('bytes', meta.download_url, fetchOpts, async (r) => {
         _throwIfRateLimited(r);
-        if (!r.ok) throw new Error(`bytes ${r.status} from ${host}`);
+        if (!r.ok) throw _statusError(`bytes ${r.status} from ${host}`, r.status);
         return { resp: r, raw: await _blobToDataUrl(await r.blob()) };
       });
     } catch (e) {
@@ -1115,10 +1173,10 @@ async function fetchChatGptFileBlobs(token, body, accountId, onEach, opts = {}) 
         () => _fetchChatGptAsset(token, pointer, accountId, conversationId));
       const rec = buildChatGptFileBlob(pointer, got.meta, got.dataUrl);
       if (rec) blobs.push(rec);
-      else failures.push({ pointer, onBranch, error: 'could not build files[] record (no asset id or empty bytes)' });
+      else failures.push({ pointer, id: chatGptAssetId(pointer), kind: 'image', reason: 'other', status: null, onBranch, error: 'could not build files[] record (no asset id or empty bytes)' });
     } catch (e) {
       if (onBranch) console.warn('ChatGPT push: file fetch failed for', pointer, e);
-      failures.push({ pointer, onBranch, error: e.message || String(e) });
+      failures.push({ pointer, id: chatGptAssetId(pointer), kind: 'image', ...classifyFetchFailure(e), onBranch, error: e.message || String(e) });
     } finally {
       if (onEach) onEach();
     }
@@ -1131,7 +1189,7 @@ async function fetchChatGptFileBlobs(token, body, accountId, onEach, opts = {}) 
     const onBranch = branchDocIds.has(att.id);
     try {
       if (typeof att.size === 'number' && att.size > CHATGPT_DOCUMENT_MAX_BYTES) {
-        failures.push({ pointer: att.id, id: att.id, name: att.name, onBranch,
+        failures.push({ pointer: att.id, id: att.id, kind: 'document', name: att.name, reason: 'too_large', status: null, onBranch,
           error: `skipped: ${att.size} bytes exceeds CHATGPT_DOCUMENT_MAX_BYTES` });
         return;
       }
@@ -1139,10 +1197,10 @@ async function fetchChatGptFileBlobs(token, body, accountId, onEach, opts = {}) 
         () => _fetchChatGptAsset(token, att.id, accountId, conversationId));
       const rec = buildChatGptDocumentBlob(att, got.meta, got.dataUrl);
       if (rec) blobs.push(rec);
-      else failures.push({ pointer: att.id, id: att.id, name: att.name, onBranch, error: 'could not build files[] record (empty bytes)' });
+      else failures.push({ pointer: att.id, id: att.id, kind: 'document', name: att.name, reason: 'other', status: null, onBranch, error: 'could not build files[] record (empty bytes)' });
     } catch (e) {
       if (onBranch) console.warn('ChatGPT push: document fetch failed for', att.id, e);
-      failures.push({ pointer: att.id, id: att.id, name: att.name, onBranch, error: e.message || String(e) });
+      failures.push({ pointer: att.id, id: att.id, kind: 'document', name: att.name, ...classifyFetchFailure(e), onBranch, error: e.message || String(e) });
     } finally {
       if (onEach) onEach();
     }
@@ -1161,10 +1219,10 @@ async function fetchChatGptFileBlobs(token, body, accountId, onEach, opts = {}) 
       const got = await withChatGptRateLimitRetry(() => _fetchChatGptGenuiBytes(g.content_url));
       const rec = buildChatGptGenuiBlob(g, got.meta, got.dataUrl);
       if (rec) blobs.push(rec);
-      else failures.push({ pointer, id: g.id, name, onBranch, error: 'could not build files[] record (empty bytes)' });
+      else failures.push({ pointer, id: g.id, kind: 'genui', name, reason: 'other', status: null, onBranch, error: 'could not build files[] record (empty bytes)' });
     } catch (e) {
       if (onBranch) console.warn('ChatGPT push: generated picture fetch failed for', pointer, e);
-      failures.push({ pointer, id: g.id, name, onBranch, error: e.message || String(e) });
+      failures.push({ pointer, id: g.id, kind: 'genui', name, ...classifyFetchFailure(e), onBranch, error: e.message || String(e) });
     } finally {
       if (onEach) onEach();
     }
@@ -1196,13 +1254,30 @@ async function fetchChatGptFileBlobs(token, body, accountId, onEach, opts = {}) 
 // would import with no source id and skip fidelity capture entirely (the
 // archive is only written when there is an id to attach it to). The fallback
 // is only used when the body carries none — a body's own id always wins.
-function buildChatGptIngestPayload(body, fileBlobs = [], fallbackConversationId = null) {
+// Map collected failures ({id, kind, reason, status, onBranch, error, ...}) to the
+// ingest wire shape. Entries without an id are skipped (server keys on file_uuid).
+function toWireFileFailures(failures) {
+  if (!Array.isArray(failures)) return [];
+  return failures.filter((f) => f && f.id).map((f) => ({
+    file_uuid: f.id,
+    kind: f.kind || 'image',
+    reason: f.reason || 'other',
+    status: Number.isInteger(f.status) ? f.status : null,
+    on_branch: !!f.onBranch,
+    error: String(f.error == null ? '' : f.error).slice(0, 500),
+  }));
+}
+
+function buildChatGptIngestPayload(body, fileBlobs = [], fallbackConversationId = null, fileFailures = [], fetchReport = null) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
   const payload = { ...body };
   if (!payload.conversation_id && fallbackConversationId) {
     payload.conversation_id = fallbackConversationId;
   }
   if (Array.isArray(fileBlobs) && fileBlobs.length) payload.files = fileBlobs;
+  const wire = toWireFileFailures(fileFailures);
+  if (wire.length) payload.file_failures = wire;
+  if (fetchReport) payload.fetch_report = fetchReport;
   return payload;
 }
 
@@ -1232,6 +1307,8 @@ if (typeof module !== 'undefined' && module.exports) {
     getChatGptBranch,
     findDeepestLeaf,
     buildChatGptIngestPayload,
+    classifyFetchFailure,
+    toWireFileFailures,
     withChatGptRateLimitRetry,
     ChatGptRateLimitError,
     createChatGptGate,
