@@ -2,7 +2,7 @@
 
 ## [3.6.0] — Gated delete from ChatGPT
 
-- **Delete selected from ChatGPT** (owner ruling 2026-10-31), mirroring the Claude flow: each selected conversation's body is fetched LIVE (sequentially, through the 429-aware gate) and sent verbatim to Scry's `verify-deletable` with `source_type: "chatgpt"`; after a confirm, ONLY ids Scry cleared are deleted. `verifyDeletableWithScry` now takes the source type (default `claude`, behaviour unchanged).
+- **Delete selected from ChatGPT** (owner ruling 2026-10-31; client half only -- the ChatGPT-aware `verify-deletable` in mbrichman/scry is pending, so until it is deployed the server blocks every ChatGPT delete (fails closed) and the button reports 0 cleared), mirroring the Claude flow: each selected conversation's body is fetched LIVE (sequentially, through the 429-aware gate) and sent verbatim to Scry's `verify-deletable` with `source_type: "chatgpt"`; after a confirm, ONLY ids Scry cleared are deleted. `verifyDeletableWithScry` now takes the source type (default `claude`, behaviour unchanged).
 - Delete call: `PATCH backend-api/conversation/<id>` `{"is_visible": false}`. A delete counts as done only when a follow-up GET returns 404 with code `conversation_deleted`; anything else is reported as a failed delete. Ids that are not plain UUIDs (e.g. temporary `local-chatgpt:<uuid>`) are refused and reported.
 - Both calls go through the one request gate under a new `delete` kind (1000 ms spacing). A 429 backs off via the shared cooldown and retries; if it persists the run stops and the remaining ids are reported as not attempted.
 - `SOURCES.<s>.delete` flag drives the dashboard's delete button. +22 tests. Not yet exercised against live chatgpt.com beyond the owner's probe.

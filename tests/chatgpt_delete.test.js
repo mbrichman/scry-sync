@@ -259,3 +259,34 @@ describe('contract and Scry client', () => {
     expect(bodies[1][1].conversations).toEqual([{ source_id: 'b', live_body: {} }]);
   });
 });
+
+describe('review follow-ups', () => {
+  it('confirm skipped count includes ids left unfetched after a fetch-phase 429', async () => {
+    const { deps, log } = flowDeps();
+    const inner = global.fetch;
+    global.fetch = async (url, init) => (url.endsWith(ID2) && !(init && init.method) ? json(429, {}) : inner(url, init));
+    const out = await runChatGptGatedDelete(deps);
+    expect(out.notAttempted.map((n) => n.source_id)).toEqual([ID3]);
+    expect(log.confirmMsg.notAttempted).toBe(1);
+    expect(log.confirmMsg.skipped).toBe(2); // ID2 fetch-failed + ID3 unfetched
+  });
+  it('PATCH ok but verify exhausts 429 retries: failure says it may have succeeded and to re-check', async () => {
+    const { deps } = flowDeps({ deps: { selected: [{ uuid: ID1, name: 'one' }, { uuid: ID2, name: 'two' }] } });
+    const inner = global.fetch;
+    global.fetch = async (url, init) => {
+      if (!(init && init.method) && inner.length >= 0 && (url.endsWith(ID1))) {
+        // GET on ID1: body fetch first (before any PATCH) must work; after PATCH, 429.
+        if (global.__patched) return json(429, {});
+      }
+      if (init && init.method === 'PATCH') global.__patched = true;
+      return inner(url, init);
+    };
+    const out = await runChatGptGatedDelete(deps);
+    delete global.__patched;
+    expect(out.rateLimited).toBe(true);
+    expect(out.failed.map((f) => f.source_id)).toEqual([ID1]);
+    expect(out.failed[0].error).toMatch(/may have succeeded/i);
+    expect(out.failed[0].error).toMatch(/re-check/i);
+    expect(out.notAttempted.map((n) => n.source_id)).toEqual([ID2]);
+  });
+});

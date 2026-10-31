@@ -295,8 +295,10 @@ function renderTabs() {
 }
 
 // Delete-from-source: Claude was the original owner ruling; ChatGPT was
-// enabled by owner ruling 2026-10-31 (Scry's verify-deletable now proves a
-// ChatGPT `mapping` capture). Each source opts in via SOURCES[s].delete.
+// enabled client-side by owner ruling 2026-10-31. The server half (a
+// ChatGPT-aware verify-deletable in mbrichman/scry) is PENDING: until it is
+// deployed every ChatGPT delete is blocked by the server (fails closed), so
+// the button reports 0 cleared. Each source opts in via SOURCES[s].delete.
 // The search placeholder names the active source for clarity.
 function sourceSupportsDelete(source) {
   return Boolean(SOURCES[source] && SOURCES[source].delete);
@@ -1150,7 +1152,7 @@ async function deleteSelectedFromChatGpt() {
           `stored archive.\n\n` +
           (info.skipped > 0
             ? `${info.skipped} selected were NOT cleared (${info.blocked} blocked, ` +
-              `${info.fetchFailed} fetch-failed, ${info.refused} refused id) and will be SKIPPED — see console.\n\n`
+              `${info.fetchFailed} fetch-failed, ${info.refused} refused id, ${info.notAttempted} not fetched) and will be SKIPPED — see console.\n\n`
             : '') +
           `This CANNOT be undone at ChatGPT. Scry keeps its copy.`;
         const ok = window.confirm(msg);

@@ -1436,20 +1436,22 @@ async function runChatGptGatedDelete({
   out.cleared = toDelete.map((c) => c.uuid);
   if (toDelete.length === 0) return out;
 
-  const skipped = out.blocked.length + out.fetchFailed.length + out.refused.length;
+  const skipped = out.blocked.length + out.fetchFailed.length + out.refused.length + out.notAttempted.length;
   if (!(await confirm({ cleared: toDelete.length, blocked: out.blocked.length,
-    fetchFailed: out.fetchFailed.length, refused: out.refused.length, skipped }))) {
+    fetchFailed: out.fetchFailed.length, refused: out.refused.length,
+    notAttempted: out.notAttempted.length, skipped }))) {
     out.cancelled = true; return out;
   }
 
   for (let i = 0; i < toDelete.length; i++) {
     if (isCancelled()) { out.cancelled = true; break; }
     const c = toDelete[i];
+    let patched = false;
     try {
       const r = await withChatGptRateLimitRetry(() => deleteChatGptConversation(token, c.uuid, accountId), retry);
       if (!r.ok) {
         out.failed.push({ source_id: c.uuid, name: c.name, error: `PATCH ${r.status}` });
-      } else if (await withChatGptRateLimitRetry(() => verifyChatGptDeleted(token, c.uuid, accountId), retry)) {
+      } else if (patched = true, await withChatGptRateLimitRetry(() => verifyChatGptDeleted(token, c.uuid, accountId), retry)) {
         out.deleted.push(c.uuid);
       } else {
         out.failed.push({ source_id: c.uuid, name: c.name,
@@ -1458,7 +1460,9 @@ async function runChatGptGatedDelete({
     } catch (e) {
       if (e instanceof ChatGptRateLimitError) {
         out.rateLimited = true;
-        out.failed.push({ source_id: c.uuid, name: c.name, error: `rate limited (${label(c)}): stopped` });
+        out.failed.push({ source_id: c.uuid, name: c.name, error: patched
+          ? `rate limited while verifying (${label(c)}): the delete may have succeeded -- re-check this conversation in ChatGPT`
+          : `rate limited (${label(c)}): stopped` });
         for (const rest of toDelete.slice(i + 1)) out.notAttempted.push({ source_id: rest.uuid, name: rest.name });
         break;
       }
