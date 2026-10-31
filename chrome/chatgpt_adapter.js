@@ -35,7 +35,9 @@ const CHATGPT_API = 'https://chatgpt.com/backend-api';
 //
 // Minimum gap between request STARTS, by kind (ms). One request in flight at a
 // time, so these are also the ceiling on request rate.
-const CHATGPT_MIN_SPACING_MS = { list: 400, body: 1000, asset: 750 };
+// 'delete' (PATCH is_visible:false + its verifying GET) is deliberately no
+// faster than a body fetch: irreversible writes get the gentlest pace.
+const CHATGPT_MIN_SPACING_MS = { list: 400, body: 1000, asset: 750, delete: 1000 };
 // Shared cooldown after a 429 with no usable Retry-After: escalates per
 // consecutive cooldown, capped at the last entry.
 const CHATGPT_COOLDOWN_SCHEDULE_MS = [60000, 120000, 240000, 480000, 900000];
@@ -1332,6 +1334,141 @@ async function withChatGptRateLimitRetry(fn, { maxRetries = CHATGPT_RATE_LIMIT_R
   }
 }
 
+
+// ===== gated DELETE (owner-ruled 2026-10-31; endpoint live-probed the same day) =====
+//
+// Delete = PATCH backend-api/conversation/<id> {"is_visible": false} -> 200
+// {"success":true}. It is only DONE when a follow-up GET answers 404 with
+// code `conversation_deleted`; anything else is a failed delete. Both calls run
+// through the one request gate (kind 'delete'). New chats briefly carry a
+// temporary id `local-chatgpt:<uuid>` that the server rejects: only plain UUIDs
+// from the listing are ever acted on.
+const _CHATGPT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function isDeletableChatGptId(id) {
+  return typeof id === 'string' && _CHATGPT_UUID_RE.test(id);
+}
+function _requireDeletableId(id) {
+  if (!isDeletableChatGptId(id)) throw new Error(`refusing to touch non-UUID ChatGPT id: ${String(id).slice(0, 60)}`);
+}
+
+// Returns { ok, status }. Throws ChatGptRateLimitError on 429 (cools the gate).
+async function deleteChatGptConversation(token, conversationId, accountId) {
+  _requireDeletableId(conversationId);
+  const url = `${CHATGPT_API}/conversation/${conversationId}`;
+  return chatGptGate.run('delete', () => chatGptGate.fetchWith(
+    url, url,
+    {
+      method: 'PATCH', credentials: 'include',
+      headers: { ...chatGptAuthHeaders(token, accountId), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ is_visible: false }),
+    },
+    async (resp) => {
+      _throwIfRateLimited(resp);
+      return { ok: resp.ok, status: resp.status };
+    }));
+}
+
+// True ONLY for 404 whose body carries code `conversation_deleted` (under
+// `detail` or top level). 200, any other 404, errors -> false.
+async function verifyChatGptDeleted(token, conversationId, accountId) {
+  _requireDeletableId(conversationId);
+  const url = `${CHATGPT_API}/conversation/${conversationId}`;
+  return chatGptGate.run('delete', () => chatGptGate.fetchWith(
+    url, url, { credentials: 'include', headers: chatGptAuthHeaders(token, accountId) },
+    async (resp) => {
+      _throwIfRateLimited(resp);
+      if (resp.status !== 404) return false;
+      let body = null;
+      try { body = await resp.json(); } catch { return false; }
+      const code = body && ((body.detail && body.detail.code) || body.code);
+      return code === 'conversation_deleted';
+    }));
+}
+
+// The whole gated-delete flow for ChatGPT, DOM-free so it is testable. Steps:
+// refuse non-UUID ids -> fetch each body LIVE (sequential; verbatim, never
+// pruned) -> `verifyWithScry(items)` (server-authoritative) -> `confirm(info)`
+// -> delete + verify ONLY ids Scry cleared, one at a time. A 429 that outlasts
+// the retry budget stops the run (remaining ids are `notAttempted`), it is not
+// counted as failure-and-continue. `selected` = [{uuid, name}].
+async function runChatGptGatedDelete({
+  token, accountId = null, selected, verifyWithScry, confirm,
+  onProgress = () => {}, isCancelled = () => false, retry = {},
+}) {
+  const out = { refused: [], fetchFailed: [], blocked: [], cleared: [], deleted: [], failed: [],
+    notAttempted: [], rateLimited: false, cancelled: false, summary: null };
+  const label = (c) => c.name || c.uuid;
+  const eligible = [];
+  for (const c of selected) {
+    if (isDeletableChatGptId(c.uuid)) eligible.push(c);
+    else out.refused.push({ source_id: c.uuid, name: c.name, reason: 'not a plain UUID (temporary or malformed id)' });
+  }
+
+  const items = [];
+  for (let i = 0; i < eligible.length; i++) {
+    if (isCancelled()) { out.cancelled = true; return out; }
+    const c = eligible[i];
+    try {
+      const live = await withChatGptRateLimitRetry(() => fetchChatGptConversation(token, c.uuid, accountId), retry);
+      items.push({ source_id: c.uuid, live_body: live });
+    } catch (e) {
+      out.fetchFailed.push({ source_id: c.uuid, name: c.name, error: e.message || String(e) });
+      if (e instanceof ChatGptRateLimitError) {
+        out.rateLimited = true;
+        for (const rest of eligible.slice(i + 1)) out.notAttempted.push({ source_id: rest.uuid, name: rest.name });
+        break;
+      }
+    }
+    onProgress('fetch', `${i + 1}/${eligible.length} fetched`, (i + 1) / eligible.length);
+  }
+  if (items.length === 0) return out;
+
+  const report = await verifyWithScry(items);
+  const clearedSet = new Set();
+  for (const r of (report && report.results) || []) {
+    if (r.deletable) clearedSet.add(r.source_id);
+    else out.blocked.push({ source_id: r.source_id, title: r.title, reasons: r.reasons || [] });
+  }
+  out.summary = report && report.summary;
+  // Only ids we actually sent AND Scry cleared; order follows the selection.
+  const sent = new Set(items.map((it) => it.source_id));
+  const toDelete = eligible.filter((c) => sent.has(c.uuid) && clearedSet.has(c.uuid));
+  out.cleared = toDelete.map((c) => c.uuid);
+  if (toDelete.length === 0) return out;
+
+  const skipped = out.blocked.length + out.fetchFailed.length + out.refused.length;
+  if (!(await confirm({ cleared: toDelete.length, blocked: out.blocked.length,
+    fetchFailed: out.fetchFailed.length, refused: out.refused.length, skipped }))) {
+    out.cancelled = true; return out;
+  }
+
+  for (let i = 0; i < toDelete.length; i++) {
+    if (isCancelled()) { out.cancelled = true; break; }
+    const c = toDelete[i];
+    try {
+      const r = await withChatGptRateLimitRetry(() => deleteChatGptConversation(token, c.uuid, accountId), retry);
+      if (!r.ok) {
+        out.failed.push({ source_id: c.uuid, name: c.name, error: `PATCH ${r.status}` });
+      } else if (await withChatGptRateLimitRetry(() => verifyChatGptDeleted(token, c.uuid, accountId), retry)) {
+        out.deleted.push(c.uuid);
+      } else {
+        out.failed.push({ source_id: c.uuid, name: c.name,
+          error: 'delete sent but verification did not see conversation_deleted' });
+      }
+    } catch (e) {
+      if (e instanceof ChatGptRateLimitError) {
+        out.rateLimited = true;
+        out.failed.push({ source_id: c.uuid, name: c.name, error: `rate limited (${label(c)}): stopped` });
+        for (const rest of toDelete.slice(i + 1)) out.notAttempted.push({ source_id: rest.uuid, name: rest.name });
+        break;
+      }
+      out.failed.push({ source_id: c.uuid, name: c.name, error: e.message || String(e) });
+    }
+    onProgress('delete', `${out.deleted.length} deleted, ${out.failed.length} failed of ${toDelete.length}`, (i + 1) / toDelete.length);
+  }
+  return out;
+}
+
 // Node (vitest): expose the PURE surface for testing. Browser: these are globals.
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
@@ -1348,6 +1485,10 @@ if (typeof module !== 'undefined' && module.exports) {
     chatGptApiGet,
     listChatGptConversations,
     fetchChatGptConversation,
+    deleteChatGptConversation,
+    verifyChatGptDeleted,
+    isDeletableChatGptId,
+    runChatGptGatedDelete,
     CHATGPT_MIN_SPACING_MS,
     CHATGPT_COOLDOWN_SCHEDULE_MS,
     CHATGPT_COOLDOWN_RESET_MS,

@@ -294,12 +294,19 @@ function renderTabs() {
   updateActionControlsForSource();
 }
 
-// Delete-from-source is offered ONLY for Claude (the owner's ruling — Scry
-// cannot yet prove a ChatGPT capture completely enough to delete against);
-// the search placeholder names the active source for clarity.
+// Delete-from-source: Claude was the original owner ruling; ChatGPT was
+// enabled by owner ruling 2026-10-31 (Scry's verify-deletable now proves a
+// ChatGPT `mapping` capture). Each source opts in via SOURCES[s].delete.
+// The search placeholder names the active source for clarity.
+function sourceSupportsDelete(source) {
+  return Boolean(SOURCES[source] && SOURCES[source].delete);
+}
 function updateActionControlsForSource() {
   const deleteBtn = document.getElementById('deleteFromClaudeBtn');
-  if (deleteBtn) deleteBtn.style.display = activeSource === 'claude' ? '' : 'none';
+  if (deleteBtn) {
+    deleteBtn.style.display = sourceSupportsDelete(activeSource) ? '' : 'none';
+    deleteBtn.textContent = `Delete selected from ${activeSource === 'chatgpt' ? 'ChatGPT' : 'Claude'}`;
+  }
   const searchInput = document.getElementById('searchInput');
   if (searchInput) {
     searchInput.placeholder = `Search ${activeSource === 'claude' ? 'Claude' : 'ChatGPT'} conversations by title...`;
@@ -623,7 +630,7 @@ function displayConversations() {
   if (syncSelected) syncSelected.disabled = false;
   if (syncRecent) syncRecent.disabled = false;
   if (reconcile) reconcile.disabled = false;
-  if (deleteFromClaude) deleteFromClaude.disabled = activeSource !== 'claude';
+  if (deleteFromClaude) deleteFromClaude.disabled = !sourceSupportsDelete(activeSource);
 }
 
 // ===== selection =====
@@ -962,11 +969,17 @@ async function reconcileAndSyncUI() {
   );
 }
 
-// Phase 3 — the gated delete. CLAUDE ONLY (the owner's ruling; the button is
-// hidden on every other tab and this guards it too). Logic is UNCHANGED from
-// the pre-phase-3 page: fetch each selected conversation's body LIVE from
-// Claude, ask Scry's verify-deletable gate which are cleared, confirm, then
-// delete only the cleared ids.
+// Phase 3 — the gated delete. Claude was the original owner ruling; ChatGPT
+// was enabled by owner ruling 2026-10-31 (deleteSelectedFromChatGpt below). The
+// button is hidden on any source without SOURCES[s].delete and each flow
+// guards itself. Claude logic is UNCHANGED from the pre-phase-3 page: fetch
+// each selected conversation's body LIVE from Claude, ask Scry's
+// verify-deletable gate which are cleared, confirm, then delete only the
+// cleared ids.
+function deleteSelected() {
+  return activeSource === 'chatgpt' ? deleteSelectedFromChatGpt() : deleteSelectedFromClaude();
+}
+
 async function deleteSelectedFromClaude() {
   if (activeSource !== 'claude') return;
 
@@ -1080,6 +1093,106 @@ async function deleteSelectedFromClaude() {
       ? `Deleted ${deleted}/${toDelete.length} from Claude — ${failed} failed (see console)`
       : `Deleted ${deleted} from Claude ✓ (Scry keeps the copy)`,
     failed > 0,
+  );
+}
+
+// ChatGPT's gated delete (owner ruling 2026-10-31). The orchestration lives in
+// chatgpt_adapter.js (runChatGptGatedDelete: sequential live body fetch through
+// the 429-aware gate, Scry's verify-deletable gate with source_type chatgpt,
+// delete + verify ONLY cleared ids). This function is just the page chrome.
+async function deleteSelectedFromChatGpt() {
+  if (activeSource !== 'chatgpt') return;
+
+  const scry = await loadScrySettings();
+  if (!scry.url) { showToast('Set your Scry URL in Options first', true); return; }
+  if (!(await ensureScryPermission(scry.url))) { showToast('Host permission for Scry was declined', true); return; }
+
+  const selected = (sourceItems.chatgpt || []).filter((c) => selectedConversations.has(c.uuid));
+  if (selected.length === 0) {
+    showToast('Select the conversation(s) to delete first (checkbox)', true);
+    return;
+  }
+
+  const progressModal = document.getElementById('progressModal');
+  const progressBar = document.getElementById('progressBar');
+  const progressText = document.getElementById('progressText');
+  const progressStats = document.getElementById('progressStats');
+  progressBar.style.width = '0%';
+  progressStats.textContent = '';
+  progressText.textContent = `Verifying ${selected.length} conversation(s) live against Scry…`;
+  progressModal.style.display = 'block';
+
+  let cancelled = false;
+  document.getElementById('cancelExport').onclick = () => {
+    cancelled = true; progressModal.style.display = 'none'; showToast('Delete cancelled', true);
+  };
+
+  let out;
+  try {
+    const token = sourceCtx.chatgpt.token || await getChatGptAccessToken();
+    sourceCtx.chatgpt.token = token;
+    out = await runChatGptGatedDelete({
+      token,
+      selected: selected.map((c) => ({ uuid: c.uuid, name: c.name || c.title })),
+      verifyWithScry: (items) => verifyDeletableWithScry(scry, items, 'chatgpt'),
+      isCancelled: () => cancelled,
+      onProgress: (phase, text, frac) => {
+        progressText.textContent = phase === 'delete'
+          ? 'Deleting from ChatGPT…' : `Verifying ${selected.length} conversation(s) live against Scry…`;
+        progressBar.style.width = `${Math.round(frac * 100)}%`;
+        progressStats.textContent = text;
+      },
+      confirm: async (info) => {
+        progressModal.style.display = 'none';
+        const msg =
+          `Permanently delete ${info.cleared} conversation(s) from ChatGPT?\n\n` +
+          `Each is verified fully captured in Scry — its live body still matches the ` +
+          `stored archive.\n\n` +
+          (info.skipped > 0
+            ? `${info.skipped} selected were NOT cleared (${info.blocked} blocked, ` +
+              `${info.fetchFailed} fetch-failed, ${info.refused} refused id) and will be SKIPPED — see console.\n\n`
+            : '') +
+          `This CANNOT be undone at ChatGPT. Scry keeps its copy.`;
+        const ok = window.confirm(msg);
+        if (ok) {
+          progressText.textContent = `Deleting ${info.cleared} from ChatGPT…`;
+          progressBar.style.width = '0%';
+          progressStats.textContent = '';
+          progressModal.style.display = 'block';
+        }
+        return ok;
+      },
+    });
+  } catch (e) {
+    progressModal.style.display = 'none';
+    console.error('ChatGPT delete flow failed', e);
+    showToast(`Delete failed: ${e.message}`, true);
+    return;
+  }
+  progressModal.style.display = 'none';
+  if (cancelled) return;
+
+  console.log('ChatGPT delete gate summary:', out.summary, '\ncleared:', out.cleared,
+              '\nblocked:', out.blocked, '\nfetch failures:', out.fetchFailed, '\nrefused:', out.refused);
+  if (out.failed.length) console.warn('ChatGPT delete failures:', out.failed);
+  if (out.notAttempted.length) console.warn('ChatGPT delete not attempted (rate limited):', out.notAttempted);
+
+  if (out.cleared.length === 0) {
+    showToast(`0 cleared for deletion — ${out.blocked.length} blocked, ${out.fetchFailed.length} fetch-failed, ${out.refused.length} refused (see console)`, true);
+    return;
+  }
+  if (out.cancelled && out.deleted.length === 0 && out.failed.length === 0) { showToast('Delete cancelled'); return; }
+
+  for (const id of out.deleted) selectedConversations.delete(id);
+  if (out.deleted.length > 0) await loadSourceWithErrorHandling('chatgpt');
+  const bad = out.failed.length;
+  const waiting = out.notAttempted.length;
+  showToast(
+    bad > 0 || waiting > 0
+      ? `Deleted ${out.deleted.length}/${out.cleared.length} from ChatGPT — ${bad} failed` +
+        (waiting > 0 ? `, ${waiting} not attempted (rate limited — try again later)` : '') + ' (see console)'
+      : `Deleted ${out.deleted.length} from ChatGPT ✓ (verified gone; Scry keeps the copy)`,
+    bad > 0 || waiting > 0,
   );
 }
 
@@ -1268,5 +1381,5 @@ function setupEventListeners() {
   if (reconcileBtn) reconcileBtn.addEventListener('click', () => reconcileAndSyncUI());
 
   const deleteFromClaudeBtn = document.getElementById('deleteFromClaudeBtn');
-  if (deleteFromClaudeBtn) deleteFromClaudeBtn.addEventListener('click', () => deleteSelectedFromClaude());
+  if (deleteFromClaudeBtn) deleteFromClaudeBtn.addEventListener('click', () => deleteSelected());
 }
