@@ -48,7 +48,7 @@ function makeGate(extra = {}) {
 
 describe('constants', () => {
   it('are the designed values, in one place', () => {
-    expect(CHATGPT_MIN_SPACING_MS).toEqual({ list: 400, body: 1000, asset: 750 });
+    expect(CHATGPT_MIN_SPACING_MS).toEqual({ list: 400, body: 1000, asset: 750, delete: 1000 });
     expect(CHATGPT_COOLDOWN_SCHEDULE_MS).toEqual([60000, 120000, 240000, 480000, 900000]);
     expect(CHATGPT_IMAGE_POOL_DEFAULT).toBe(2);
   });

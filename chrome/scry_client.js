@@ -367,13 +367,13 @@ async function reconcileStatusWithScry(scry, items, sourceType = 'claude', chunk
 // fresh, content-level proof the other checks (Scry-internal / trusts-archive /
 // stale snapshot) can't give. Server-authoritative: we delete ONLY what this
 // returns as deletable. Returns { summary, results:[{source_id, deletable, ...}] }.
-async function verifyDeletableWithScry(scry, items) {
+async function verifyDeletableWithScry(scry, items, sourceType = 'claude') {
   const url = `${scry.url.replace(/\/+$/, '')}/api/conversations/verify-deletable`;
   const headers = { 'Content-Type': 'application/json' };
   if (scry.token) headers['Authorization'] = `Bearer ${scry.token}`;
   const resp = await fetch(url, {
     method: 'POST', headers,
-    body: JSON.stringify({ source_type: 'claude', conversations: items }),
+    body: JSON.stringify({ source_type: sourceType, conversations: items }),
   });
   if (!resp.ok) throw new Error(`verify-deletable HTTP ${resp.status}`);
   return resp.json();
@@ -447,7 +447,7 @@ async function syncOneConversation(orgId, conversationUuid, scry) {
 // which needs global.fetch/chrome.* stubbed — see tests/org_detect.test.js).
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    conversationBodyIsStub, partitionDeletableReport, reconcileWithScry,
+    conversationBodyIsStub, partitionDeletableReport, verifyDeletableWithScry, reconcileWithScry,
     fetchConversationFileBlobs, chunkIds, mergeReconcileReports, reconcileStatusWithScry,
     selectClaudeOrgId, detectClaudeOrgId,
     formatRelativeTime, formatSourceStatus, getContinuousSyncStates,

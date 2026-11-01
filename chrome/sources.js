@@ -144,6 +144,7 @@ function classifyStubAfterReconcile(report, uuid) {
 const SOURCES = {
   claude: {
     name: 'claude',
+    delete: true, // gated delete-from-source (browse.js)
     stateKey: 'continuousSync',
     // Two gates, parallel to chatgpt: claudeEnabled (the source on/off,
     // DEFAULT ON when absent so existing installs keep working) AND the
@@ -163,6 +164,7 @@ const SOURCES = {
   },
   chatgpt: {
     name: 'chatgpt',
+    delete: true, // enabled by owner ruling 2026-10-31 (browse.js)
     stateKey: 'continuousSync:chatgpt',
     // Two gates, unlike claude's single default-on toggle: chatgptEnabled
     // (DEFAULT FALSE when absent — an existing install must not start hitting
