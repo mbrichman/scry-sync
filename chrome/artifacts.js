@@ -603,13 +603,14 @@ async function postScryArtifact(scry, payload) {
 
 // ===================== IMPURE: capture one artifact =====================
 
-// Did Scry's ingest answer say the preview image was not stored? The reply
-// shape is defensive: any of these signals counts.
+// Did Scry's ingest answer say the preview image was not stored? Scry (PR #349)
+// replies png: {status: 'rejected', reason, http_status}; the other signals are
+// kept defensively.
 function artifactPngRejected(body) {
   if (!body || typeof body !== 'object') return false;
   const p = body.png;
   return body.png_rejected === true || body.png_stored === false || body.has_png === false
-    || Boolean(p && typeof p === 'object' && (p.rejected === true || p.stored === false || p.accepted === false));
+    || Boolean(p && typeof p === 'object' && (p.status === 'rejected' || p.rejected === true || p.stored === false || p.accepted === false));
 }
 
 function _clientVersion() {

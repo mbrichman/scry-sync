@@ -547,13 +547,16 @@ describe('contract fixes (server review)', () => {
   it('rejected-png detection', () => {
     expect(A.artifactPngRejected({ success: true, png_stored: false })).toBe(true);
     expect(A.artifactPngRejected({ png: { rejected: true } })).toBe(true);
+    // Scry's actual ingest reply (PR #349): png outcome carries status 'rejected'.
+    expect(A.artifactPngRejected({ success: true, png: { status: 'rejected', reason: 'not_image', http_status: 415 } })).toBe(true);
+    expect(A.artifactPngRejected({ success: true, png: { status: 'stored' } })).toBe(false);
     expect(A.artifactPngRejected({ success: true })).toBe(false);
     expect(A.artifactPngRejected(null)).toBe(false);
   });
   it('a rejected preview marks the thumbnail tried, so missing_png is not retried', async () => {
     const net = setupNetwork();
     const f = global.fetch;
-    global.fetch = vi.fn(async (u, i) => (String(u).endsWith('/api/artifacts/ingest') ? (net.ingests.push(JSON.parse(i.body)), mkResp(200, { success: true, png_stored: false })) : f(u, i)));
+    global.fetch = vi.fn(async (u, i) => (String(u).endsWith('/api/artifacts/ingest') ? (net.ingests.push(JSON.parse(i.body)), mkResp(200, { success: true, png: { status: 'rejected', reason: 'not_image', http_status: 415 } })) : f(u, i)));
     const pngTried = {};
     await A.runArtifactCollector({ gate: fastGate(), orgId: 'org', scry, tabs: mkTabs(() => {}), session: QUICK, sleep: async () => {}, pngTried });
     expect(pngTried[ID1]).toBeTypeOf('number');   // ID1 had a thumbnail that was sent
