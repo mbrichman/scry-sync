@@ -13,7 +13,8 @@ Chrome extension (MV3, `chrome/`) that pushes Claude.ai and ChatGPT conversation
 - `chrome/sync_core.js` — the shared sync core: `syncBatch`/`reconcileAndSync`, the ONE implementation of "sync a batch for a source", used by the dashboard, the popup, and the continuous engine. `syncBatch`'s `opts.onStatus` is attached to `ctx.onStatus` for the call's duration.
 - `chrome/dashboard_model.js` — pure model behind the unified dashboard: which source tabs to show (`visibleSourceTabs`), tab labels (`tabLabel`), row mapping (`toRow`), the synced-status badge (`badgeFromReconcile`), and the popup's site-detection helper (`detectSyncTarget`).
 - `chrome/continuous_sync.js` — the background engine: pure planning/state machine + `runAllContinuousSyncs`. Loaded by `background.js` via `importScripts` (order matters: `utils`, `scry_sync`, `scry_client`, `chatgpt_adapter`, `sources`, `sync_core`, `continuous_sync`).
-- `chrome/background.js` — alarms (15-min incremental, daily deep reconcile).
+- `chrome/background.js` — alarms (15-min incremental, daily deep reconcile, daily artifact collector `scry-artifacts`).
+- `chrome/artifacts.js` — the artifact collector: pure planner (`planArtifact*`), manifest/payload builders, download strategies, db-capture session, then the impure collector/diagnostics/job runner (`runArtifactsJob`, status in `chrome.storage.local.artifactsRun`). Loaded by `background.js` after `continuous_sync`; reuses `createChatGptGate` for its request gate. `artifact_capture_main.js` / `artifact_capture_relay.js` are the content scripts on `claude.ai/artifact/*` (MAIN-world fetch wrapper -> nonce'd postMessage -> relay -> background `handleArtifactDbMessage`); `artifacts_ui.js` is the Options page glue (enable checkbox, Collect now, Artifacts: test capture, Copy).
 - `chrome/browse.*` — the unified dashboard (one page, a tab per visible source: Claude always on, ChatGPT only when enabled in Options and not signed out of chatgpt.com). Claude enumeration is a direct credentialed fetch (`listClaudeConversations`/`detectClaudeOrgId`), not a claude.ai tab relay. Load order: `utils`, `scry_sync`, `scry_client`, `chatgpt_adapter`, `sources`, `sync_core`, `dashboard_model`, `browse`.
 - `chrome/popup.*` — site-aware sync: detects claude.ai vs. chatgpt.com from the active tab (`dashboard_model.detectSyncTarget`) and syncs via `SOURCES[source].syncOne`. Load order: `popup-theme`, `utils`, `scry_sync`, `scry_client`, `chatgpt_adapter`, `sources`, `dashboard_model`, `popup`.
 - `chrome/options.*` — Scry connection (URL/token/concurrency, its own Save) + a Sources block (Claude: org id auto-detected/editable + continuous sync; ChatGPT: enable + continuous sync — each Sources checkbox persists itself immediately via `mergeScrySetting`, no separate Save step) + Backup & Restore + Model Display (Claude only).
@@ -33,6 +34,12 @@ Chrome extension (MV3, `chrome/`) that pushes Claude.ai and ChatGPT conversation
 - **Test-first** for pure helpers; when a fetcher is involved, stub `global.fetch` as `tests/chatgpt_adapter.test.js` does. Mutation-check new tests (revert the product line, confirm the test fails).
 - **Commit/push only when asked.** PRs need the same dual clearance as the `scry` repo (code-reviewer + Oracle GATE) before merge. Record merges and reversals in the scry decision trace.
 - Keep `docs/CHANGELOG.md` current (one `## [X.Y.Z]` entry per version) and move finished items in `docs/TODO.md`.
+
+## Artifacts (claude.ai `/api/frame/*`)
+
+- Every `/api/frame/*` request needs cookies + exactly one extra header `x-frame-cp: go` (else 404). Typed artifacts (files under `artifact-type/`) are stored as db rows + PNG, **never** re-created; the vendor app bytes are never uploaded (manifest still lists them). The page db token is negotiated inside the artifact frame and cannot be minted by the extension, so rows come from a background-tab capture of the parent page's own db calls. Never log artifact titles, contents, bytes or any token (asset/frame/consent/sync).
+- File-download method, thumbnail fetchability from the background and tab capture were UNVERIFIED at v3.6.0: run **Artifacts: test capture** before enabling the daily run, and record the answer here.
+- Artifact collection is off by default (`scry.artifactsEnabled === true` to run on the alarm).
 
 ## Live-measured facts worth not re-deriving
 

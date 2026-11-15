@@ -1,8 +1,8 @@
 {
     "manifest_version": 3,
     "name": "Scry Sync",
-    "version": "3.5.0",
-    "description": "Sync your Claude.ai and ChatGPT conversations (with images and file originals) into Scry.",
+    "version": "3.6.0",
+    "description": "Sync your Claude.ai and ChatGPT conversations (with images and file originals), and your claude.ai artifacts, into Scry.",
       "permissions": [
     "activeTab",
     "storage",
@@ -15,7 +15,8 @@
       "https://chatgpt.com/*",
       "https://chat.openai.com/*",
       "https://*.oaiusercontent.com/*",
-      "https://images.openai.com/*"
+      "https://images.openai.com/*",
+      "https://*.frame.claudeusercontent.com/*"
     ],
     "optional_host_permissions": [
       "http://*/*",
@@ -34,6 +35,17 @@
       "matches": ["https://claude.ai/*"],
       "js": ["content.js"],
       "css": ["content.css"]
+    },
+    {
+      "matches": ["https://claude.ai/artifact/*"],
+      "js": ["artifact_capture_main.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://claude.ai/artifact/*"],
+      "js": ["artifact_capture_relay.js"],
+      "run_at": "document_start"
     }
   ],
     "background": {

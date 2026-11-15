@@ -1,5 +1,15 @@
 # Changelog
 
+## [3.6.0] — Artifact collector
+
+- New: captures the owner's claude.ai **artifacts** (the `/api/frame/*` surface) and pushes them to Scry (`GET /api/artifacts/state`, `POST /api/artifacts/ingest`). HTML/SVG/markdown/code pages are stored verbatim; typed artifacts (vendor "Whiteboard" etc.) are stored as their database rows plus a thumbnail PNG, never re-created. The vendor app under `artifact-type/` is listed in the manifest but its bytes are never uploaded; files over 25 MB are recorded in `fetch_report`; every file's sha256 is verified against the vendor's before sending (mismatch is not sent, and is reported).
+- New `chrome/artifacts.js` (pure planner/payload/strategy helpers + the collector). Requests go through one gate (the ChatGPT gate machinery: >= 1 s apart, shared 429 cooldown, a second 429 aborts the run). Sequential; at most one background tab at a time.
+- **Typed artifacts**: the extension opens the artifact's `open_url` in a background tab (inactive), and two content scripts on `https://claude.ai/artifact/*` (`artifact_capture_main.js` MAIN world, `artifact_capture_relay.js` isolated) record the parent page's own `/api/frame/db/*/call` query responses (collection + docs only, never the request token). The tab is always closed; capture ends after ~5 s without a db call (20 s if none arrive) or 45 s.
+- **Schedule**: its own daily `chrome.alarms` alarm (`scry-artifacts`, first fire 45 min after registration, registered only if absent), skipped while a continuous-sync wake is running. **Off by default**: Options > Artifacts > "Collect artifacts once a day". A manual **Collect artifacts now** button sits beside it.
+- **Artifacts: test capture** (Options > Artifacts): a dry run (list, detail, one file download per strategy, thumbnail, one typed artifact's tab capture) that pushes nothing and prints only counts, HTTP statuses, content types, byte sizes and which download strategy worked, with a Copy button.
+- manifest: new host permission `https://*.frame.claudeusercontent.com/*` and the two content scripts. **Chrome/Brave asks the owner to re-approve the extension after this update.**
+- **Unverified when written** (the test capture exists to settle them): how page files are downloaded (strategies tried in order: `__frame_t=<assetToken>` query, with/without cookies, `Authorization: Bearer`, `x-frame-t` header), whether the thumbnail is fetchable from the background, and whether the background-tab capture sees the db calls.
+
 ## [3.5.0] — Self-configures from a bundled scry-config.json
 
 - The Scry installer can drop `chrome/scry-config.json` (`{"url": "...", "token": "..."}`) next to `manifest.json`. On install and on every service-worker startup, if no Scry URL and token are stored, the extension reads that file and seeds the `scry` settings (trailing slashes stripped; other `scry` keys preserved). A missing or invalid file is ignored silently (normal unbundled install).

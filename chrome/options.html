@@ -287,6 +287,24 @@
   </div>
 
   <div class="section">
+    <h3>Artifacts</h3>
+    <p>Captures your claude.ai artifacts (HTML/SVG pages stored as-is; typed artifacts such as Whiteboard as their database rows plus a preview image) and pushes them to Scry.</p>
+    <label for="scryArtifactsEnabled" style="display: flex; align-items: center; gap: 8px;">
+      <input type="checkbox" id="scryArtifactsEnabled" style="margin: 0;">
+      Collect artifacts once a day
+    </label>
+    <span class="settings-saved" id="scryArtifactsEnabledSaved" style="font-size: 12px; color: var(--success-text); display: none;">Saved</span>
+    <div class="example">Off by default. Run <strong>Artifacts: test capture</strong> first. A daily run opens one background claude.ai tab at a time for each typed artifact, then closes it. Requests are spaced at least 1 second apart.</div>
+    <div class="button-row">
+      <button id="artifactsCollectBtn">Collect artifacts now</button>
+      <button id="artifactsDiagBtn">Artifacts: test capture</button>
+      <button id="artifactsCopyBtn">Copy result</button>
+    </div>
+    <div class="example">The test capture pushes nothing to Scry. Its result lists only counts, HTTP statuses, content types, byte sizes and which download method worked.</div>
+    <pre id="artifactsOutput" class="status" style="white-space: pre-wrap; user-select: all;"></pre>
+  </div>
+
+  <div class="section">
     <h3>Backup &amp; Restore</h3>
     <p>Save the extension's data — model snapshots, export history, and preferences — to a file you can restore later. Useful before uninstalling, or to move your data to another browser, device, or extension build.</p>
     <button id="backupBtn" style="margin-right: 8px;">Export Backup</button>
@@ -340,6 +358,7 @@
   </div>
 
   <script src="utils.js"></script>
+  <script src="artifacts_ui.js"></script>
   <script src="options.js"></script>
 </body>
 </html>
