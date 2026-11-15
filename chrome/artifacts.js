@@ -21,6 +21,11 @@ const ARTIFACT_ALARM_DELAY_MIN = 45;      // off the 15-min / daily sync wakes
 const ARTIFACT_ALARM_PERIOD_MIN = 1440;
 const ARTIFACT_RUN_KEY = 'artifactsRun';  // chrome.storage.local: status the options page renders
 const ARTIFACT_PNG_TRIED_KEY = 'artifactsPngTried';
+const ARTIFACT_TOO_LARGE_KEY = 'artifactsTooLarge';
+// Scry caps one ingest request (db/services/claude_artifact_service.py): 200 MB, 500 files.
+const ARTIFACT_MAX_REQUEST_BYTES = 190 * 1024 * 1024;   // safety margin under 200 MB
+const ARTIFACT_MAX_REQUEST_FILES = 500;
+const ARTIFACT_TOO_LARGE_RETRY_MS = 7 * 24 * 3600 * 1000;
 const ARTIFACT_RUN_STALE_MS = 2 * 3600 * 1000;
 const ARTIFACT_DB_FIRST_CALL_MS = 20000;
 const ARTIFACT_DB_IDLE_MS = 5000;
@@ -338,6 +343,7 @@ function createArtifactDbSession(opts = {}) {
 function formatArtifactRunSummary(s) {
   if (!s) return '';
   const parts = [`listed ${s.listed || 0}`, `captured ${s.captured || 0}`, `skipped ${s.skipped || 0}`, `failed ${s.failed || 0}`];
+  if (s.too_large && s.too_large.length) parts.push(`too_large ${s.too_large.length}`);
   if (s.aborted) parts.push(`aborted: ${s.aborted}`);
   return parts.join(' | ');
 }
@@ -377,6 +383,22 @@ class ArtifactAbort extends Error {
   constructor(reason) { super(`artifact run aborted: ${reason}`); this.name = 'ArtifactAbort'; this.reason = reason; }
 }
 class _ArtifactRateLimited extends Error {}
+class ArtifactTooLarge extends Error {
+  constructor(reason) { super(`artifact too large: ${reason}`); this.name = 'ArtifactTooLarge'; this.reason = reason; }
+}
+
+// Encoded request size estimate: base64 per file + JSON for the rest.
+function estimateArtifactRequestBytes({ fileSizes = [], extraJson = 0 }) {
+  let n = 4096 + extraJson;
+  for (const sz of fileSizes) n += Math.ceil((Number(sz) || 0) / 3) * 4 + 200;
+  return n;
+}
+
+// Remembered "too large" artifacts retry after 7 days, or at once if updated_at changed.
+function artifactTooLargeBackoffActive(map, item, now) {
+  const e = map && map[item.id];
+  return Boolean(e && e.updated_at === (item.updated_at || null) && typeof e.at === 'number' && now - e.at < ARTIFACT_TOO_LARGE_RETRY_MS);
+}
 
 // One serialized, spaced, cooling-down gate for every claude.ai / frame request:
 // the ChatGPT gate's machinery (>=1 s between starts, shared 429 cooldown with
@@ -633,6 +655,9 @@ async function captureOneArtifact(ctx, item, knownDetail) {
   const sel = selectArtifactFiles(detail.files);
   report.vendor_files_skipped = sel.vendor;
   report.oversize = sel.oversize;
+  // Before downloading anything: the manifest sizes already say whether it can fit.
+  if (sel.upload.length + 1 > ARTIFACT_MAX_REQUEST_FILES) throw new ArtifactTooLarge('too_large');
+  if (estimateArtifactRequestBytes({ fileSizes: sel.upload.map((f) => f.size), extraJson: JSON.stringify(manifest).length }) > ARTIFACT_MAX_REQUEST_BYTES) throw new ArtifactTooLarge('too_large');
 
   const out = [];
   let mainContentType = null;
@@ -696,8 +721,13 @@ async function captureOneArtifact(ctx, item, knownDetail) {
   }
 
   const payload = buildArtifactPayload({ item, detail, manifest, type, files: out, db, comments, png, fetchReport: report });
+  if (out.length + (png ? 1 : 0) > ARTIFACT_MAX_REQUEST_FILES) throw new ArtifactTooLarge('too_large');
+  const actual = out.reduce((a, f) => a + f.data_b64.length + 200, 0) + (png ? png.data_b64.length : 0)
+    + JSON.stringify([manifest, db, comments, report]).length + 4096;
+  if (actual > ARTIFACT_MAX_REQUEST_BYTES) throw new ArtifactTooLarge('too_large');
   let resp = await postScryArtifact(scry, payload);
   if (!resp.ok && resp.status >= 500) resp = await postScryArtifact(scry, payload);
+  if (resp.status === 413) throw new ArtifactTooLarge('too_large_server');
   if (!resp.ok) throw new Error(`artifact ingest HTTP ${resp.status}`);
   // A rejected preview must not make the planner re-capture as missing_png every run.
   if (png && artifactPngRejected(resp.body) && ctx.pngTried) ctx.pngTried[item.id] = ctx.now();
@@ -710,11 +740,11 @@ async function runArtifactCollector(deps) {
   const ctx = {
     gate: deps.gate || createArtifactGate(), orgId: deps.orgId, scry: deps.scry,
     tabs: deps.tabs, sleep: deps.sleep, keepalive: deps.keepalive, session: deps.session, scripting: deps.scripting,
-    now: deps.now || Date.now, pngTried: deps.pngTried || {}, strategy: null,
+    now: deps.now || Date.now, pngTried: deps.pngTried || {}, tooLarge: deps.tooLarge || {}, strategy: null,
   };
   const progress = deps.onProgress || (() => {});
   ctx.gate.resetRun();
-  const sum = { listed: 0, captured: 0, skipped: 0, failed: 0, aborted: null, errors: [] };
+  const sum = { listed: 0, captured: 0, skipped: 0, failed: 0, too_large: [], aborted: null, errors: [] };
   try {
     progress('listing artifacts');
     const { items, meta } = await fetchArtifactList(ctx.gate, ctx.orgId);
@@ -742,11 +772,22 @@ async function runArtifactCollector(deps) {
     for (const t of todo) {
       n++;
       progress(`capturing ${n}/${todo.length}`);
+      const it = byId.get(t.id);
+      if (artifactTooLargeBackoffActive(ctx.tooLarge, it, ctx.now())) {
+        sum.too_large.push({ id: t.id, reason: ctx.tooLarge[t.id].reason, backoff: true });
+        continue;
+      }
       try {
         await captureOneArtifact(ctx, byId.get(t.id), details.get(t.id) || null);
         sum.captured++;
+        delete ctx.tooLarge[t.id];
       } catch (e) {
         if (e instanceof ArtifactAbort) throw e;
+        if (e instanceof ArtifactTooLarge) {
+          ctx.tooLarge[t.id] = { updated_at: it.updated_at || null, at: ctx.now(), reason: e.reason };
+          sum.too_large.push({ id: t.id, reason: e.reason });
+          continue;
+        }
         sum.failed++;
         sum.errors.push({ id: t.id, reason: (e && e.message) || 'error' });
         console.warn(`Scry artifacts: capture failed for ${t.id}: ${(e && e.message) || 'error'}`);
@@ -883,10 +924,12 @@ async function runArtifactsJob(mode, { scheduled = false } = {}) {
       await write({ state: 'done', finishedAt: Date.now(), text: formatArtifactDiagnostics(d) });
     } else {
       const pngTried = (await _storageGet([ARTIFACT_PNG_TRIED_KEY]))[ARTIFACT_PNG_TRIED_KEY] || {};
-      const sum = await runArtifactCollector({ orgId, scry, tabs: chrome.tabs, keepalive, onProgress, pngTried });
-      await _storageSet({ [ARTIFACT_PNG_TRIED_KEY]: pngTried });
+      const tooLarge = (await _storageGet([ARTIFACT_TOO_LARGE_KEY]))[ARTIFACT_TOO_LARGE_KEY] || {};
+      const sum = await runArtifactCollector({ orgId, scry, tabs: chrome.tabs, keepalive, onProgress, pngTried, tooLarge });
+      await _storageSet({ [ARTIFACT_PNG_TRIED_KEY]: pngTried, [ARTIFACT_TOO_LARGE_KEY]: tooLarge });
       const lines = [formatArtifactRunSummary(sum)];
       for (const e of sum.errors.slice(0, 10)) lines.push(`  ${e.id || '-'}: ${e.reason}`);
+      for (const e of (sum.too_large || []).slice(0, 10)) lines.push(`  ${e.id}: ${e.reason}${e.backoff ? ' (backoff)' : ''}`);
       console.log(`Scry artifacts: ${formatArtifactRunSummary(sum)}`);
       await write({ state: 'done', finishedAt: Date.now(), text: lines.join('\n'), summary: { ...sum, errors: undefined } });
     }
@@ -910,6 +953,7 @@ if (typeof module !== 'undefined' && module.exports) {
     ARTIFACT_VENDOR_PREFIX, ARTIFACT_MAX_FILE_BYTES, ARTIFACT_ALARM, ARTIFACT_RETRY_ALARM, ARTIFACT_RUN_KEY, runArtifactsJob, registerArtifactCaptureScripts, unregisterArtifactCaptureScripts,
     artifactIsVendorPath, buildArtifactManifest, selectArtifactFiles, artifactMainFile, inferArtifactType,
     extractArtifactCursor, normalizeArtifactList, artifactManifestChanged, planArtifact, planArtifactCaptures,
+    ArtifactTooLarge, estimateArtifactRequestBytes, artifactTooLargeBackoffActive, ARTIFACT_MAX_REQUEST_BYTES,
     artifactBytesToBase64, artifactNormalizeSha, artifactPngRejected, artifactSha256Hex, artifactShaMatches, prepareArtifactFile, buildArtifactPayload,
     artifactViewerOrigin, artifactIsFrameHost, buildArtifactDownloadStrategies, createArtifactDbSession,
     formatArtifactRunSummary, formatArtifactDiagnostics, artifactTabUrl,

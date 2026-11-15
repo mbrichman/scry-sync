@@ -567,3 +567,69 @@ describe('contract fixes (server review)', () => {
     expect(net.ingests.find((x) => x.artifact.id === ID1).fetch_report.thumbnail.content_type).toBe('image/png');
   });
 });
+
+describe('request caps (200 MB / 500 files)', () => {
+  const origFetch0 = global.fetch;
+  afterEach(() => { global.fetch = origFetch0; });
+  const run = (tooLarge = {}, now = Date.now) => A.runArtifactCollector({ gate: fastGate(), orgId: 'org', scry, tabs: mkTabs(() => {}), session: QUICK, sleep: async () => {}, pngTried: {}, tooLarge, now });
+
+  it('over-size by manifest: no file download, no POST, remembered', async () => {
+    const net = setupNetwork();
+    const f = global.fetch;
+    const big = Array.from({ length: 8 }, (_, i) => ({ path: `f${i}.bin`, size: 24 * 1024 * 1024, contentType: 'application/octet-stream', sha256: 'aa' }));
+    global.fetch = vi.fn(async (u, i) => (String(u).startsWith(`https://claude.ai/api/frame/${ID1}?`)
+      ? mkResp(200, { ver: 'v1', viewerOrigin: `https://${ID1}.frame.claudeusercontent.com`, assetToken: 'T', files: big }) : f(u, i)));
+    const tooLarge = {};
+    const sum = await run(tooLarge);
+    expect(sum.too_large.find((x) => x.id === ID1).reason).toBe('too_large');
+    expect(net.ingests.find((p) => p.artifact.id === ID1)).toBeUndefined();
+    expect(net.calls.some((c) => c.url.includes(`${ID1}.frame`) && c.url.includes('/_f/'))).toBe(false);
+    expect(tooLarge[ID1]).toMatchObject({ updated_at: 'u1', reason: 'too_large' });
+    expect(sum.failed).toBe(0);
+    expect(A.formatArtifactRunSummary(sum)).toContain('too_large 1');
+  });
+
+  it('over-count (600 small files): skipped without POST', async () => {
+    const net = setupNetwork();
+    const f = global.fetch;
+    const many = Array.from({ length: 600 }, (_, i) => ({ path: `f${i}.txt`, size: 10, contentType: 'text/plain', sha256: 'aa' }));
+    global.fetch = vi.fn(async (u, i) => (String(u).startsWith(`https://claude.ai/api/frame/${ID1}?`)
+      ? mkResp(200, { ver: 'v1', viewerOrigin: `https://${ID1}.frame.claudeusercontent.com`, assetToken: 'T', files: many }) : f(u, i)));
+    const sum = await run();
+    expect(sum.too_large.map((x) => x.id)).toContain(ID1);
+    expect(net.ingests.find((p) => p.artifact.id === ID1)).toBeUndefined();
+  });
+
+  it('server 413 -> too_large_server, not a failure, remembered', async () => {
+    setupNetwork();
+    const f = global.fetch;
+    global.fetch = vi.fn(async (u, i) => (String(u).endsWith('/api/artifacts/ingest') ? mkResp(413, {}) : f(u, i)));
+    const tooLarge = {};
+    const sum = await run(tooLarge);
+    expect(sum.failed).toBe(0);
+    expect(sum.too_large.map((x) => x.reason)).toEqual(['too_large_server', 'too_large_server']);
+    expect(tooLarge[ID1].reason).toBe('too_large_server');
+  });
+
+  it('backoff skips (no requests for it) until 7 days or a changed updated_at', async () => {
+    const net = setupNetwork();
+    const t0 = 1_000_000_000_000;
+    const mk = (updated_at, at) => ({ [ID1]: { updated_at, at, reason: 'too_large' }, [ID2]: { updated_at: 'u2', at, reason: 'too_large' } });
+    let sum = await run(mk('u1', t0), () => t0 + 86400000);
+    expect(sum.too_large.every((x) => x.backoff)).toBe(true);
+    expect(net.ingests).toHaveLength(0);
+    expect(net.calls.some((c) => c.url.startsWith(`https://claude.ai/api/frame/${ID1}?`))).toBe(false);
+    // expiry
+    sum = await run(mk('u1', t0), () => t0 + 8 * 86400000);
+    expect(sum.captured).toBe(2);
+    // changed updated_at retries even inside the window
+    net.ingests.length = 0;
+    sum = await run(mk('OLD', t0), () => t0 + 1000);
+    expect(sum.captured).toBe(1);
+    expect(net.ingests.map((p) => p.artifact.id)).toEqual([ID1]);
+  });
+
+  it('a normal artifact is unaffected', () => {
+    expect(A.estimateArtifactRequestBytes({ fileSizes: [3000] })).toBeLessThan(A.ARTIFACT_MAX_REQUEST_BYTES);
+  });
+});
