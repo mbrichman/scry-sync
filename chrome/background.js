@@ -9,7 +9,7 @@
 // classifyStubAfterReconcile as a global) and before continuous_sync.js
 // (which resolves SOURCES/SOURCE_ORDER the same way); sync_core.js MUST load
 // before continuous_sync.js (which resolves syncBatch/reconcileAndSync).
-importScripts('bundled_config.js', 'utils.js', 'scry_sync.js', 'scry_client.js', 'chatgpt_adapter.js', 'sources.js', 'sync_core.js', 'continuous_sync.js');
+importScripts('bundled_config.js', 'utils.js', 'scry_sync.js', 'scry_client.js', 'chatgpt_adapter.js', 'sources.js', 'sync_core.js', 'continuous_sync.js', 'artifacts.js');
 
 // Self-configure from a bundled scry-config.json (Scry installer). No-op unless
 // no url/token is stored. Runs on install and on every worker startup.
@@ -37,8 +37,33 @@ function registerContinuousSyncAlarms() {
 chrome.runtime.onStartup.addListener(registerContinuousSyncAlarms);
 chrome.runtime.onInstalled.addListener(registerContinuousSyncAlarms);
 
+// Artifact collector: its own daily alarm (45 min after first registration, so
+// it does not land on the 15-min / daily sync wakes), registered only if absent
+// so a browser restart never pushes it out. Off unless Options enables it.
+// A worker killed mid-capture can leave the dynamic capture scripts registered.
+chrome.runtime.onStartup.addListener(() => { unregisterArtifactCaptureScripts(chrome.scripting); });
+chrome.runtime.onInstalled.addListener(() => { unregisterArtifactCaptureScripts(chrome.scripting); });
+chrome.runtime.onStartup.addListener(() => { registerArtifactAlarm().catch((e) => console.error('Scry artifacts alarm failed', e)); });
+chrome.runtime.onInstalled.addListener(() => { registerArtifactAlarm().catch((e) => console.error('Scry artifacts alarm failed', e)); });
+
+// Options page buttons ('collect' / 'diagnose') and the db-capture relay from
+// claude.ai/artifact/* content scripts. Runs report through storage, not the
+// message reply, so a long run never holds a message port open.
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request && request.action === 'artifactsRun' && (request.mode === 'collect' || request.mode === 'diagnose')) {
+    runArtifactsJob(request.mode).then(sendResponse, (e) => sendResponse({ started: false, reason: (e && e.message) || 'error' }));
+    return true;
+  }
+  if (request && request.action === 'artifactDbCapture') {
+    handleArtifactDbMessage(request, sender);
+  }
+  return false;
+});
+
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === INCREMENTAL_ALARM) {
+  if (alarm.name === ARTIFACT_ALARM || alarm.name === ARTIFACT_RETRY_ALARM) {
+    runArtifactsJob('collect', { scheduled: true }).catch((e) => console.error('Scry artifacts wake failed', e));
+  } else if (alarm.name === INCREMENTAL_ALARM) {
     runAllContinuousSyncs('incremental').catch((e) => console.error('Scry incremental sync wake failed', e));
   } else if (alarm.name === DEEP_RECONCILE_ALARM) {
     runAllContinuousSyncs('deep')
