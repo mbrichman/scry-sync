@@ -40,6 +40,9 @@ chrome.runtime.onInstalled.addListener(registerContinuousSyncAlarms);
 // Artifact collector: its own daily alarm (45 min after first registration, so
 // it does not land on the 15-min / daily sync wakes), registered only if absent
 // so a browser restart never pushes it out. Off unless Options enables it.
+// A worker killed mid-capture can leave the dynamic capture scripts registered.
+chrome.runtime.onStartup.addListener(() => { unregisterArtifactCaptureScripts(chrome.scripting); });
+chrome.runtime.onInstalled.addListener(() => { unregisterArtifactCaptureScripts(chrome.scripting); });
 chrome.runtime.onStartup.addListener(() => { registerArtifactAlarm().catch((e) => console.error('Scry artifacts alarm failed', e)); });
 chrome.runtime.onInstalled.addListener(() => { registerArtifactAlarm().catch((e) => console.error('Scry artifacts alarm failed', e)); });
 

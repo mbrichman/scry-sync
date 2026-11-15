@@ -836,6 +836,9 @@ async function _artifactsOrgId() {
 async function runArtifactsJob(mode, { scheduled = false } = {}) {
   const prev = (await _storageGet([ARTIFACT_RUN_KEY]))[ARTIFACT_RUN_KEY];
   if (prev && prev.state === 'running' && Date.now() - prev.startedAt < ARTIFACT_RUN_STALE_MS) return { started: false, reason: 'already-running' };
+  // A worker killed mid-capture leaves the capture scripts registered: clear them
+  // first (after the already-running check, so a live run is never disturbed).
+  await unregisterArtifactCaptureScripts(chrome.scripting);
   const scry = await loadScrySettings();
   if (scheduled && scry.artifactsEnabled !== true) return { started: false, reason: 'disabled' };
   if (scry.claudeEnabled === false) return { started: false, reason: 'claude-disabled' };

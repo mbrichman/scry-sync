@@ -492,6 +492,15 @@ describe('review fixes', () => {
       expect(await A.runArtifactsJob('collect', { scheduled: true })).toEqual({ started: false, reason: 'disabled' });
       expect(store.artifactsRun).toBeUndefined();
     });
+    it('job start unregisters lingering capture scripts, even when it then declines to run', async () => {
+      scriptingStub.unregisterContentScripts.mockClear();
+      await A.runArtifactsJob('collect', { scheduled: true });   // flag off -> declines
+      expect(scriptingStub.unregisterContentScripts).toHaveBeenCalledWith({ ids: ['scry-artifact-main', 'scry-artifact-relay'] });
+    });
+    it('unregister errors are swallowed', async () => {
+      scriptingStub.unregisterContentScripts.mockRejectedValueOnce(new Error('none'));
+      expect((await A.runArtifactsJob('collect', { scheduled: true })).reason).toBe('disabled');
+    });
     it('claude disabled', async () => {
       settings = { ...settings, claudeEnabled: false, artifactsEnabled: true };
       expect((await A.runArtifactsJob('collect')).reason).toBe('claude-disabled');
