@@ -523,3 +523,44 @@ describe('review fixes', () => {
     });
   });
 });
+
+describe('contract fixes (server review)', () => {
+  const hex = sha(new Uint8Array([1, 2, 3]));
+  const b64 = Buffer.from(hex, 'hex').toString('base64');
+  it('normalises hex/base64 vendor shas to lowercase hex, without Buffer', () => {
+    const saved = globalThis.Buffer;
+    try {
+      globalThis.Buffer = undefined;
+      expect(A.artifactNormalizeSha(hex.toUpperCase())).toBe(hex);
+      expect(A.artifactNormalizeSha(b64)).toBe(hex);
+      expect(A.artifactNormalizeSha('')).toBe('');
+    } finally { globalThis.Buffer = saved; }
+  });
+  it('manifest sends hex; base64 vendor shas are no false "changed" against hex state', () => {
+    const files = [{ path: 'index.html', size: 1, contentType: 'text/html', sha256: b64 }, { path: 'artifact-type/a.js', sha256: b64 }];
+    expect(A.buildArtifactManifest(files).every((m) => m.sha256 === hex)).toBe(true);
+    expect(A.artifactManifestChanged(files, { 'index.html': hex })).toBe(false);
+    expect(A.artifactManifestChanged([{ path: 'index.html', sha256: hex.toUpperCase() }], { 'index.html': hex })).toBe(false);
+    expect(A.artifactManifestChanged(files, { 'index.html': 'other' })).toBe(true);
+    expect(A.planArtifact({ id: 'x', updated_at: 'u', thumbnail_url: null }, { updated_at: 'u', files: { 'index.html': hex }, has_png: true }, { detail: { files } }).capture).toBe(false);
+  });
+  it('rejected-png detection', () => {
+    expect(A.artifactPngRejected({ success: true, png_stored: false })).toBe(true);
+    expect(A.artifactPngRejected({ png: { rejected: true } })).toBe(true);
+    expect(A.artifactPngRejected({ success: true })).toBe(false);
+    expect(A.artifactPngRejected(null)).toBe(false);
+  });
+  it('a rejected preview marks the thumbnail tried, so missing_png is not retried', async () => {
+    const net = setupNetwork();
+    const f = global.fetch;
+    global.fetch = vi.fn(async (u, i) => (String(u).endsWith('/api/artifacts/ingest') ? (net.ingests.push(JSON.parse(i.body)), mkResp(200, { success: true, png_stored: false })) : f(u, i)));
+    const pngTried = {};
+    await A.runArtifactCollector({ gate: fastGate(), orgId: 'org', scry, tabs: mkTabs(() => {}), session: QUICK, sleep: async () => {}, pngTried });
+    expect(pngTried[ID1]).toBeTypeOf('number');   // ID1 had a thumbnail that was sent
+    expect(pngTried[ID2]).toBeUndefined();
+    const dec = A.planArtifact({ id: ID1, updated_at: 'u1', thumbnail_url: 'https://x.frame.claudeusercontent.com/t' }, { updated_at: 'u1', files: {}, has_png: false }, { pngTried, now: Date.now() });
+    expect(dec.reason).not.toBe('missing_png');
+    // thumbnail's real content type still reported
+    expect(net.ingests.find((x) => x.artifact.id === ID1).fetch_report.thumbnail.content_type).toBe('image/png');
+  });
+});

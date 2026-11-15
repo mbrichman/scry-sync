@@ -47,7 +47,7 @@ function buildArtifactManifest(files) {
     .filter((f) => f && typeof f.path === 'string')
     .map((f) => ({
       path: f.path, size: Number(f.size) || 0,
-      content_type: f.contentType || f.content_type || '', sha256: f.sha256 || '',
+      content_type: f.contentType || f.content_type || '', sha256: artifactNormalizeSha(f.sha256),
     }));
 }
 
@@ -103,7 +103,7 @@ function normalizeArtifactList(resp) {
 function artifactOwnFileShas(files) {
   const out = {};
   for (const f of Array.isArray(files) ? files : []) {
-    if (f && typeof f.path === 'string' && !artifactIsVendorPath(f.path) && f.sha256) out[f.path] = f.sha256;
+    if (f && typeof f.path === 'string' && !artifactIsVendorPath(f.path) && f.sha256) out[f.path] = artifactNormalizeSha(f.sha256);
   }
   return out;
 }
@@ -113,7 +113,7 @@ function artifactOwnFileShas(files) {
 function artifactManifestChanged(detailFiles, stateFiles) {
   const now = artifactOwnFileShas(detailFiles);
   const had = {};
-  for (const [p, s] of Object.entries(stateFiles || {})) if (!artifactIsVendorPath(p)) had[p] = s;
+  for (const [p, s] of Object.entries(stateFiles || {})) if (!artifactIsVendorPath(p)) had[p] = artifactNormalizeSha(s);
   const a = Object.keys(now);
   if (a.length !== Object.keys(had).length) return true;
   return a.some((p) => had[p] !== now[p]);
@@ -176,18 +176,25 @@ async function artifactSha256Hex(bytes) {
   return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+// Vendor sha256 -> lowercase hex (it may arrive hex or base64). No Node APIs
+// (the MV3 service worker has no Buffer). Unparseable input is returned lowercased.
+function artifactNormalizeSha(v) {
+  if (v == null || v === '') return '';
+  const e = String(v).trim();
+  if (/^[0-9a-fA-F]{64}$/.test(e)) return e.toLowerCase();
+  try {
+    const bin = atob(e);
+    let hex = '';
+    for (let i = 0; i < bin.length; i++) hex += bin.charCodeAt(i).toString(16).padStart(2, '0');
+    if (hex.length === 64) return hex;
+  } catch { /* not base64 */ }
+  return e.toLowerCase();
+}
+
 // Does `expected` (the detail's sha256, hex or base64) match the computed hex?
 function artifactShaMatches(expected, hex) {
   if (!expected) return true;
-  const e = String(expected).trim();
-  if (e.toLowerCase() === hex) return true;
-  try {
-    // No Node APIs: the MV3 service worker has no Buffer.
-    const bin = atob(e);
-    let raw = '';
-    for (let i = 0; i < bin.length; i++) raw += bin.charCodeAt(i).toString(16).padStart(2, '0');
-    return raw === hex;
-  } catch { return false; }
+  return artifactNormalizeSha(expected) === hex;
 }
 
 // Verify + encode one downloaded file. Mismatch -> {ok:false, reason:'sha_mismatch'}: never sent.
@@ -596,6 +603,15 @@ async function postScryArtifact(scry, payload) {
 
 // ===================== IMPURE: capture one artifact =====================
 
+// Did Scry's ingest answer say the preview image was not stored? The reply
+// shape is defensive: any of these signals counts.
+function artifactPngRejected(body) {
+  if (!body || typeof body !== 'object') return false;
+  const p = body.png;
+  return body.png_rejected === true || body.png_stored === false || body.has_png === false
+    || Boolean(p && typeof p === 'object' && (p.rejected === true || p.stored === false || p.accepted === false));
+}
+
 function _clientVersion() {
   return typeof getClientVersion === 'function' ? getClientVersion() : 'test';
 }
@@ -682,6 +698,8 @@ async function captureOneArtifact(ctx, item, knownDetail) {
   let resp = await postScryArtifact(scry, payload);
   if (!resp.ok && resp.status >= 500) resp = await postScryArtifact(scry, payload);
   if (!resp.ok) throw new Error(`artifact ingest HTTP ${resp.status}`);
+  // A rejected preview must not make the planner re-capture as missing_png every run.
+  if (png && artifactPngRejected(resp.body) && ctx.pngTried) ctx.pngTried[item.id] = ctx.now();
   return { type, files_sent: out.length, files_failed: report.files_failed.length, png: Boolean(png) };
 }
 
@@ -891,7 +909,7 @@ if (typeof module !== 'undefined' && module.exports) {
     ARTIFACT_VENDOR_PREFIX, ARTIFACT_MAX_FILE_BYTES, ARTIFACT_ALARM, ARTIFACT_RETRY_ALARM, ARTIFACT_RUN_KEY, runArtifactsJob, registerArtifactCaptureScripts, unregisterArtifactCaptureScripts,
     artifactIsVendorPath, buildArtifactManifest, selectArtifactFiles, artifactMainFile, inferArtifactType,
     extractArtifactCursor, normalizeArtifactList, artifactManifestChanged, planArtifact, planArtifactCaptures,
-    artifactBytesToBase64, artifactSha256Hex, artifactShaMatches, prepareArtifactFile, buildArtifactPayload,
+    artifactBytesToBase64, artifactNormalizeSha, artifactPngRejected, artifactSha256Hex, artifactShaMatches, prepareArtifactFile, buildArtifactPayload,
     artifactViewerOrigin, artifactIsFrameHost, buildArtifactDownloadStrategies, createArtifactDbSession,
     formatArtifactRunSummary, formatArtifactDiagnostics, artifactTabUrl,
     ArtifactAbort, createArtifactGate, artifactGatedFetch, fetchArtifactList, fetchArtifactDetail,
