@@ -3,6 +3,10 @@
 // /api/frame/db/<id>/call queries, so the extension can store a typed
 // artifact's database rows. Only {collection, docs, nextCursor, status} leave
 // this script. The request token and the request body are never recorded.
+// Registered dynamically by the background ONLY while a collector capture tab is
+// open (chrome.scripting.registerContentScripts), so it is absent otherwise.
+// The nonce only filters accidental noise; it is NOT authentication (any script
+// in this world can read it).
 (() => {
   if (window.__scryArtifactCapture) return;
   window.__scryArtifactCapture = true;

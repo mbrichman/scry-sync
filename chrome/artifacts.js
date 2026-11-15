@@ -16,6 +16,7 @@ const ARTIFACT_LIST_LIMIT = 48;
 const ARTIFACT_LIST_MAX_PAGES = 20;
 const ARTIFACT_PNG_RETRY_MS = 7 * 24 * 3600 * 1000;
 const ARTIFACT_ALARM = 'scry-artifacts';
+const ARTIFACT_RETRY_ALARM = 'scry-artifacts-retry';   // one-shot deferral; never touches the daily alarm
 const ARTIFACT_ALARM_DELAY_MIN = 45;      // off the 15-min / daily sync wakes
 const ARTIFACT_ALARM_PERIOD_MIN = 1440;
 const ARTIFACT_RUN_KEY = 'artifactsRun';  // chrome.storage.local: status the options page renders
@@ -181,7 +182,10 @@ function artifactShaMatches(expected, hex) {
   const e = String(expected).trim();
   if (e.toLowerCase() === hex) return true;
   try {
-    const raw = typeof Buffer !== 'undefined' ? Buffer.from(e, 'base64').toString('hex') : null;
+    // No Node APIs: the MV3 service worker has no Buffer.
+    const bin = atob(e);
+    let raw = '';
+    for (let i = 0; i < bin.length; i++) raw += bin.charCodeAt(i).toString(16).padStart(2, '0');
     return raw === hex;
   } catch { return false; }
 }
@@ -251,7 +255,7 @@ function buildArtifactDownloadStrategies({ detail, id, file }) {
   if (srcVer && srcVer !== detailVer) vers.push(['src-ver', srcVer]);
   const paths = file ? [['', _encPath(file.path)]] : [['@root', ''], ['@index.html', 'index.html']];
   const out = [];
-  const add = (name, url, init) => out.push({ name, url, init });
+  const add = (name, url, init) => out.push({ name, url, init: { ...init, redirect: 'error' } });
   for (const [vname, ver] of vers) {
     for (const [pname, p] of paths) {
       const base = `${origin}/_f/${encodeURIComponent(ver)}/${p}`;
@@ -487,7 +491,7 @@ async function fetchArtifactThumbnail(gate, url) {
   const rec = { status: null, content_type: null, bytes: null };
   if (!url || !artifactIsFrameHost(url)) { rec.error = 'no_thumbnail_url'; return rec; }
   try {
-    const r = await artifactGatedFetch(gate, 'thumb', url, { credentials: 'omit' }, 'bytes');
+    const r = await artifactGatedFetch(gate, 'thumb', url, { credentials: 'omit', redirect: 'error' }, 'bytes');
     rec.status = r.status;
     rec.content_type = r.contentType;
     if (r.ok && r.bytes) { rec.bytes = r.bytes.length; rec._bytes = r.bytes; }
@@ -519,9 +523,26 @@ function artifactTabUrl(openUrl) {
   } catch { return null; }
 }
 
+const ARTIFACT_SCRIPT_IDS = ['scry-artifact-main', 'scry-artifact-relay'];
+
+// The capture scripts exist ONLY while a collector tab is open: registered
+// just before tabs.create, unregistered in `finally`. With the feature off (or
+// between runs) nothing is injected into claude.ai/artifact/* pages.
+async function registerArtifactCaptureScripts(scripting) {
+  await unregisterArtifactCaptureScripts(scripting);   // clear a stale registration
+  await scripting.registerContentScripts([
+    { id: ARTIFACT_SCRIPT_IDS[0], matches: ['https://claude.ai/artifact/*'], js: ['artifact_capture_main.js'], runAt: 'document_start', world: 'MAIN', persistAcrossSessions: false },
+    { id: ARTIFACT_SCRIPT_IDS[1], matches: ['https://claude.ai/artifact/*'], js: ['artifact_capture_relay.js'], runAt: 'document_start', persistAcrossSessions: false },
+  ]);
+}
+async function unregisterArtifactCaptureScripts(scripting) {
+  try { await scripting.unregisterContentScripts({ ids: ARTIFACT_SCRIPT_IDS }); } catch { /* not registered */ }
+}
+
 // One background tab at a time (callers are sequential). Always closes the tab.
 async function captureArtifactDbViaTab(openUrl, deps = {}) {
   const tabs = deps.tabs || chrome.tabs;
+  const scripting = deps.scripting || chrome.scripting;
   const sleep = deps.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
   const now = deps.now || Date.now;
   const url = artifactTabUrl(openUrl);
@@ -530,6 +551,7 @@ async function captureArtifactDbViaTab(openUrl, deps = {}) {
   const started = now();
   let tab = null;
   try {
+    await registerArtifactCaptureScripts(scripting);
     tab = await tabs.create({ url, active: false });
     _artSessions.set(tab.id, session);
     let st = session.status();
@@ -544,6 +566,7 @@ async function captureArtifactDbViaTab(openUrl, deps = {}) {
       _artSessions.delete(tab.id);
       try { await tabs.remove(tab.id); } catch { /* already closed */ }
     }
+    await unregisterArtifactCaptureScripts(scripting);
   }
 }
 
@@ -640,7 +663,7 @@ async function captureOneArtifact(ctx, item, knownDetail) {
   let db = null;
   let comments = null;
   if (type === 'typed') {
-    const cap = await captureArtifactDbViaTab(item.open_url, { tabs: ctx.tabs, sleep: ctx.sleep, keepalive: ctx.keepalive, session: ctx.session });
+    const cap = await captureArtifactDbViaTab(item.open_url, { tabs: ctx.tabs, sleep: ctx.sleep, keepalive: ctx.keepalive, session: ctx.session, scripting: ctx.scripting });
     db = cap.db;
     comments = cap.comments;
     report.db = { ...cap.stats, reason: cap.reason, ms: cap.ms };
@@ -667,7 +690,7 @@ async function captureOneArtifact(ctx, item, knownDetail) {
 async function runArtifactCollector(deps) {
   const ctx = {
     gate: deps.gate || createArtifactGate(), orgId: deps.orgId, scry: deps.scry,
-    tabs: deps.tabs, sleep: deps.sleep, keepalive: deps.keepalive, session: deps.session,
+    tabs: deps.tabs, sleep: deps.sleep, keepalive: deps.keepalive, session: deps.session, scripting: deps.scripting,
     now: deps.now || Date.now, pngTried: deps.pngTried || {}, strategy: null,
   };
   const progress = deps.onProgress || (() => {});
@@ -694,7 +717,8 @@ async function runArtifactCollector(deps) {
         if (dec.capture) todo.push({ id, reason: dec.reason });
       } catch (e) { if (e instanceof ArtifactAbort) throw e; sum.failed++; sum.errors.push({ id, reason: 'detail_error' }); }
     }
-    sum.skipped = items.length - todo.length;
+    const detailFailed = new Set(sum.errors.map((e) => e.id));
+    sum.skipped = items.filter((i) => !detailFailed.has(i.id)).length - todo.length;
     let n = 0;
     for (const t of todo) {
       n++;
@@ -781,7 +805,7 @@ async function runArtifactDiagnostics(deps) {
         }
         if (typed) {
           progress('background tab db capture');
-          const cap = await captureArtifactDbViaTab(item.open_url, { tabs: deps.tabs, sleep: deps.sleep, keepalive: deps.keepalive, session: deps.session });
+          const cap = await captureArtifactDbViaTab(item.open_url, { tabs: deps.tabs, sleep: deps.sleep, keepalive: deps.keepalive, session: deps.session, scripting: deps.scripting });
           rec.db = { ...cap.stats, reason: cap.reason, ms: cap.ms, comments: cap.comments ? cap.comments.length : 0 };
           d.db_ok = cap.stats.docs > 0;
         }
@@ -820,7 +844,7 @@ async function runArtifactsJob(mode, { scheduled = false } = {}) {
     // Do not overlap a continuous-sync wake (its own `running` guard, 10 min stale).
     const cs = (await _storageGet(['continuousSync'])).continuousSync;
     if (cs && typeof cs.running === 'number' && Date.now() - cs.running < 10 * 60 * 1000) {
-      chrome.alarms.create(ARTIFACT_ALARM, { delayInMinutes: 10 });
+      chrome.alarms.create(ARTIFACT_RETRY_ALARM, { delayInMinutes: 10 });
       return { started: false, reason: 'continuous-sync-running' };
     }
   }
@@ -861,7 +885,7 @@ async function registerArtifactAlarm() {
 
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = {
-    ARTIFACT_VENDOR_PREFIX, ARTIFACT_MAX_FILE_BYTES, ARTIFACT_ALARM, ARTIFACT_RUN_KEY,
+    ARTIFACT_VENDOR_PREFIX, ARTIFACT_MAX_FILE_BYTES, ARTIFACT_ALARM, ARTIFACT_RETRY_ALARM, ARTIFACT_RUN_KEY, runArtifactsJob, registerArtifactCaptureScripts, unregisterArtifactCaptureScripts,
     artifactIsVendorPath, buildArtifactManifest, selectArtifactFiles, artifactMainFile, inferArtifactType,
     extractArtifactCursor, normalizeArtifactList, artifactManifestChanged, planArtifact, planArtifactCaptures,
     artifactBytesToBase64, artifactSha256Hex, artifactShaMatches, prepareArtifactFile, buildArtifactPayload,

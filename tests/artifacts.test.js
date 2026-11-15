@@ -2,6 +2,8 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 const nodeCrypto = require('node:crypto');
 const A = require('../chrome/artifacts.js');
+const scriptingStub = { registerContentScripts: vi.fn(async () => {}), unregisterContentScripts: vi.fn(async () => {}) };
+globalThis.chrome = { scripting: scriptingStub };
 
 const sha = (buf) => nodeCrypto.createHash('sha256').update(buf).digest('hex');
 const ID1 = '11111111-1111-4111-8111-111111111111';
@@ -410,5 +412,105 @@ describe('content scripts', () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatchObject({ action: 'artifactDbCapture', collection: 'items' });
+  });
+});
+
+describe('review fixes', () => {
+  it('sha matching works without Buffer (MV3 service worker), hex and base64', async () => {
+    const bytes = new Uint8Array([9, 8, 7]);
+    const hex = sha(bytes);
+    const b64 = Buffer.from(hex, 'hex').toString('base64');
+    const saved = globalThis.Buffer;
+    try {
+      globalThis.Buffer = undefined;
+      expect(A.artifactShaMatches(hex, hex)).toBe(true);
+      expect(A.artifactShaMatches(b64, hex)).toBe(true);
+      expect(A.artifactShaMatches('AAAA', hex)).toBe(false);
+      expect(A.artifactShaMatches('!!notb64!!', hex)).toBe(false);
+      expect(A.artifactBytesToBase64(bytes)).toBe(saved.from(bytes).toString('base64'));
+    } finally { globalThis.Buffer = saved; }
+  });
+
+  it('every token-carrying download and the thumbnail fetch use redirect:error', async () => {
+    const s = A.buildArtifactDownloadStrategies({ detail: { ver: 'v', assetToken: 'T' }, id: ID1, file: { path: 'a', src: { ver: 'w' } } });
+    expect(s.length).toBeGreaterThan(3);
+    expect(s.every((x) => x.init.redirect === 'error')).toBe(true);
+    const calls = [];
+    const orig = global.fetch;
+    global.fetch = vi.fn(async (u, init) => { calls.push(init); return mkResp(200, PNG, 'image/png'); });
+    await A.fetchArtifactThumbnail(fastGate(), `https://${ID1}.frame.claudeusercontent.com/_thumb.img?__frame_t=X`);
+    global.fetch = orig;
+    expect(calls[0].redirect).toBe('error');
+  });
+
+  it('capture scripts are registered only around the tab and always unregistered', async () => {
+    const order = [];
+    const scripting = {
+      registerContentScripts: vi.fn(async (l) => { order.push('register'); expect(l.map((x) => x.world || 'ISOLATED')).toEqual(['MAIN', 'ISOLATED']); expect(l[0].persistAcrossSessions).toBe(false); }),
+      unregisterContentScripts: vi.fn(async () => { order.push('unregister'); }),
+    };
+    const tabs = { create: vi.fn(async () => { order.push('create'); return { id: 3 }; }), remove: vi.fn(async () => { order.push('remove'); }) };
+    await A.captureArtifactDbViaTab('/artifact/x', { tabs, scripting, sleep: async () => {}, session: { firstCallMs: 0 }, pollMs: 0 });
+    expect(order).toEqual(['unregister', 'register', 'create', 'remove', 'unregister']);
+    // tab creation fails -> still unregistered
+    order.length = 0;
+    tabs.create = vi.fn(async () => { throw new Error('boom'); });
+    await expect(A.captureArtifactDbViaTab('/artifact/x', { tabs, scripting, sleep: async () => {} })).rejects.toThrow();
+    expect(order.at(-1)).toBe('unregister');
+    // bad url: nothing registered
+    order.length = 0;
+    await A.captureArtifactDbViaTab('https://evil.example/x', { tabs, scripting });
+    expect(order).toEqual([]);
+  });
+
+  it('manifest has no static artifact content scripts', () => {
+    const m = JSON.parse(require('node:fs').readFileSync('chrome/manifest.json', 'utf8'));
+    expect(JSON.stringify(m.content_scripts)).not.toContain('artifact_capture');
+    expect(m.permissions).toContain('scripting');
+  });
+
+  describe('runArtifactsJob gating', () => {
+    let store; let settings; let alarms;
+    beforeEach(() => {
+      store = {}; settings = { url: 'http://s', token: 'tok' }; alarms = [];
+      globalThis.chrome = {
+        scripting: scriptingStub,
+        storage: { local: {
+          get: (keys, cb) => cb(Object.fromEntries((Array.isArray(keys) ? keys : [keys]).filter((k) => k in store).map((k) => [k, store[k]]))),
+          set: (o, cb) => { Object.assign(store, JSON.parse(JSON.stringify(o))); cb && cb(); },
+        } },
+        alarms: { create: (name, info) => alarms.push({ name, info }) },
+        runtime: { getPlatformInfo: () => {} },
+      };
+      globalThis.loadScrySettings = async () => settings;
+      globalThis.readOrgIdFromStorage = async () => null;
+      globalThis.detectClaudeOrgId = async () => { throw new Error('stop'); };
+    });
+    afterEach(() => { delete globalThis.loadScrySettings; delete globalThis.readOrgIdFromStorage; delete globalThis.detectClaudeOrgId; globalThis.chrome = { scripting: scriptingStub }; });
+
+    it('scheduled run with the flag off does nothing', async () => {
+      expect(await A.runArtifactsJob('collect', { scheduled: true })).toEqual({ started: false, reason: 'disabled' });
+      expect(store.artifactsRun).toBeUndefined();
+    });
+    it('claude disabled', async () => {
+      settings = { ...settings, claudeEnabled: false, artifactsEnabled: true };
+      expect((await A.runArtifactsJob('collect')).reason).toBe('claude-disabled');
+    });
+    it('already running', async () => {
+      store.artifactsRun = { state: 'running', startedAt: Date.now() };
+      expect((await A.runArtifactsJob('collect')).reason).toBe('already-running');
+    });
+    it('collect needs a configured Scry', async () => {
+      settings = {};
+      expect((await A.runArtifactsJob('collect')).reason).toBe('scry-not-configured');
+    });
+    it('deferral uses a separate one-shot alarm, never the daily one', async () => {
+      settings = { ...settings, artifactsEnabled: true };
+      store.continuousSync = { running: Date.now() - 1000 };
+      const r = await A.runArtifactsJob('collect', { scheduled: true });
+      expect(r.reason).toBe('continuous-sync-running');
+      expect(alarms).toEqual([{ name: A.ARTIFACT_RETRY_ALARM, info: { delayInMinutes: 10 } }]);
+      expect(alarms.some((a) => a.name === A.ARTIFACT_ALARM)).toBe(false);
+    });
   });
 });

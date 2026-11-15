@@ -58,7 +58,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === ARTIFACT_ALARM) {
+  if (alarm.name === ARTIFACT_ALARM || alarm.name === ARTIFACT_RETRY_ALARM) {
     runArtifactsJob('collect', { scheduled: true }).catch((e) => console.error('Scry artifacts wake failed', e));
   } else if (alarm.name === INCREMENTAL_ALARM) {
     runAllContinuousSyncs('incremental').catch((e) => console.error('Scry incremental sync wake failed', e));
