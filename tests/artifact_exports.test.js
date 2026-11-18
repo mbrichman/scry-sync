@@ -122,6 +122,7 @@ describe('click allow-list (pure)', () => {
   });
 });
 
+const clk = () => { let t = 0; return { now: () => t, sleep: async (ms) => { t += ms; await new Promise((r) => setTimeout(r, 0)); } }; };
 describe('export driver (fake DOM)', () => {
   it('document type: dismisses the tip, exports Markdown and PDF, never Word, never touches other items', async () => {
     const ref = {};
@@ -181,6 +182,44 @@ describe('export driver (fake DOM)', () => {
     ref2.current = m.d;
     const r2 = await m.d.run({ title: 'Synthetic Title', timeoutMs: 40, loadMs: 200 });
     expect(r2.failed).toEqual([{ format: 'markdown', reason: 'timeout' }]);
+  });
+
+  it('menu that ignores click() but opens on a pointer press: pointer fallback on the same button', async () => {
+    const ref = {};
+    const page = mkPage({ formats: DOC_FORMATS, driverRef: ref, files: DOC_FILES });
+    const banner = page.root.children[0];
+    const tb = banner.children[0];
+    const open = tb.onclick;
+    tb.onclick = null;                                   // click() does nothing
+    const seen = [];
+    tb.dispatchEvent = (ev) => { seen.push(ev.type); if (ev.type === 'pointerdown') open(); return true; };
+    class Ev { constructor(type, o) { this.type = type; Object.assign(this, o); } }
+    page.document.defaultView = { MouseEvent: Ev, PointerEvent: Ev, KeyboardEvent: Ev };
+    const { d } = mkDriver(page, clk());
+    ref.current = d;
+    const res = await d.run({ title: 'Synthetic Title', timeoutMs: 1e7, loadMs: 200 });   // fake clock: file delivery is real-time
+    expect(res.failed).toEqual([]);
+    expect(res.captured.map((c) => c.format)).toEqual(['markdown', 'pdf']);
+    expect(res.clicks).toContain('title:pointer');
+    expect(seen[0]).toBe('pointerdown');
+    expect(res.probe.map((p) => p.stage).slice(0, 3)).toEqual(['before', 'after_click', 'after_pointer']);
+  });
+
+  it('menu that never opens: menu_not_opened with a probe of every stage, nothing else clicked', async () => {
+    const ref = {};
+    const page = mkPage({ formats: DOC_FORMATS, driverRef: ref, files: DOC_FILES });
+    const tb = page.root.children[0].children[0];
+    tb.onclick = null;
+    tb.dispatchEvent = () => true;
+    class Ev { constructor(type, o) { this.type = type; Object.assign(this, o); } }
+    page.document.defaultView = { MouseEvent: Ev, PointerEvent: Ev, KeyboardEvent: Ev };
+    const { d } = mkDriver(page, clk());
+    ref.current = d;
+    const res = await d.run({ title: 'Synthetic Title', timeoutMs: 30, loadMs: 50 });
+    expect(res.failed).toEqual([{ format: '*', reason: 'menu_not_opened' }]);
+    expect(res.probe.map((p) => p.stage)).toEqual(['before', 'after_click', 'after_pointer', 'after_enter']);
+    expect(res.clicks).toEqual(['title', 'title:pointer', 'title:enter']);
+    expect(Object.keys(res.probe[0]).sort()).toEqual(['connected', 'dialogs', 'expanded', 'focus', 'items', 'menus', 'stage', 'vis']);
   });
 
   it('a click the allow-list refuses throws and is reported, not performed', async () => {

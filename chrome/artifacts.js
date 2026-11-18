@@ -455,6 +455,8 @@ function formatArtifactDiagnostics(d) {
     L.push(`EXPORT TEST (${e.subtype || 'unknown subtype'}): mode ${e.mode}, offered [${(e.offered || []).join(', ')}], ms ${e.ms}`);
     for (const c of e.captured) L.push(`  captured ${c.format}: ${c.bytes} bytes, ${c.content_type || '-'}`);
     for (const f of e.failed) L.push(`  failed ${f.format}: ${f.reason}`);
+    if (e.clicks && e.clicks.length) L.push(`  clicks: ${e.clicks.join(', ')}`);
+    for (const p of e.probe || []) L.push(`  probe ${p.stage}: focus ${p.focus} vis ${p.vis} expanded ${p.expanded} connected ${p.connected} menus ${p.menus} items ${p.items} dialogs ${p.dialogs}`);
   }
   L.push(`SUMMARY: working download strategies = ${(d.working_strategies || []).join(', ') || 'NONE'}; thumbnail fetchable = ${d.thumbnail_ok === null ? 'untested' : d.thumbnail_ok}; tab db capture = ${d.db_ok === null ? 'untested (no typed artifact)' : d.db_ok}; export capture = ${d.export_ok === null || d.export_ok === undefined ? 'untested' : d.export_ok}`);
   return L.join('\n');
@@ -1125,7 +1127,7 @@ async function runArtifactDiagnostics(deps) {
         const prep = await prepareArtifactExports(cap.captured);
         if (cap.subtype && seen.has(cap.subtype)) continue;
         if (cap.subtype) seen.add(cap.subtype);
-        d.exports.push({ subtype: cap.subtype, mode: cap.mode, offered: cap.offered, captured: prep.captured, failed: cap.failed.concat(prep.failed), ms: cap.ms });
+        d.exports.push({ subtype: cap.subtype, mode: cap.mode, offered: cap.offered, captured: prep.captured, failed: cap.failed.concat(prep.failed), ms: cap.ms, clicks: cap.clicks || [], probe: cap.probe || [] });
       }
       d.export_ok = d.exports.length ? d.exports.some((e) => e.captured.length > 0) : null;
     }

@@ -81,6 +81,7 @@
     const files = [];                 // everything the MAIN script reported
     const names = new Map();          // id -> filename (export_name)
     const clicks = [];                // kinds of the clicks made (never names)
+    const probe = [];                 // page-state snapshots around the title click (counts/flags only)
 
     function onMainMessage(d) {
       if (!d) return;
@@ -113,6 +114,32 @@
       if (!clickAllowed(kind, role, name, ctx)) throw new Error('blocked_click');
       clicks.push(kind);
       el.click();
+    }
+    function _check(kind, el, extra) {
+      const ctx = { title: extra.title, inBanner: within(el, isBanner), inTipDialog: false, inDialog: within(el, isDialog), inExportRadiogroup: false };
+      if (!clickAllowed(kind, roleOf(el), nameOf(el), ctx)) throw new Error('blocked_click');
+    }
+    function guardedPress(kind, el, extra = {}) {
+      _check(kind, el, extra);
+      clicks.push(kind + ':pointer');
+      const W = doc.defaultView || globalThis;
+      if (typeof el.dispatchEvent !== 'function' || !W.MouseEvent) return;
+      const o = { bubbles: true, cancelable: true, composed: true, view: W, button: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+      const PE = W.PointerEvent || W.MouseEvent;
+      el.dispatchEvent(new PE('pointerdown', { ...o, buttons: 1 }));
+      el.dispatchEvent(new W.MouseEvent('mousedown', { ...o, buttons: 1 }));
+      if (typeof el.focus === 'function') el.focus();
+      el.dispatchEvent(new PE('pointerup', { ...o, buttons: 0 }));
+      el.dispatchEvent(new W.MouseEvent('mouseup', { ...o, buttons: 0 }));
+      el.dispatchEvent(new W.MouseEvent('click', { ...o, buttons: 0 }));
+    }
+    function guardedKey(kind, el, extra = {}) {
+      _check(kind, el, extra);
+      clicks.push(kind + ':enter');
+      const W = doc.defaultView || globalThis;
+      if (typeof el.dispatchEvent !== 'function' || !W.KeyboardEvent) return;
+      if (typeof el.focus === 'function') el.focus();
+      for (const t of ['keydown', 'keyup']) el.dispatchEvent(new W.KeyboardEvent(t, { key: 'Enter', code: 'Enter', bubbles: true, cancelable: true }));
     }
 
     async function waitFor(fn, ms, step = 200) {
@@ -160,8 +187,32 @@
       await dismissTip();
       const tb = await waitFor(() => titleButton(title), timeoutMs);
       if (!tb) return 'title_button_not_found';
+      const snap = (stage) => ({
+        stage,
+        focus: typeof doc.hasFocus === 'function' ? doc.hasFocus() : null,
+        vis: doc.visibilityState || null,
+        expanded: tb.getAttribute ? tb.getAttribute('aria-expanded') : null,
+        connected: tb.isConnected !== false,
+        menus: all().filter((e) => roleOf(e) === 'menu').length,
+        items: all().filter((e) => roleOf(e) === 'menuitem').length,
+        dialogs: dialogs().length,
+      });
+      probe.push(snap('before'));
       guardedClick('title', tb, { title });
-      const item = await waitFor(menuExportItem, 5000);
+      let item = await waitFor(menuExportItem, 5000);
+      probe.push(snap('after_click'));
+      // Fallbacks on the SAME allow-listed button: a full pointer sequence, then
+      // keyboard Enter (menu libraries differ in which event opens them).
+      if (!item) {
+        guardedPress('title', tb, { title });
+        item = await waitFor(menuExportItem, 3000);
+        probe.push(snap('after_pointer'));
+      }
+      if (!item) {
+        guardedKey('title', tb, { title });
+        item = await waitFor(menuExportItem, 3000);
+        probe.push(snap('after_enter'));
+      }
       if (!item) return 'menu_not_opened';
       guardedClick('export', item);
       const d = await waitFor(exportDialog, 5000);
@@ -194,7 +245,7 @@
     // opts: { title, timeoutMs, onlyFormats?: [...] , loadMs }
     async function run(opts = {}) {
       const timeoutMs = opts.timeoutMs || 20000;
-      const out = { offered: [], subtype: null, captured: [], failed: [], clicks };
+      const out = { offered: [], subtype: null, captured: [], failed: [], clicks, probe };
       post({ type: 'arm' });
       try {
         const err = await openExportDialog(opts.title, opts.loadMs || 20000);
