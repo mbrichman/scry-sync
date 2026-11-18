@@ -30,7 +30,7 @@ class El {
 }
 
 // A page that behaves like Claude's artifact view. `formats` = button names in the dialog.
-function mkPage({ title = 'Synthetic Title', formats, tip = false, driverRef, files = {}, noFile = [] }) {
+function mkPage({ title = 'Synthetic Title', formats, tip = false, driverRef, files = {}, noFile = [], sharePane = false }) {
   const root = new El('body');
   const clicked = [];
   const track = (el, label) => { const o = el.onclick; el.onclick = () => { clicked.push(label); o && o(); }; return el; };
@@ -46,8 +46,17 @@ function mkPage({ title = 'Synthetic Title', formats, tip = false, driverRef, fi
         if (n !== 'Export') return;
         menu.remove();
         dialog = root.add(new El('div', { role: 'dialog' }));
-        dialog.add(new El('div', { role: 'radiogroup' })).add(new El('div', { role: 'radio' }, 'Export'));
-        const list = dialog.add(new El('ul', {}, 'Download as'));
+        const rg = dialog.add(new El('div', { role: 'radiogroup', 'aria-label': 'Share or export' }));
+        const exportRadio = rg.add(new El('div', { role: 'radio' }, 'Export'));
+        const list = new El('ul', {}, 'Download as');
+        if (sharePane) {
+          rg.add(new El('div', { role: 'radio', 'aria-checked': 'true' }, 'Share'));
+          dialog.add(new El('button', {}, 'Copy private link'));
+          dialog.add(new El('button', { role: 'switch' }, 'Show in Artifacts list'));
+          dialog.add(new El('button', {}, 'Invite'));
+          dialog.add(new El('input', { role: 'textbox', 'aria-label': 'Add people' }));
+          exportRadio.onclick = () => { dialog.add(list); };
+        } else dialog.add(list);
         for (const f of formats) {
           const key = f.toLowerCase().split(/[ ,]/)[0];
           const b = list.add(new El('button', {}, f));
@@ -186,11 +195,58 @@ describe('export driver (fake DOM)', () => {
   });
 });
 
+describe('share pane, no formats, partial success', () => {
+  it('radio is allowed only as the exact "Export" radio inside the "Share or export" radiogroup of a dialog', () => {
+    const ok = { inDialog: true, inExportRadiogroup: true };
+    expect(X.clickAllowed('radio', 'radio', 'Export', ok)).toBe(true);
+    expect(X.clickAllowed('radio', 'radio', 'Share', ok)).toBe(false);
+    expect(X.clickAllowed('radio', 'radio', 'Export', { inDialog: true })).toBe(false);
+    expect(X.clickAllowed('radio', 'radio', 'Export', { inExportRadiogroup: true })).toBe(false);
+    expect(X.clickAllowed('radio', 'button', 'Export', ok)).toBe(false);
+    expect(X.clickAllowed('radio', 'switch', 'Export', ok)).toBe(false);
+    for (const [role, name] of [['button', 'Copy private link'], ['switch', 'Show in Artifacts list'], ['button', 'Invite'], ['textbox', 'Add people'], ['radio', 'Share']]) {
+      for (const kind of ['radio', 'title', 'export', 'format', 'dismiss', 'close']) expect(X.clickAllowed(kind, role, name, { inDialog: true, inExportRadiogroup: true, inTipDialog: true })).toBe(false);
+    }
+  });
+  it('dialog opens on the Share pane: clicks only the Export radio, then proceeds', async () => {
+    const ref = {};
+    const page = mkPage({ formats: DOC_FORMATS, driverRef: ref, files: DOC_FILES, sharePane: true });
+    const { d } = mkDriver(page);
+    ref.current = d;
+    const res = await d.run({ title: 'Synthetic Title', timeoutMs: 500, loadMs: 200 });
+    expect(res.captured.map((c) => c.format)).toEqual(['markdown', 'pdf']);
+    expect(res.clicks).toContain('radio');
+    expect(page.clicked.filter((n) => n.startsWith('radio:'))).toEqual(['radio:Export']);
+    expect(page.clicked.filter((n) => /Copy private link|Show in Artifacts|Invite|Share|radio:Share|Add people/.test(n) && !n.startsWith('menuitem:Share'))).toEqual([]);
+    expect(page.clicked.some((n) => n === 'menuitem:Share')).toBe(false);
+  });
+  it('Word-only offer or an unrecognised pane reports no_formats_offered', async () => {
+    const ref = {};
+    const page = mkPage({ formats: ['Word , Editable .docx document'], driverRef: ref, files: {} });
+    const { d } = mkDriver(page);
+    ref.current = d;
+    const res = await d.run({ title: 'Synthetic Title', timeoutMs: 30, loadMs: 100 });
+    expect(res.failed).toEqual([{ format: '*', reason: 'no_formats_offered' }]);
+    const ref2 = {};
+    const page2 = mkPage({ formats: [], driverRef: ref2, files: {} });
+    const m = mkDriver(page2);
+    ref2.current = m.d;
+    const r2 = await m.d.run({ title: 'Synthetic Title', timeoutMs: 30, loadMs: 100 });
+    expect(r2.failed).toEqual([{ format: '*', reason: 'no_formats_offered' }]);
+  });
+  it('markdown: text/plain only counts with a .md filename; pdf blob is not markdown', () => {
+    expect(X.fileMatchesFormat('markdown', { content_type: 'text/plain' })).toBe(false);
+    expect(X.fileMatchesFormat('markdown', { content_type: 'text/plain', filename: 'x.md' })).toBe(true);
+    expect(X.fileMatchesFormat('markdown', { content_type: 'text/markdown' })).toBe(true);
+    expect(X.fileMatchesFormat('markdown', { content_type: 'application/pdf', filename: 'x.pdf' })).toBe(false);
+  });
+});
+
 describe('MAIN-world capture script', () => {
   function mkEnv() {
     const listeners = [];
     const posted = [];
-    class FakeURL extends URL { static createObjectURL() { return 'blob:https://claude.ai/abc'; } }
+    class FakeURL extends URL { static n = 0; static createObjectURL() { return `blob:https://claude.ai/abc${FakeURL.n++ || ''}`; } }
     class Anchor { constructor(attrs) { this.attrs = attrs; this.tagName = 'A'; this.href = attrs.href; this.realClicks = 0; } hasAttribute(k) { return k in this.attrs; } getAttribute(k) { return this.attrs[k] ?? null; } click() { this.realClicks++; } }
     class ET { dispatchEvent() { return true; } }
     const win = {
@@ -239,6 +295,21 @@ describe('MAIN-world capture script', () => {
     const c = new e.Anchor({ download: 'z', href: url });
     e.Anchor.prototype.click.call(c);
     expect(c.realClicks).toBe(1);                        // restored
+  });
+
+  it('a reused <a download> is suppressed and captured on every click', async () => {
+    const e = mkEnv();
+    await e.send('arm');
+    const mk = (str) => { const bytes = new TextEncoder().encode(str); return { type: 'text/markdown', size: bytes.length, arrayBuffer: async () => bytes.buffer }; };
+    const a = new e.Anchor({ download: 'one.md', href: '' });
+    a.href = e.FakeURL.createObjectURL(mk('first'));
+    e.Anchor.prototype.click.call(a);
+    a.href = e.FakeURL.createObjectURL(mk('second'));
+    a.attrs.download = 'two.pdf';
+    e.Anchor.prototype.click.call(a);
+    await wait();
+    expect(a.realClicks).toBe(0);
+    expect(e.posted.filter((m) => m.type === 'export_name').map((m) => m.filename)).toEqual(['one.md', 'two.pdf']);
   });
 
   it('ignores arm messages with the wrong nonce', async () => {
@@ -546,6 +617,71 @@ describe('collector: export capture', () => {
     const f = exportTabs([{ offered: ['markdown'], subtype: 'document', captured: [cap('markdown')], failed: [] }]);
     await run(f);
     for (const t of ['Synthetic Title', 'THUMBTOKEN', 'SERVICETOKEN', 'ASSETTOKEN']) expect(logs.join('\n')).not.toContain(t);
+  });
+});
+
+const uid = (i) => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`;
+
+describe('collector: no formats, cap, persistence, partial', () => {
+  let orig;
+  beforeEach(() => { orig = global.fetch; });
+  afterEach(() => { global.fetch = orig; vi.restoreAllMocks(); });
+  const NONE = { offered: [], subtype: null, captured: [], failed: [{ format: '*', reason: 'no_formats_offered' }] };
+  const stateFor = (id, extra = {}) => ({ [id]: { updated_at: 'u1', version: 'v2', files: { 'index.html': sha(HTML) }, has_png: true, exports: {}, png_origin: 'thumbnail', ...extra } });
+
+  it('M1: no formats offered is a failure with 7-day backoff, never a success memo', async () => {
+    const net = setupNet({ items: [thumbItem(ID1)] });
+    const f = mkFlow({ replies: [NONE] });
+    const exportTried = {};
+    await run(f, { exportTried });
+    expect(net.ingests[0].fetch_report.export.failed).toEqual([{ format: '*', reason: 'no_formats_offered' }]);
+    expect(exportTried[ID1]).toMatchObject({ ok: false, updated_at: 'u1' });
+    const sends = f.tabs.sendMessage.mock.calls.length;
+    setupNet({ items: [thumbItem(ID1)], state: { artifacts: stateFor(ID1) } });
+    const sum = await run(f, { exportTried });
+    expect(sum.captured).toBe(0);
+    expect(f.tabs.sendMessage.mock.calls.length).toBe(sends);
+  });
+
+  it('M2: at most ARTIFACT_EXPORT_MAX_PER_RUN missing_export recaptures per run; the rest are deferred', async () => {
+    const ids = Array.from({ length: 12 }, (_, i) => uid(i + 1));
+    setupNet({ items: ids.map((id) => thumbItem(id)), state: { artifacts: Object.assign({}, ...ids.map((id) => stateFor(id))) } });
+    const f = mkFlow({ replies: ids.map(() => ({ offered: ['png'], subtype: 'whiteboard', captured: [], failed: [] })) });
+    const sum = await run(f);
+    expect(A.ARTIFACT_EXPORT_MAX_PER_RUN).toBe(10);
+    expect(sum.captured).toBe(10);
+    expect(sum.export_deferred).toBe(2);
+    expect(f.tabs.sendMessage).toHaveBeenCalledTimes(10);
+  });
+
+  it('M3: backoffs are persisted as each artifact finishes, so a later abort keeps them', async () => {
+    setupNet({ items: [thumbItem(ID1), thumbItem(ID2)] });
+    const g = global.fetch;
+    global.fetch = vi.fn(async (u, i) => (String(u).startsWith(`https://claude.ai/api/frame/${ID2}?`) ? mkResp(429, {}) : g(u, i)));
+    const f = mkFlow({ replies: [NONE] });
+    const exportTried = {};
+    const snaps = [];
+    const gate = A.createArtifactGate({ spacing: { list: 0, detail: 0, file: 0, thumb: 0, tab: 0 }, sleep: async () => {}, schedule: [0] });
+    const sum = await A.runArtifactCollector({ gate, orgId: 'org', scry, tabs: f.tabs, windows: f.windows, scripting: scriptingStub, sleep: async () => { await new Promise((r) => setTimeout(r, 2)); }, session: { idleMs: 3, firstCallMs: 5, maxMs: 30 }, pngTried: {}, exportTried, persist: async () => { snaps.push(JSON.parse(JSON.stringify(exportTried))); } });
+    expect(sum.aborted).toBe('rate_limited');
+    expect(snaps.length).toBeGreaterThanOrEqual(1);
+    expect(snaps[0][ID1]).toMatchObject({ ok: false });
+  });
+
+  it('L5: partial success marks captured formats done and retries only the failed one after backoff', async () => {
+    setupNet({ items: [thumbItem(ID1)] });
+    const f = mkFlow({ replies: [{ offered: ['markdown', 'pdf'], subtype: 'document', captured: [cap('markdown')], failed: [{ format: 'pdf', reason: 'timeout' }] }] });
+    const exportTried = {};
+    let t = 1_000_000_000_000;
+    await run(f, { exportTried, exportMode: 'tab', now: () => t });
+    expect(exportTried[ID1]).toMatchObject({ ok: false, done: ['markdown'], failed: ['pdf'] });
+    // after the 7-day backoff: only the failed format is requested
+    t += 8 * 86400000;
+    setupNet({ items: [thumbItem(ID1)], state: { artifacts: stateFor(ID1, { exports: { 'export/document.md': 'a' } }) } });
+    f.tabs.sendMessage.mockImplementationOnce(async (id, m) => { expect(m.onlyFormats).toEqual(['pdf', 'png']); return { offered: ['markdown', 'pdf'], subtype: 'document', captured: [cap('pdf')], failed: [] }; });
+    const sum = await run(f, { exportTried, exportMode: 'tab', now: () => t });
+    expect(sum.captured).toBe(1);
+    expect(exportTried[ID1]).toMatchObject({ ok: true, done: ['markdown', 'pdf'] });
   });
 });
 

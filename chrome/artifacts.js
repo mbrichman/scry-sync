@@ -24,6 +24,7 @@ const ARTIFACT_PNG_TRIED_KEY = 'artifactsPngTried';
 const ARTIFACT_TOO_LARGE_KEY = 'artifactsTooLarge';
 const ARTIFACT_EXPORT_TRIED_KEY = 'artifactsExportTried';   // {id: {updated_at, at, ok}}
 const ARTIFACT_EXPORT_RETRY_MS = 7 * 24 * 3600 * 1000;
+const ARTIFACT_EXPORT_MAX_PER_RUN = 10;    // missing_export recaptures per run; the rest drain on later runs
 const ARTIFACT_EXPORT_TIMEOUT_MS = 20000;
 const ARTIFACT_EXPORT_LOAD_MS = 30000;
 const ARTIFACT_EXPORT_PATHS = { markdown: 'export/document.md', pdf: 'export/document.pdf' };
@@ -147,7 +148,7 @@ function artifactExportBackoffActive(map, item, now) {
 function artifactExportNeeded(entry, item, { exportTried = null, now = Date.now() } = {}) {
   if (artifactExportBackoffActive(exportTried, item, now)) return false;
   const t = exportTried && exportTried[item.id];
-  const doneHere = Boolean(t && t.ok === true && t.updated_at === (item.updated_at || null));
+  const doneHere = Boolean(t && t.ok === true && t.updated_at === (item.updated_at || null));   // partial (ok:false) never counts as done
   const ex = entry && entry.exports;
   const po = entry && entry.png_origin;
   if (ex === undefined || ex === null || po === undefined) return !doneHere;
@@ -743,7 +744,7 @@ async function captureArtifactExportsViaTab(openUrl, deps = {}) {
   if (!url) return empty('bad_open_url');
   if (!tabs || typeof tabs.sendMessage !== 'function') return empty('no_driver');
   let mode = deps.exportMode === 'window' ? 'window' : 'tab';
-  let res = await _exportAttempt(url, mode, deps, null);
+  let res = await _exportAttempt(url, mode, deps, deps.onlyFormats || null);
   const timedOut = res.failed.filter((f) => f.reason === 'timeout').map((f) => f.format);
   if (mode === 'tab' && !deps.exportMode && timedOut.length) {
     const r2 = await _exportAttempt(url, 'window', deps, timedOut);
@@ -886,8 +887,12 @@ async function captureOneArtifact(ctx, item, knownDetail) {
       report.export = { skipped: 'backoff' };
     } else {
       let cap;
+      const prior = ctx.exportTried && ctx.exportTried[item.id];
+      const priorDone = prior && prior.updated_at === (item.updated_at || null) && Array.isArray(prior.done) ? prior.done : [];
+      const onlyFormats = priorDone.length ? ['markdown', 'pdf', 'png'].filter((f) => !priorDone.includes(f)) : undefined;
       try {
         cap = await captureArtifactExportsViaTab(item.open_url, {
+          onlyFormats,
           tabs: ctx.tabs, windows: ctx.windows, sleep: ctx.sleep, keepalive: ctx.keepalive, scripting: ctx.scripting,
           title: item.title, exportMode: ctx.exportMode, now: ctx.now, ...(ctx.exportOpts || {}),
         });
@@ -901,9 +906,12 @@ async function captureOneArtifact(ctx, item, knownDetail) {
       for (const f of exportPieces.files) out.push(f);
       for (const m of exportPieces.manifest) manifest.push(m);
       if (ctx.exportTried) {
-        // Failures back off at once; success is memoised only after Scry accepts the ingest.
-        if (failed.length) ctx.exportTried[item.id] = { updated_at: item.updated_at || null, at: ctx.now(), ok: false };
-        else exportMemo = { updated_at: item.updated_at || null, at: ctx.now(), ok: true };
+        // Failures back off at once (only the failed formats are retried later);
+        // captured formats are marked done only after Scry accepts the ingest.
+        const done = Array.from(new Set(priorDone.concat(exportPieces.captured.map((c) => c.format))));
+        const failedFormats = failed.map((f) => f.format);
+        if (failed.length) ctx.exportTried[item.id] = { updated_at: item.updated_at || null, at: ctx.now(), ok: false, done: priorDone, failed: failedFormats };
+        exportMemo = { updated_at: item.updated_at || null, at: ctx.now(), ok: failed.length === 0, done, failed: failedFormats };
       }
     }
   }
@@ -928,7 +936,7 @@ async function captureOneArtifact(ctx, item, knownDetail) {
   if (!resp.ok) throw new Error(`artifact ingest HTTP ${resp.status}`);
   // A rejected preview must not make the planner re-capture as missing_png every run.
   if (png && png.origin === 'thumbnail' && artifactPngRejected(resp.body) && ctx.pngTried) ctx.pngTried[item.id] = ctx.now();
-  if (exportMemo && ctx.exportTried) ctx.exportTried[item.id] = exportMemo;
+  if (exportMemo && ctx.exportTried) ctx.exportTried[item.id] = exportMemo;   // ok:true, or ok:false carrying the now-ingested done formats
   return { type, files_sent: out.length, files_failed: report.files_failed.length, png: Boolean(png) };
 }
 
@@ -968,18 +976,28 @@ async function runArtifactCollector(deps) {
     const detailFailed = new Set(sum.errors.map((e) => e.id));
     sum.skipped = items.filter((i) => !detailFailed.has(i.id)).length - todo.length;
     let n = 0;
+    let exportOnly = 0;
     for (const t of todo) {
       n++;
       progress(`capturing ${n}/${todo.length}`);
       const it = byId.get(t.id);
+      if (t.reason === 'missing_export') {
+        if (exportOnly >= ARTIFACT_EXPORT_MAX_PER_RUN) { sum.export_deferred = (sum.export_deferred || 0) + 1; continue; }
+        exportOnly++;
+      }
       if (artifactTooLargeBackoffActive(ctx.tooLarge, it, ctx.now())) {
         sum.too_large.push({ id: t.id, reason: ctx.tooLarge[t.id].reason, backoff: true });
         continue;
       }
       try {
-        await captureOneArtifact(ctx, byId.get(t.id), details.get(t.id) || null);
-        sum.captured++;
-        delete ctx.tooLarge[t.id];
+        try {
+          await captureOneArtifact(ctx, byId.get(t.id), details.get(t.id) || null);
+          sum.captured++;
+          delete ctx.tooLarge[t.id];
+        } finally {
+          // Persist backoffs as each artifact finishes, so a later abort or a killed worker keeps them.
+          if (deps.persist) { try { await deps.persist(); } catch { /* best-effort */ } }
+        }
       } catch (e) {
         if (e instanceof ArtifactAbort) throw e;
         if (e instanceof ArtifactTooLarge) {
@@ -1147,7 +1165,8 @@ async function runArtifactsJob(mode, { scheduled = false } = {}) {
       const pngTried = (await _storageGet([ARTIFACT_PNG_TRIED_KEY]))[ARTIFACT_PNG_TRIED_KEY] || {};
       const tooLarge = (await _storageGet([ARTIFACT_TOO_LARGE_KEY]))[ARTIFACT_TOO_LARGE_KEY] || {};
       const exportTried = (await _storageGet([ARTIFACT_EXPORT_TRIED_KEY]))[ARTIFACT_EXPORT_TRIED_KEY] || {};
-      const sum = await runArtifactCollector({ orgId, scry, tabs: chrome.tabs, windows: chrome.windows, keepalive, onProgress, pngTried, tooLarge, exportTried, exportMode: scry.artifactsExportMode });
+      const persist = () => _storageSet({ [ARTIFACT_PNG_TRIED_KEY]: pngTried, [ARTIFACT_TOO_LARGE_KEY]: tooLarge, [ARTIFACT_EXPORT_TRIED_KEY]: exportTried });
+      const sum = await runArtifactCollector({ orgId, scry, tabs: chrome.tabs, windows: chrome.windows, keepalive, onProgress, pngTried, tooLarge, exportTried, exportMode: scry.artifactsExportMode, persist });
       await _storageSet({ [ARTIFACT_PNG_TRIED_KEY]: pngTried, [ARTIFACT_TOO_LARGE_KEY]: tooLarge, [ARTIFACT_EXPORT_TRIED_KEY]: exportTried });
       const lines = [formatArtifactRunSummary(sum)];
       for (const e of sum.errors.slice(0, 10)) lines.push(`  ${e.id || '-'}: ${e.reason}`);
@@ -1181,6 +1200,6 @@ if (typeof module !== 'undefined' && module.exports) {
     formatArtifactRunSummary, formatArtifactDiagnostics, artifactTabUrl,
     ArtifactAbort, createArtifactGate, artifactGatedFetch, fetchArtifactList, fetchArtifactDetail,
     attemptArtifactDownload, downloadArtifactFile, fetchArtifactThumbnail, handleArtifactDbMessage,
-    captureArtifactDbViaTab, captureArtifactExportsViaTab, prepareArtifactExports, artifactExportNeeded, artifactExportBackoffActive, artifactDetailIsTyped, ARTIFACT_EXPORT_PATHS, ARTIFACT_EXPORT_TRIED_KEY, captureOneArtifact, runArtifactCollector, runArtifactDiagnostics,
+    captureArtifactDbViaTab, captureArtifactExportsViaTab, prepareArtifactExports, artifactExportNeeded, artifactExportBackoffActive, artifactDetailIsTyped, ARTIFACT_EXPORT_PATHS, ARTIFACT_EXPORT_TRIED_KEY, ARTIFACT_EXPORT_MAX_PER_RUN, captureOneArtifact, runArtifactCollector, runArtifactDiagnostics,
   };
 }

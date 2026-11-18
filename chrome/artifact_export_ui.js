@@ -11,6 +11,7 @@
 //   format   - a button inside the export dialog whose name starts "Markdown", "PDF" or "PNG"
 //   dismiss  - the button "Dismiss" inside the "Duplicate this artifact" tip dialog
 //   close    - the button "Close" inside a dialog
+//   radio    - ONLY the radio named exactly "Export" inside the radiogroup "Share or export" of a dialog
 // Delete / Rename / Duplicate / Share / Permissions / Word / anything else throws.
 (() => {
   const FORMAT_PREFIXES = { markdown: 'markdown', pdf: 'pdf', png: 'png' };
@@ -49,6 +50,7 @@
       case 'export': return role === 'menuitem' && n === 'Export';
       case 'format': return role === 'button' && ctx.inDialog === true && WANTED_PREFIXES.some((p) => n.startsWith(p)) && !DENY.test(n);
       case 'dismiss': return role === 'button' && ctx.inTipDialog === true && n === 'Dismiss';
+      case 'radio': return role === 'radio' && n === 'Export' && ctx.inExportRadiogroup === true && ctx.inDialog === true;
       case 'close': return role === 'button' && ctx.inDialog === true && n === 'Close';
       default: return false;
     }
@@ -65,7 +67,7 @@
   function fileMatchesFormat(fmt, file) {
     const ct = String((file && file.content_type) || '').split(';')[0].trim().toLowerCase();
     const fn = String((file && file.filename) || '').toLowerCase();
-    if (fmt === 'markdown') return ['text/markdown', 'text/x-markdown', 'text/plain'].includes(ct) || /\.(md|markdown)$/.test(fn);
+    if (fmt === 'markdown') return ['text/markdown', 'text/x-markdown'].includes(ct) || /\.(md|markdown)$/.test(fn);
     if (fmt === 'pdf') return ct === 'application/pdf' || fn.endsWith('.pdf');
     if (fmt === 'png') return ct === 'image/png' || fn.endsWith('.png');
     return false;
@@ -106,6 +108,7 @@
         inBanner: within(el, isBanner),
         inTipDialog: within(el, (p) => isDialog(p) && /duplicate this artifact/i.test(norm(p.textContent))),
         inDialog: within(el, isDialog),
+        inExportRadiogroup: within(el, (p) => roleOf(p) === 'radiogroup' && /^share or export$/i.test(norm(p.getAttribute && p.getAttribute('aria-label')))),
       };
       if (!clickAllowed(kind, role, name, ctx)) throw new Error('blocked_click');
       clicks.push(kind);
@@ -140,9 +143,20 @@
       return d ? all(d).filter((e) => roleOf(e) === 'button' && formatKeyOf(nameOf(e))) : [];
     };
 
+    // The dialog may open on its Share pane: select the "Export" radio (only that one).
+    async function ensureExportPane() {
+      if (formatButtons().length) return;
+      const d = exportDialog();
+      if (!d) return;
+      const radio = all(d).find((e) => roleOf(e) === 'radio' && nameOf(e) === 'Export' && within(e, (p) => roleOf(p) === 'radiogroup' && /^share or export$/i.test(norm(p.getAttribute && p.getAttribute('aria-label')))));
+      if (!radio || (radio.getAttribute && radio.getAttribute('aria-checked') === 'true')) return;
+      guardedClick('radio', radio);
+      await waitFor(() => formatButtons().length, 3000);
+    }
+
     // Open the export dialog from scratch (tip, title button, Export item).
     async function openExportDialog(title, timeoutMs) {
-      if (exportDialog()) return null;
+      if (exportDialog()) { await ensureExportPane(); return null; }
       await dismissTip();
       const tb = await waitFor(() => titleButton(title), timeoutMs);
       if (!tb) return 'title_button_not_found';
@@ -153,6 +167,7 @@
       const d = await waitFor(exportDialog, 5000);
       if (!d) return 'dialog_not_found';
       await dismissTip();
+      await ensureExportPane();
       return null;
     }
 
@@ -189,6 +204,7 @@
         out.offered = Array.from(keys);
         const sel = selectExportFormats(out.offered);
         out.subtype = sel.subtype;
+        if (!sel.wanted.length) { out.failed.push({ format: '*', reason: 'no_formats_offered' }); await closeDialog(); return out; }
         const wanted = opts.onlyFormats ? sel.wanted.filter((f) => opts.onlyFormats.includes(f)) : sel.wanted;
         for (const fmt of wanted) {
           const reopen = await openExportDialog(opts.title, 10000);

@@ -48,7 +48,6 @@
   let seq = 0;
   const saved = {};
   const blobIds = new Map();      // blob: URL -> id
-  const handled = new WeakSet();  // anchors already intercepted
   const b64 = (buf) => {
     const u8 = new Uint8Array(buf);
     let s = '';
@@ -70,8 +69,7 @@
   };
   function interceptAnchor(a) {
     // Returns true when the click was taken over (the real download suppressed).
-    if (!armed || !isDownloadAnchor(a) || handled.has(a)) return false;
-    handled.add(a);
+    if (!armed || !isDownloadAnchor(a)) return false;   // per click: a reused anchor is suppressed every time
     const name = a.getAttribute('download') || null;
     const href = String(a.href || '');
     if (blobIds.has(href)) { post({ type: 'export_name', id: blobIds.get(href), filename: name }); return true; }
