@@ -55,7 +55,7 @@ describe('planner', () => {
     const d = { ver: '3', files: [{ path: 'index.html', sha256: 'zz' }] };
     expect(A.planArtifact(item(), entry(), { detail: d }).reason).toBe('manifest_changed');
     const dv = { ver: '3', files: [{ path: 'index.html', sha256: 'aa' }, { path: 'artifact-type/x.js', sha256: 'new' }] };
-    expect(A.planArtifact(item(), entry(), { detail: dv }).capture).toBe(false);
+    expect(A.planArtifact(item(), entry({ exports: {}, png_origin: 'export' }), { detail: dv }).capture).toBe(false);
   });
   it('missing png recaptures unless recently tried', () => {
     expect(A.planArtifact(item(), entry({ has_png: false })).reason).toBe('missing_png');
@@ -542,7 +542,7 @@ describe('contract fixes (server review)', () => {
     expect(A.artifactManifestChanged(files, { 'index.html': hex })).toBe(false);
     expect(A.artifactManifestChanged([{ path: 'index.html', sha256: hex.toUpperCase() }], { 'index.html': hex })).toBe(false);
     expect(A.artifactManifestChanged(files, { 'index.html': 'other' })).toBe(true);
-    expect(A.planArtifact({ id: 'x', updated_at: 'u', thumbnail_url: null }, { updated_at: 'u', files: { 'index.html': hex }, has_png: true }, { detail: { files } }).capture).toBe(false);
+    expect(A.planArtifact({ id: 'x', updated_at: 'u', thumbnail_url: null }, { updated_at: 'u', files: { 'index.html': hex }, has_png: true, exports: {}, png_origin: 'export' }, { detail: { files } }).capture).toBe(false);
   });
   it('rejected-png detection', () => {
     expect(A.artifactPngRejected({ success: true, png_stored: false })).toBe(true);
