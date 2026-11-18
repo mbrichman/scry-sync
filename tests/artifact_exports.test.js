@@ -435,6 +435,8 @@ function mkFlow({ replies, withWindows = true }) {
   const windows = withWindows ? {
     create: vi.fn(async (o) => { log.push(['win.create', o.focused, o.type]); return { id: 99, tabs: [{ id: 55 }] }; }),
     remove: vi.fn(async (id) => { log.push(['win.remove', id]); }),
+    getLastFocused: vi.fn(async () => ({ id: 7 })),
+    update: vi.fn(async (id, o) => { log.push(['win.update', id, o.focused]); }),
   } : null;
   return { tabs, windows, log };
 }
@@ -452,7 +454,7 @@ describe('captureArtifactExportsViaTab', () => {
     expect(scriptingStub.unregisterContentScripts.mock.calls.length).toBe(2);
     expect(f.windows.create).not.toHaveBeenCalled();
   });
-  it('a timed-out format falls back ONCE to an unfocused normal window for that format only', async () => {
+  it('a timed-out format falls back ONCE to a focused normal window for that format only', async () => {
     const f = mkFlow({ replies: [
       { offered: ['markdown', 'pdf'], subtype: 'document', captured: [cap('markdown')], failed: [{ format: 'pdf', reason: 'timeout' }] },
       { offered: ['markdown', 'pdf'], subtype: 'document', captured: [cap('pdf')], failed: [] },
@@ -461,7 +463,7 @@ describe('captureArtifactExportsViaTab', () => {
     expect(r.mode).toBe('window');
     expect(r.captured.map((c) => c.format)).toEqual(['markdown', 'pdf']);
     expect(r.failed).toEqual([]);
-    expect(f.log).toEqual([['tab.create', false], ['send', 10, null], ['tab.remove', 10], ['win.create', false, 'normal'], ['send', 55, ['pdf']], ['win.remove', 99]]);
+    expect(f.log).toEqual([['tab.create', false], ['send', 10, null], ['tab.remove', 10], ['win.create', true, 'normal'], ['send', 55, ['pdf']], ['win.remove', 99], ['win.update', 7, true]]);
   });
   it('a menu/dialog that never renders in the background tab retries the whole run ONCE in a window', async () => {
     // Live finding 2026-11-18: in an inactive tab Claude's menu never rendered
@@ -476,8 +478,19 @@ describe('captureArtifactExportsViaTab', () => {
       expect(r.subtype).toBe('document');
       expect(r.captured.map((c) => c.format)).toEqual(['markdown', 'pdf']);
       expect(r.failed).toEqual([]);
-      expect(f.log).toEqual([['tab.create', false], ['send', 10, null], ['tab.remove', 10], ['win.create', false, 'normal'], ['send', 55, null], ['win.remove', 99]]);
+      expect(f.log).toEqual([['tab.create', false], ['send', 10, null], ['tab.remove', 10], ['win.create', true, 'normal'], ['send', 55, null], ['win.remove', 99], ['win.update', 7, true]]);
     }
+  });
+  it('the retry window takes focus (menus close in an unfocused document) and focus goes back afterwards', async () => {
+    const f = mkFlow({ replies: [{ offered: [], subtype: null, captured: [], failed: [] }] });
+    await A.captureArtifactExportsViaTab('/artifact/x', { ...base, tabs: f.tabs, windows: f.windows, scripting: scriptingStub, exportMode: 'window' });
+    expect(f.log).toEqual([['win.create', true, 'normal'], ['send', 55, null], ['win.remove', 99], ['win.update', 7, true]]);
+    // No previously focused window (or the lookup fails): nothing to restore, no throw.
+    const f2 = mkFlow({ replies: [{ offered: [], subtype: null, captured: [], failed: [] }] });
+    f2.windows.getLastFocused = vi.fn(async () => { throw new Error('none'); });
+    const r2 = await A.captureArtifactExportsViaTab('/artifact/x', { ...base, tabs: f2.tabs, windows: f2.windows, scripting: scriptingStub, exportMode: 'window' });
+    expect(r2.failed).toEqual([]);
+    expect(f2.log.at(-1)).toEqual(['win.remove', 99]);
   });
   it('a UI failure in the window too is reported once, not retried again', async () => {
     const u = { offered: [], subtype: null, captured: [], failed: [{ format: '*', reason: 'menu_not_opened' }] };

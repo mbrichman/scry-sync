@@ -686,8 +686,8 @@ async function captureArtifactDbViaTab(openUrl, deps = {}) {
 
 const _NO_RECEIVER = /receiving end does not exist|could not establish connection/i;
 
-// One attempt in one tab (mode 'tab': inactive tab) or one UNFOCUSED normal
-// window (mode 'window'). Always closes what it opened and unregisters the scripts.
+// One attempt in one tab (mode 'tab': inactive tab) or one briefly FOCUSED
+// normal window (mode 'window'). Always closes what it opened and unregisters the scripts.
 async function _exportAttempt(url, mode, deps, only) {
   const tabs = deps.tabs || chrome.tabs;
   const windows = deps.windows || (typeof chrome !== 'undefined' ? chrome.windows : null);
@@ -698,10 +698,15 @@ async function _exportAttempt(url, mode, deps, only) {
   const loadMs = deps.exportLoadMs || ARTIFACT_EXPORT_LOAD_MS;
   let tabId = null;
   let winId = null;
+  let prevWinId = null;
   try {
     await registerArtifactCaptureScripts(scripting);
     if (mode === 'window') {
-      const w = await windows.create({ url, focused: false, type: 'normal' });
+      // FOCUSED: Claude's menus close themselves when the document has no focus
+      // (live 2026-11-18: menu_not_opened in an inactive tab AND in an unfocused
+      // window). Focus goes back to the previous window in `finally`.
+      try { const pw = await windows.getLastFocused(); prevWinId = pw && pw.id != null ? pw.id : null; } catch { prevWinId = null; }
+      const w = await windows.create({ url, focused: true, type: 'normal' });
       winId = w.id;
       tabId = w.tabs && w.tabs[0] ? w.tabs[0].id : null;
       if (tabId == null) return { offered: [], subtype: null, captured: [], failed: [{ format: '*', reason: 'no_tab' }] };
@@ -728,13 +733,14 @@ async function _exportAttempt(url, mode, deps, only) {
   } finally {
     if (winId != null) { try { await windows.remove(winId); } catch { /* already closed */ } }
     else if (tabId != null) { try { await tabs.remove(tabId); } catch { /* already closed */ } }
+    if (prevWinId != null) { try { await windows.update(prevWinId, { focused: true }); } catch { /* gone */ } }
     await unregisterArtifactCaptureScripts(scripting);
   }
 }
 
 const _EXPORT_UI_RETRY = new Set(['title_button_not_found', 'menu_not_opened', 'dialog_not_found']);
 
-// deps.exportMode: undefined = inactive tab, falling back ONCE to an unfocused
+// deps.exportMode: undefined = inactive tab, falling back ONCE to a focused
 // window for formats that timed out; 'tab' / 'window' force one mode.
 // Returns {offered, subtype, captured[{format,content_type,size,b64,...}], failed[], mode, ms}.
 async function captureArtifactExportsViaTab(openUrl, deps = {}) {
@@ -749,7 +755,7 @@ async function captureArtifactExportsViaTab(openUrl, deps = {}) {
   let res = await _exportAttempt(url, mode, deps, deps.onlyFormats || null);
   // Claude's menu/dialog can fail to render in an inactive tab (seen live
   // 2026-11-18: menu_not_opened on every artifact): redo the whole run, once,
-  // in an unfocused window. blocked_click is never retried.
+  // in a focused window. blocked_click is never retried.
   const uiFailed = res.failed.some((f) => f.format === '*' && _EXPORT_UI_RETRY.has(f.reason));
   if (mode === 'tab' && !deps.exportMode && uiFailed) {
     const r2 = await _exportAttempt(url, 'window', deps, deps.onlyFormats || null);
