@@ -732,6 +732,8 @@ async function _exportAttempt(url, mode, deps, only) {
   }
 }
 
+const _EXPORT_UI_RETRY = new Set(['title_button_not_found', 'menu_not_opened', 'dialog_not_found']);
+
 // deps.exportMode: undefined = inactive tab, falling back ONCE to an unfocused
 // window for formats that timed out; 'tab' / 'window' force one mode.
 // Returns {offered, subtype, captured[{format,content_type,size,b64,...}], failed[], mode, ms}.
@@ -745,6 +747,14 @@ async function captureArtifactExportsViaTab(openUrl, deps = {}) {
   if (!tabs || typeof tabs.sendMessage !== 'function') return empty('no_driver');
   let mode = deps.exportMode === 'window' ? 'window' : 'tab';
   let res = await _exportAttempt(url, mode, deps, deps.onlyFormats || null);
+  // Claude's menu/dialog can fail to render in an inactive tab (seen live
+  // 2026-11-18: menu_not_opened on every artifact): redo the whole run, once,
+  // in an unfocused window. blocked_click is never retried.
+  const uiFailed = res.failed.some((f) => f.format === '*' && _EXPORT_UI_RETRY.has(f.reason));
+  if (mode === 'tab' && !deps.exportMode && uiFailed) {
+    const r2 = await _exportAttempt(url, 'window', deps, deps.onlyFormats || null);
+    return { ...r2, mode: 'window', ms: now() - t0 };
+  }
   const timedOut = res.failed.filter((f) => f.reason === 'timeout').map((f) => f.format);
   if (mode === 'tab' && !deps.exportMode && timedOut.length) {
     const r2 = await _exportAttempt(url, 'window', deps, timedOut);

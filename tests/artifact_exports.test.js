@@ -463,6 +463,36 @@ describe('captureArtifactExportsViaTab', () => {
     expect(r.failed).toEqual([]);
     expect(f.log).toEqual([['tab.create', false], ['send', 10, null], ['tab.remove', 10], ['win.create', false, 'normal'], ['send', 55, ['pdf']], ['win.remove', 99]]);
   });
+  it('a menu/dialog that never renders in the background tab retries the whole run ONCE in a window', async () => {
+    // Live finding 2026-11-18: in an inactive tab Claude's menu never rendered
+    // (menu_not_opened on every artifact); a visible page opens it fine.
+    for (const reason of ['title_button_not_found', 'menu_not_opened', 'dialog_not_found']) {
+      const f = mkFlow({ replies: [
+        { offered: [], subtype: null, captured: [], failed: [{ format: '*', reason }] },
+        { offered: ['markdown', 'pdf'], subtype: 'document', captured: [cap('markdown'), cap('pdf')], failed: [] },
+      ] });
+      const r = await A.captureArtifactExportsViaTab('/artifact/x', { ...base, tabs: f.tabs, windows: f.windows, scripting: scriptingStub, title: 'T' });
+      expect(r.mode).toBe('window');
+      expect(r.subtype).toBe('document');
+      expect(r.captured.map((c) => c.format)).toEqual(['markdown', 'pdf']);
+      expect(r.failed).toEqual([]);
+      expect(f.log).toEqual([['tab.create', false], ['send', 10, null], ['tab.remove', 10], ['win.create', false, 'normal'], ['send', 55, null], ['win.remove', 99]]);
+    }
+  });
+  it('a UI failure in the window too is reported once, not retried again', async () => {
+    const u = { offered: [], subtype: null, captured: [], failed: [{ format: '*', reason: 'menu_not_opened' }] };
+    const f = mkFlow({ replies: [u, u, u] });
+    const r = await A.captureArtifactExportsViaTab('/artifact/x', { ...base, tabs: f.tabs, windows: f.windows, scripting: scriptingStub });
+    expect(r.mode).toBe('window');
+    expect(r.failed).toEqual([{ format: '*', reason: 'menu_not_opened' }]);
+    expect(f.tabs.sendMessage).toHaveBeenCalledTimes(2);
+  });
+  it('blocked_click never falls back (the allow-list said no)', async () => {
+    const f = mkFlow({ replies: [{ offered: [], subtype: null, captured: [], failed: [{ format: '*', reason: 'blocked_click' }] }] });
+    const r = await A.captureArtifactExportsViaTab('/artifact/x', { ...base, tabs: f.tabs, windows: f.windows, scripting: scriptingStub });
+    expect(r.mode).toBe('tab');
+    expect(f.windows.create).not.toHaveBeenCalled();
+  });
   it('timeout in the window too: reported, not retried a third time', async () => {
     const t = { offered: ['png'], subtype: 'whiteboard', captured: [], failed: [{ format: 'png', reason: 'timeout' }] };
     const f = mkFlow({ replies: [t, t, t] });
