@@ -113,6 +113,15 @@ describe('click allow-list (pure)', () => {
     expect(X.clickAllowed('close', 'button', 'Close', { ...ok, inDialog: false })).toBe(false);
     expect(X.clickAllowed('anything-else', 'button', 'Export', ok)).toBe(false);
   });
+  it('icon-font glyphs and zero-width chars in labels are ignored (live: "\\uE063Export")', () => {
+    expect(X.clickAllowed('export', 'menuitem', '\uE063Export')).toBe(true);
+    expect(X.clickAllowed('export', 'menuitem', '\u200BExport\uFEFF')).toBe(true);
+    expect(X.clickAllowed('export', 'menuitem', '\uE063Delete')).toBe(false);
+    expect(X.clickAllowed('format', 'button', '\uE0A1Markdown , Plain-text .md file', { inDialog: true })).toBe(true);
+    expect(X.clickAllowed('format', 'button', '\uE0A1Word , Editable', { inDialog: true })).toBe(false);
+    expect(X.formatKeyOf('\uE0A2PDF , Document')).toBe('pdf');
+    expect(X.titleMatches('\uE001Synthetic Title', 'Synthetic Title')).toBe(true);
+  });
   it('format selection never includes Word', () => {
     expect(X.selectExportFormats(['word', 'pdf', 'markdown'])).toEqual({ wanted: ['markdown', 'pdf'], subtype: 'document' });
     expect(X.selectExportFormats(['markdown'])).toEqual({ wanted: ['markdown'], subtype: 'document' });

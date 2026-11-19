@@ -17,7 +17,9 @@
   const FORMAT_PREFIXES = { markdown: 'markdown', pdf: 'pdf', png: 'png' };
   const WANTED_PREFIXES = ['Markdown', 'PDF', 'PNG'];
   const DENY = /^(share|pin|rename|duplicate|refresh|permissions|delete|word|more formats|show all comments|version history|open in desktop app)\b/i;
-  const norm = (s) => String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  // Claude prefixes menu labels with icon-font glyphs from the Private Use Area
+  // (live 2026-11-19: "\uE063Export"); strip those and zero-width chars first.
+  const norm = (s) => String(s == null ? '' : s).replace(/[\uE000-\uF8FF\u200B-\u200D\u2060\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
 
   function roleOf(el) {
     const r = el && el.getAttribute && el.getAttribute('role');
