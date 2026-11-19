@@ -136,6 +136,8 @@ function artifactDetailIsTyped(detail) {
 }
 
 // Export backoff: a failed export attempt for (id, updated_at) is not retried for 7 days.
+const ARTIFACT_EXPORT_STALE_COOLDOWN_MS = 24 * 3600 * 1000;
+
 function artifactExportBackoffActive(map, item, now) {
   const t = map && map[item.id];
   // Only a failure recorded by THIS extension version backs off: a new version
@@ -151,8 +153,13 @@ function artifactExportNeeded(entry, item, { exportTried = null, now = Date.now(
   if (artifactExportBackoffActive(exportTried, item, now)) return false;
   // Scry says the stored export came from an earlier version (an edit whose
   // re-export failed): needed again, whatever the local memo says.
-  if (entry && entry.exports_stale === true) return true;
   const t = exportTried && exportTried[item.id];
+  if (entry && entry.exports_stale === true) {
+    // ...but not again within 24 h of a successful export of this same version
+    // (e.g. a format the new version no longer offers keeps an old stamp).
+    const recentOk = Boolean(t && t.ok === true && t.updated_at === (item.updated_at || null) && typeof t.at === 'number' && now - t.at < ARTIFACT_EXPORT_STALE_COOLDOWN_MS);
+    return !recentOk;
+  }
   const doneHere = Boolean(t && t.ok === true && t.updated_at === (item.updated_at || null));   // partial (ok:false) never counts as done
   const ex = entry && entry.exports;
   const po = entry && entry.png_origin;

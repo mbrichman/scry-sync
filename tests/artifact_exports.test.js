@@ -518,8 +518,11 @@ describe('export planner', () => {
     const stale = { ...full, exports_stale: true };
     expect(A.artifactExportNeeded(stale, item, { now })).toBe(true);
     expect(A.artifactExportNeeded({ exports: {}, png_origin: 'export', exports_stale: true }, item, { now })).toBe(true);
-    // even an ok memo for this updated_at does not hide a stale export (the ingest did not land)
-    expect(A.artifactExportNeeded(stale, item, { exportTried: { [ID1]: { updated_at: 'u1', at: now, ok: true, v: 'test' } }, now })).toBe(true);
+    // a successful export for this updated_at under 24 h ago: no re-capture (a format the new
+    // version no longer offers must not cause a capture every run); after 24 h, retried
+    expect(A.artifactExportNeeded(stale, item, { exportTried: { [ID1]: { updated_at: 'u1', at: now - 1000, ok: true, v: 'test' } }, now })).toBe(false);
+    expect(A.artifactExportNeeded(stale, item, { exportTried: { [ID1]: { updated_at: 'u1', at: now - 25 * 3600000, ok: true, v: 'test' } }, now })).toBe(true);
+    expect(A.artifactExportNeeded(stale, item, { exportTried: { [ID1]: { updated_at: 'u0', at: now - 1000, ok: true, v: 'test' } }, now })).toBe(true);
     // a same-version failure for this updated_at still backs off
     expect(A.artifactExportNeeded(stale, item, { exportTried: { [ID1]: { updated_at: 'u1', at: now - 1000, ok: false, v: 'test' } }, now })).toBe(false);
     // an old server (no field) behaves as before
