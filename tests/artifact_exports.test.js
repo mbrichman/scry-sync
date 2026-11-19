@@ -509,10 +509,17 @@ describe('export planner', () => {
     expect(A.artifactExportNeeded({ exports: {}, png_origin: 'thumbnail' }, item, { now })).toBe(true);
   });
   it('7-day backoff keyed by (id, updated_at) after a failure', () => {
-    const t = { [ID1]: { updated_at: 'u1', at: now - 1000, ok: false } };
+    const t = { [ID1]: { updated_at: 'u1', at: now - 1000, ok: false, v: 'test' } };
     expect(A.artifactExportNeeded({ exports: {}, png_origin: 'thumbnail' }, item, { exportTried: t, now })).toBe(false);
     expect(A.artifactExportNeeded({ exports: {}, png_origin: 'thumbnail' }, { ...item, updated_at: 'u2' }, { exportTried: t, now })).toBe(true);
-    expect(A.artifactExportNeeded({ exports: {}, png_origin: 'thumbnail' }, item, { exportTried: { [ID1]: { updated_at: 'u1', at: now - 8 * 86400000, ok: false } }, now })).toBe(true);
+    expect(A.artifactExportNeeded({ exports: {}, png_origin: 'thumbnail' }, item, { exportTried: { [ID1]: { updated_at: 'u1', at: now - 8 * 86400000, ok: false, v: 'test' } }, now })).toBe(true);
+  });
+  it('a failure recorded by a DIFFERENT extension version does not back off (a fixed driver retries at once)', () => {
+    // Live 2026-11-19: a 3.7.0-era menu_not_opened memo held the artifact for 7 days after the fix.
+    const e = { exports: {}, png_origin: 'thumbnail' };
+    expect(A.artifactExportNeeded(e, item, { exportTried: { [ID1]: { updated_at: 'u1', at: now - 1000, ok: false } }, now })).toBe(true);           // pre-versioned memo
+    expect(A.artifactExportNeeded(e, item, { exportTried: { [ID1]: { updated_at: 'u1', at: now - 1000, ok: false, v: '3.6.9' } }, now })).toBe(true);
+    expect(A.artifactExportBackoffActive({ [ID1]: { updated_at: 'u1', at: now - 1000, ok: false, v: 'test' } }, item, now)).toBe(true);
   });
   it('planArtifact: typed detail with a missing export -> missing_export; plain detail never', () => {
     const typed = { files: [{ path: 'artifact-type/a.js' }] };
@@ -879,9 +886,9 @@ describe('diagnostics: export test (dry run)', () => {
 });
 
 describe('release', () => {
-  it('manifest version is 3.7.0 and still has no static artifact content scripts', () => {
+  it('manifest version is 3.7.1 and still has no static artifact content scripts', () => {
     const m = JSON.parse(fs.readFileSync('chrome/manifest.json', 'utf8'));
-    expect(m.version).toBe('3.7.0');
+    expect(m.version).toBe('3.7.1');
     expect(JSON.stringify(m.content_scripts)).not.toContain('artifact_');
     expect(m.permissions).toContain('tabs');
   });

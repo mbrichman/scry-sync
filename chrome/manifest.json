@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Scry Sync",
-    "version": "3.7.0",
+    "version": "3.7.1",
     "description": "Sync your Claude.ai and ChatGPT conversations (with images and file originals), and your claude.ai artifacts, into Scry.",
       "permissions": [
     "activeTab",

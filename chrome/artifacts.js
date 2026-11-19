@@ -138,7 +138,9 @@ function artifactDetailIsTyped(detail) {
 // Export backoff: a failed export attempt for (id, updated_at) is not retried for 7 days.
 function artifactExportBackoffActive(map, item, now) {
   const t = map && map[item.id];
-  return Boolean(t && t.ok === false && t.updated_at === (item.updated_at || null) && typeof t.at === 'number' && now - t.at < ARTIFACT_EXPORT_RETRY_MS);
+  // Only a failure recorded by THIS extension version backs off: a new version
+  // usually ships a driver fix, so everything that failed before retries at once.
+  return Boolean(t && t.ok === false && t.v === _clientVersion() && t.updated_at === (item.updated_at || null) && typeof t.at === 'number' && now - t.at < ARTIFACT_EXPORT_RETRY_MS);
 }
 
 // Does a typed artifact still need its export capture? `entry` is Scry's state
@@ -931,8 +933,8 @@ async function captureOneArtifact(ctx, item, knownDetail) {
         // captured formats are marked done only after Scry accepts the ingest.
         const done = Array.from(new Set(priorDone.concat(exportPieces.captured.map((c) => c.format))));
         const failedFormats = failed.map((f) => f.format);
-        if (failed.length) ctx.exportTried[item.id] = { updated_at: item.updated_at || null, at: ctx.now(), ok: false, done: priorDone, failed: failedFormats };
-        exportMemo = { updated_at: item.updated_at || null, at: ctx.now(), ok: failed.length === 0, done, failed: failedFormats };
+        if (failed.length) ctx.exportTried[item.id] = { updated_at: item.updated_at || null, at: ctx.now(), ok: false, v: _clientVersion(), done: priorDone, failed: failedFormats };
+        exportMemo = { updated_at: item.updated_at || null, at: ctx.now(), ok: failed.length === 0, v: _clientVersion(), done, failed: failedFormats };
       }
     }
   }
