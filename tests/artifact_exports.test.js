@@ -687,7 +687,7 @@ function setupNet({ items, state = { artifacts: {} } }) {
     calls.push(u);
     if (u.startsWith('https://claude.ai/api/frame/artifacts?')) return mkResp(200, { artifacts: items, hosted_total: items.length });
     for (const it of items) {
-      if (u.startsWith(`https://claude.ai/api/frame/${it.id}?`)) return mkResp(200, it.kind === 'snippet' ? { ver: 'v1', viewerOrigin: `https://${it.id}.frame.claudeusercontent.com`, assetToken: 'A', files: [{ path: 'main.py', size: 3, contentType: 'text/x-python', sha256: sha('abc') }] } : typedDetail(it.id));
+      if (u.startsWith(`https://claude.ai/api/frame/${it.id}?`)) return mkResp(200, it.plain ? { ver: 'v1', viewerOrigin: `https://${it.id}.frame.claudeusercontent.com`, assetToken: 'A', files: [{ path: 'main.py', size: 3, contentType: 'text/x-python', sha256: sha('abc') }] } : typedDetail(it.id));
       if (u.includes('_thumb')) return mkResp(200, new Uint8Array([0x89, 0x50, 0x4e, 0x47, 9]), 'image/png');
       if (u.includes(`${it.id}.frame.claudeusercontent.com/_f/`)) return u.includes('main.py') ? mkResp(200, bytesOf('abc'), 'text/x-python') : mkResp(200, HTML, 'text/html');
       if (u.includes(`${it.id}.frame.claudeusercontent.com/_thumb`)) return mkResp(200, new Uint8Array([0x89, 0x50, 0x4e, 0x47, 9]), 'image/png');
@@ -768,7 +768,7 @@ describe('collector: export capture', () => {
   });
 
   it('no export capture for plain pages, and none when disabled by ctx', async () => {
-    const net = setupNet({ items: [thumbItem(ID1, { kind: 'snippet' })] });
+    const net = setupNet({ items: [thumbItem(ID1, { kind: 'page', plain: true })] });
     const f = exportTabs([]);
     await run(f);
     expect(f.tabs.sendMessage).not.toHaveBeenCalled();
@@ -854,22 +854,18 @@ describe('snippets', () => {
   let orig;
   beforeEach(() => { orig = global.fetch; });
   afterEach(() => { global.fetch = orig; });
-  it('a snippet is captured like a page: files fetched, type = its content type, reason recorded', async () => {
-    const net = setupNet({ items: [thumbItem(ID1, { kind: 'snippet', thumbnail_url: null })] });
-    const sum = await run(mkFlow({ replies: [] }));
-    expect(sum).toMatchObject({ captured: 1, failed: 0 });
-    const p = net.ingests[0];
-    expect(p.artifact.type).toBe('text/x-python');
-    expect(p.files.map((x) => x.path)).toEqual(['main.py']);
-    expect(p.fetch_report.snippet).toEqual({ files: 1, content_type: 'text/x-python', reason: null });
-  });
-  it('a snippet whose files cannot be fetched records why', async () => {
+  it('snippets are skipped: no detail request, no ingest, counted as saved with their conversation, not failed', async () => {
+    // Live 2026-11-19 (mini): the four snippets failed "detail 404" — a snippet is an in-chat
+    // artifact with no frame page; its text is already stored with its conversation.
     const net = setupNet({ items: [thumbItem(ID1, { kind: 'snippet', thumbnail_url: null })] });
     const g = global.fetch;
-    global.fetch = vi.fn(async (u, i) => (String(u).includes('/_f/') ? mkResp(404, {}, 'application/json') : g(u, i)));
-    await run(mkFlow({ replies: [] }));
-    expect(net.ingests[0].fetch_report.snippet.reason).toBe('download_failed');
-    expect(net.ingests[0].files).toEqual([]);
+    const urls = [];
+    global.fetch = vi.fn(async (u, i) => { urls.push(String(u)); return g(u, i); });
+    const sum = await run(mkFlow({ replies: [] }));
+    expect(sum).toMatchObject({ listed: 1, captured: 0, failed: 0, skipped: 0, snippets_in_conversation: 1 });
+    expect(net.ingests).toEqual([]);
+    expect(urls.some((u) => u.includes(`/api/frame/${ID1}`))).toBe(false);
+    expect(A.formatArtifactRunSummary(sum)).toContain('snippets 1 (saved with their conversations)');
   });
 });
 
@@ -900,9 +896,9 @@ describe('diagnostics: export test (dry run)', () => {
 });
 
 describe('release', () => {
-  it('manifest version is 3.7.1 and still has no static artifact content scripts', () => {
+  it('manifest version is 3.7.2 and still has no static artifact content scripts', () => {
     const m = JSON.parse(fs.readFileSync('chrome/manifest.json', 'utf8'));
-    expect(m.version).toBe('3.7.1');
+    expect(m.version).toBe('3.7.2');
     expect(JSON.stringify(m.content_scripts)).not.toContain('artifact_');
     expect(m.permissions).toContain('tabs');
   });

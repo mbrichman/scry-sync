@@ -433,6 +433,7 @@ function createArtifactDbSession(opts = {}) {
 function formatArtifactRunSummary(s) {
   if (!s) return '';
   const parts = [`listed ${s.listed || 0}`, `captured ${s.captured || 0}`, `skipped ${s.skipped || 0}`, `failed ${s.failed || 0}`];
+  if (s.snippets_in_conversation) parts.push(`snippets ${s.snippets_in_conversation} (saved with their conversations)`);
   if (s.too_large && s.too_large.length) parts.push(`too_large ${s.too_large.length}`);
   if (s.aborted) parts.push(`aborted: ${s.aborted}`);
   return parts.join(' | ');
@@ -984,11 +985,15 @@ async function runArtifactCollector(deps) {
   };
   const progress = deps.onProgress || (() => {});
   ctx.gate.resetRun();
-  const sum = { listed: 0, captured: 0, skipped: 0, failed: 0, too_large: [], aborted: null, errors: [] };
+  const sum = { listed: 0, captured: 0, skipped: 0, failed: 0, snippets_in_conversation: 0, too_large: [], aborted: null, errors: [] };
   try {
     progress('listing artifacts');
-    const { items, meta } = await fetchArtifactList(ctx.gate, ctx.orgId);
-    sum.listed = items.length;
+    const { items: listed, meta } = await fetchArtifactList(ctx.gate, ctx.orgId);
+    sum.listed = listed.length;
+    // Snippets are in-chat artifacts: no frame page (detail 404), and their text is
+    // already stored with the conversation by the chat sync. Not captured here.
+    const items = listed.filter((i) => i.kind !== 'snippet');
+    sum.snippets_in_conversation = listed.length - items.length;
     sum.truncated = meta.truncated;
     progress('reading Scry state');
     const state = await fetchScryArtifactState(ctx.scry);
