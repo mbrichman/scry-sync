@@ -149,6 +149,9 @@ function artifactExportBackoffActive(map, item, now) {
 // not cause a daily recapture.
 function artifactExportNeeded(entry, item, { exportTried = null, now = Date.now() } = {}) {
   if (artifactExportBackoffActive(exportTried, item, now)) return false;
+  // Scry says the stored export came from an earlier version (an edit whose
+  // re-export failed): needed again, whatever the local memo says.
+  if (entry && entry.exports_stale === true) return true;
   const t = exportTried && exportTried[item.id];
   const doneHere = Boolean(t && t.ok === true && t.updated_at === (item.updated_at || null));   // partial (ok:false) never counts as done
   const ex = entry && entry.exports;

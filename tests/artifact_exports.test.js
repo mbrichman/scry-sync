@@ -514,6 +514,17 @@ describe('export planner', () => {
     expect(A.artifactExportNeeded({ exports: {}, png_origin: 'thumbnail' }, { ...item, updated_at: 'u2' }, { exportTried: t, now })).toBe(true);
     expect(A.artifactExportNeeded({ exports: {}, png_origin: 'thumbnail' }, item, { exportTried: { [ID1]: { updated_at: 'u1', at: now - 8 * 86400000, ok: false, v: 'test' } }, now })).toBe(true);
   });
+  it('exports Scry marks stale (kept from before an edit) are needed again, subject to the backoff', () => {
+    const stale = { ...full, exports_stale: true };
+    expect(A.artifactExportNeeded(stale, item, { now })).toBe(true);
+    expect(A.artifactExportNeeded({ exports: {}, png_origin: 'export', exports_stale: true }, item, { now })).toBe(true);
+    // even an ok memo for this updated_at does not hide a stale export (the ingest did not land)
+    expect(A.artifactExportNeeded(stale, item, { exportTried: { [ID1]: { updated_at: 'u1', at: now, ok: true, v: 'test' } }, now })).toBe(true);
+    // a same-version failure for this updated_at still backs off
+    expect(A.artifactExportNeeded(stale, item, { exportTried: { [ID1]: { updated_at: 'u1', at: now - 1000, ok: false, v: 'test' } }, now })).toBe(false);
+    // an old server (no field) behaves as before
+    expect(A.artifactExportNeeded(full, item, { now })).toBe(false);
+  });
   it('a failure recorded by a DIFFERENT extension version does not back off (a fixed driver retries at once)', () => {
     // Live 2026-11-19: a 3.7.0-era menu_not_opened memo held the artifact for 7 days after the fix.
     const e = { exports: {}, png_origin: 'thumbnail' };
