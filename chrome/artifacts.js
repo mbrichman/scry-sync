@@ -456,7 +456,7 @@ function formatArtifactDiagnostics(d) {
     for (const c of e.captured) L.push(`  captured ${c.format}: ${c.bytes} bytes, ${c.content_type || '-'}`);
     for (const f of e.failed) L.push(`  failed ${f.format}: ${f.reason}`);
     if (e.clicks && e.clicks.length) L.push(`  clicks: ${e.clicks.join(', ')}`);
-    for (const p of e.probe || []) L.push(`  probe ${p.stage}: focus ${p.focus} vis ${p.vis} expanded ${p.expanded} connected ${p.connected} menus ${p.menus} items ${p.items} dialogs ${p.dialogs}`);
+    for (const p of e.probe || []) L.push(`  probe ${p.stage}: focus ${p.focus} vis ${p.vis} expanded ${p.expanded} menus ${p.menus} items ${p.items} dialogs ${p.dialogs}${p.labels ? ' [' + p.labels.join(' | ') + ']' : ''}`);
   }
   L.push(`SUMMARY: working download strategies = ${(d.working_strategies || []).join(', ') || 'NONE'}; thumbnail fetchable = ${d.thumbnail_ok === null ? 'untested' : d.thumbnail_ok}; tab db capture = ${d.db_ok === null ? 'untested (no typed artifact)' : d.db_ok}; export capture = ${d.export_ok === null || d.export_ok === undefined ? 'untested' : d.export_ok}`);
   return L.join('\n');
@@ -719,7 +719,10 @@ async function _exportAttempt(url, mode, deps, only) {
     const t0 = now();
     for (;;) {
       try {
-        const budget = (only ? only.length : 2) * (timeoutMs + 15000) + loadMs + 30000;
+        // Each dialog open may wait up to the driver's readyMs (45 s) for Export
+        // to become enabled: one open, plus one reopen per format.
+        const n = only ? only.length : 2;
+        const budget = n * (timeoutMs + 15000) + (n + 1) * 45000 + loadMs + 30000;
         let timer;
         const resp = await Promise.race([
           tabs.sendMessage(tabId, msg),
@@ -740,7 +743,7 @@ async function _exportAttempt(url, mode, deps, only) {
   }
 }
 
-const _EXPORT_UI_RETRY = new Set(['title_button_not_found', 'menu_not_opened', 'dialog_not_found']);
+const _EXPORT_UI_RETRY = new Set(['title_button_not_found', 'menu_not_opened', 'dialog_not_found', 'export_disabled', 'export_item_missing']);
 
 // deps.exportMode: undefined = inactive tab, falling back ONCE to a focused
 // window for formats that timed out; 'tab' / 'window' force one mode.

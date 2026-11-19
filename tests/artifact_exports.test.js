@@ -202,7 +202,7 @@ describe('export driver (fake DOM)', () => {
     expect(res.captured.map((c) => c.format)).toEqual(['markdown', 'pdf']);
     expect(res.clicks).toContain('title:pointer');
     expect(seen[0]).toBe('pointerdown');
-    expect(res.probe.map((p) => p.stage).slice(0, 3)).toEqual(['before', 'after_click', 'after_pointer']);
+    expect(res.probe[0].stage).toBe('before');
   });
 
   it('menu that never opens: menu_not_opened with a probe of every stage, nothing else clicked', async () => {
@@ -215,11 +215,60 @@ describe('export driver (fake DOM)', () => {
     page.document.defaultView = { MouseEvent: Ev, PointerEvent: Ev, KeyboardEvent: Ev };
     const { d } = mkDriver(page, clk());
     ref.current = d;
-    const res = await d.run({ title: 'Synthetic Title', timeoutMs: 30, loadMs: 50 });
+    const res = await d.run({ title: 'Synthetic Title', timeoutMs: 30, loadMs: 50, readyMs: 12000 });
     expect(res.failed).toEqual([{ format: '*', reason: 'menu_not_opened' }]);
-    expect(res.probe.map((p) => p.stage)).toEqual(['before', 'after_click', 'after_pointer', 'after_enter']);
-    expect(res.clicks).toEqual(['title', 'title:pointer', 'title:enter']);
+    expect(res.probe.map((p) => p.stage)).toEqual(['before', 'round_0', 'round_1', 'gave_up']);
+    expect(res.clicks).toEqual(['title', 'title:pointer', 'title:enter', 'title', 'title:pointer', 'title:enter']);
     expect(Object.keys(res.probe[0]).sort()).toEqual(['connected', 'dialogs', 'expanded', 'focus', 'items', 'menus', 'stage', 'vis']);
+  });
+
+  it('Export greyed out while the artifact loads: waits, never clicks the disabled item, then exports', async () => {
+    const ref = {};
+    const page = mkPage({ formats: DOC_FORMATS, driverRef: ref, files: DOC_FILES });
+    const tb = page.root.children[0].children[0];
+    const open = tb.onclick;
+    let opens = 0;
+    tb.onclick = () => {
+      opens++;
+      open();
+      const menu = page.root.children.find((c) => c.getAttribute('role') === 'menu');
+      const ex = menu.children.find((c) => c.textContent === 'Export');
+      // greyed on the first two opens; the menu closes on Escape
+      if (opens <= 2) ex.attrs['aria-disabled'] = 'true';
+      const exClick = ex.onclick;
+      ex.onclick = () => { if (ex.attrs['aria-disabled'] === 'true') throw new Error('clicked a disabled item'); exClick && exClick(); };
+      menu.dispatchEvent = (ev) => { if (ev.type === 'keydown' && ev.key === 'Escape') menu.remove(); return true; };
+    };
+    class Ev { constructor(type, o) { this.type = type; Object.assign(this, o); } }
+    page.document.defaultView = { MouseEvent: Ev, PointerEvent: Ev, KeyboardEvent: Ev };
+    const { d } = mkDriver(page, clk());
+    ref.current = d;
+    const res = await d.run({ title: 'Synthetic Title', timeoutMs: 1e7, loadMs: 200 });
+    expect(res.failed).toEqual([]);
+    expect(res.captured.map((c) => c.format)).toEqual(['markdown', 'pdf']);
+    expect(opens).toBeGreaterThanOrEqual(3);
+    expect(res.probe.some((p) => (p.labels || []).includes('Export (disabled)'))).toBe(true);
+    expect(res.clicks).not.toContain('title:pointer');   // the menu DID open: no toggling fallbacks
+  });
+
+  it('Export that never enables: export_disabled, after closing the menu', async () => {
+    const ref = {};
+    const page = mkPage({ formats: DOC_FORMATS, driverRef: ref, files: DOC_FILES });
+    const tb = page.root.children[0].children[0];
+    const open = tb.onclick;
+    tb.onclick = () => {
+      open();
+      const menu = page.root.children.find((c) => c.getAttribute('role') === 'menu');
+      menu.children.find((c) => c.textContent === 'Export').attrs['aria-disabled'] = 'true';
+      menu.dispatchEvent = (ev) => { if (ev.key === 'Escape') menu.remove(); return true; };
+    };
+    class Ev { constructor(type, o) { this.type = type; Object.assign(this, o); } }
+    page.document.defaultView = { MouseEvent: Ev, PointerEvent: Ev, KeyboardEvent: Ev };
+    const { d } = mkDriver(page, clk());
+    ref.current = d;
+    const res = await d.run({ title: 'Synthetic Title', timeoutMs: 30, loadMs: 50, readyMs: 10000 });
+    expect(res.failed).toEqual([{ format: '*', reason: 'export_disabled' }]);
+    expect(page.root.children.some((c) => c.getAttribute('role') === 'menu')).toBe(false);
   });
 
   it('a click the allow-list refuses throws and is reported, not performed', async () => {

@@ -160,6 +160,18 @@
     }
 
     const menuExportItem = () => all().find((e) => roleOf(e) === 'menuitem' && nameOf(e) === 'Export') || null;
+    const exportItem = menuExportItem;
+    const menuOpen = () => all().some((e) => roleOf(e) === 'menu');
+    const isEnabled = (el) => !(el.getAttribute && (el.getAttribute('aria-disabled') === 'true' || el.getAttribute('data-disabled') !== null)) && !el.disabled;
+    // Claude's own menu wording only (never artifact content), clipped.
+    const menuLabels = () => all().filter((e) => roleOf(e) === 'menuitem').map((e) => nameOf(e).slice(0, 24) + (isEnabled(e) ? '' : ' (disabled)'));
+    function closeMenu() {
+      const m = all().find((e) => roleOf(e) === 'menu');
+      if (!m || typeof m.dispatchEvent !== 'function') return;
+      const W = doc.defaultView || globalThis;
+      if (!W.KeyboardEvent) return;
+      m.dispatchEvent(new W.KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', bubbles: true, cancelable: true }));
+    }
     const titleButton = (title) => {
       const banner = all().find(isBanner);
       if (!banner) return null;
@@ -182,7 +194,7 @@
     }
 
     // Open the export dialog from scratch (tip, title button, Export item).
-    async function openExportDialog(title, timeoutMs) {
+    async function openExportDialog(title, timeoutMs, opts = {}) {
       if (exportDialog()) { await ensureExportPane(); return null; }
       await dismissTip();
       const tb = await waitFor(() => titleButton(title), timeoutMs);
@@ -198,22 +210,45 @@
         dialogs: dialogs().length,
       });
       probe.push(snap('before'));
-      guardedClick('title', tb, { title });
-      let item = await waitFor(menuExportItem, 5000);
-      probe.push(snap('after_click'));
-      // Fallbacks on the SAME allow-listed button: a full pointer sequence, then
-      // keyboard Enter (menu libraries differ in which event opens them).
-      if (!item) {
-        guardedPress('title', tb, { title });
-        item = await waitFor(menuExportItem, 3000);
-        probe.push(snap('after_pointer'));
+      // Live 2026-11-19: the title click DOES open the menu, but Claude greys
+      // Export out until the artifact has loaded (9-11 items instead of 12).
+      // So: open the menu; if Export is missing or disabled, close it with
+      // Escape, wait, and look again until readyMs. The pointer / Enter
+      // fallbacks run only when the menu itself did not open (a second press
+      // on an OPEN menu toggles it shut).
+      const readyMs = opts.readyMs || 45000;
+      const t0 = now();
+      let item = null;
+      let sawMenu = false;
+      let sawDisabled = false;
+      for (let round = 0; ; round++) {
+        if (!menuOpen()) {
+          guardedClick('title', tb, { title });
+          if (!(await waitFor(menuOpen, 3000))) {
+            guardedPress('title', tb, { title });
+            if (!(await waitFor(menuOpen, 2000))) {
+              guardedKey('title', tb, { title });
+              await waitFor(menuOpen, 2000);
+            }
+          }
+        }
+        if (menuOpen()) {
+          sawMenu = true;
+          await waitFor(() => exportItem() && isEnabled(exportItem()), 1500);
+          const ex = exportItem();
+          if (ex && isEnabled(ex)) { item = ex; break; }
+          if (ex) sawDisabled = true;
+        }
+        if (probe.length < 6) probe.push({ ...snap('round_' + round), labels: menuLabels() });
+        if (now() - t0 >= readyMs) break;
+        closeMenu();
+        await sleep(3000);
       }
       if (!item) {
-        guardedKey('title', tb, { title });
-        item = await waitFor(menuExportItem, 3000);
-        probe.push(snap('after_enter'));
+        if (probe.length < 7) probe.push({ ...snap('gave_up'), labels: menuLabels() });
+        closeMenu();
+        return !sawMenu ? 'menu_not_opened' : (sawDisabled ? 'export_disabled' : 'export_item_missing');
       }
-      if (!item) return 'menu_not_opened';
       guardedClick('export', item);
       const d = await waitFor(exportDialog, 5000);
       if (!d) return 'dialog_not_found';
@@ -248,7 +283,7 @@
       const out = { offered: [], subtype: null, captured: [], failed: [], clicks, probe };
       post({ type: 'arm' });
       try {
-        const err = await openExportDialog(opts.title, opts.loadMs || 20000);
+        const err = await openExportDialog(opts.title, opts.loadMs || 20000, { readyMs: opts.readyMs });
         if (err) { out.failed.push({ format: '*', reason: err }); return out; }
         const keys = new Set();
         for (const b of formatButtons()) { const k = formatKeyOf(nameOf(b)); if (k) keys.add(k); }
@@ -258,7 +293,7 @@
         if (!sel.wanted.length) { out.failed.push({ format: '*', reason: 'no_formats_offered' }); await closeDialog(); return out; }
         const wanted = opts.onlyFormats ? sel.wanted.filter((f) => opts.onlyFormats.includes(f)) : sel.wanted;
         for (const fmt of wanted) {
-          const reopen = await openExportDialog(opts.title, 10000);
+          const reopen = await openExportDialog(opts.title, 10000, { readyMs: opts.readyMs });
           if (reopen) { out.failed.push({ format: fmt, reason: reopen }); continue; }
           const btn = formatButtons().find((b) => formatKeyOf(nameOf(b)) === fmt);
           if (!btn) { out.failed.push({ format: fmt, reason: 'format_button_not_found' }); continue; }
