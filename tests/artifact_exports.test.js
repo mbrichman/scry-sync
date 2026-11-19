@@ -873,6 +873,16 @@ describe('diagnostics: export test (dry run)', () => {
   let orig;
   beforeEach(() => { orig = global.fetch; });
   afterEach(() => { global.fetch = orig; });
+  it('the test capture never probes snippets (they use no probe slot)', async () => {
+    setupNet({ items: [thumbItem(ID1, { kind: 'snippet', thumbnail_url: null }), thumbItem(ID2, { kind: 'page', plain: true })] });
+    const g = global.fetch;
+    const urls = [];
+    global.fetch = vi.fn(async (u, i) => { urls.push(String(u)); return g(u, i); });
+    const d = await A.runArtifactDiagnostics({ orgId: 'org', gate: fastGate(), exportTest: false, tabs: null });
+    expect(urls.some((u) => u.includes(`/api/frame/${ID1}`))).toBe(false);
+    expect(urls.some((u) => u.includes(`/api/frame/${ID2}`))).toBe(true);
+    expect(d.list.kinds).toEqual({ snippet: 1, page: 1 });
+  });
   it('tests one document and one whiteboard artifact, reports sizes only, pushes nothing', async () => {
     const net = setupNet({ items: [thumbItem(ID1), thumbItem(ID2)] });
     const f = mkFlow({ replies: [

@@ -1087,6 +1087,7 @@ async function runArtifactDiagnostics(deps) {
     let probes = 0;
     for (const item of items) {
       if ((done.typed && done.plain) || probes >= 6) break;
+      if (item.kind === 'snippet') continue;   // no frame page; saved with its conversation
       probes++;
       progress(`probing artifact ${probes}`);
       const det = await fetchArtifactDetail(gate, deps.orgId, item.id);
