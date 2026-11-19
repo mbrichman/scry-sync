@@ -166,7 +166,17 @@
     const menuOpen = () => all().some((e) => roleOf(e) === 'menu');
     const isEnabled = (el) => !(el.getAttribute && (el.getAttribute('aria-disabled') === 'true' || el.getAttribute('data-disabled') !== null)) && !el.disabled;
     // Claude's own menu wording only (never artifact content), clipped.
-    const menuLabels = () => all().filter((e) => roleOf(e) === 'menuitem').map((e) => nameOf(e).slice(0, 24) + (isEnabled(e) ? '' : ' (disabled)'));
+    // Only labels from Claude's fixed artifact-menu vocabulary are reported;
+    // anything else (could ever be user text) is a bare '?'.
+    const KNOWN_LABEL = /^(show all comments|version history|share|export|open in desktop app|pin|unpin|add browser shortcut|rename|duplicate|refresh|storage|database storage|permissions|delete)\b/i;
+    const menuLabels = () => {
+      const m = all().find((e) => roleOf(e) === 'menu');
+      if (!m) return [];
+      return all(m).filter((e) => roleOf(e) === 'menuitem').map((e) => {
+        const n = nameOf(e);
+        return (KNOWN_LABEL.test(n) ? n.slice(0, 24) : '?') + (isEnabled(e) ? '' : ' (disabled)');
+      });
+    };
     function closeMenu() {
       const m = all().find((e) => roleOf(e) === 'menu');
       if (!m || typeof m.dispatchEvent !== 'function') return;
@@ -226,9 +236,11 @@
       for (let round = 0; ; round++) {
         if (!menuOpen()) {
           guardedClick('title', tb, { title });
-          if (!(await waitFor(menuOpen, 3000))) {
+          // Re-check right before each fallback: a press on a menu that opened
+          // late would toggle it shut.
+          if (!(await waitFor(menuOpen, 3000)) && !menuOpen()) {
             guardedPress('title', tb, { title });
-            if (!(await waitFor(menuOpen, 2000))) {
+            if (!(await waitFor(menuOpen, 2000)) && !menuOpen()) {
               guardedKey('title', tb, { title });
               await waitFor(menuOpen, 2000);
             }

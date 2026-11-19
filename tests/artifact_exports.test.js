@@ -121,6 +121,10 @@ describe('click allow-list (pure)', () => {
     expect(X.clickAllowed('format', 'button', '\uE0A1Word , Editable', { inDialog: true })).toBe(false);
     expect(X.formatKeyOf('\uE0A2PDF , Document')).toBe('pdf');
     expect(X.titleMatches('\uE001Synthetic Title', 'Synthetic Title')).toBe(true);
+    for (const n of ['\uE063Delete', '\uE063Rename', '\u200BDuplicate', '\uE063Permissions', '\uE063Share']) {
+      expect(X.clickAllowed('title', 'button', n, { inBanner: true, title: n })).toBe(false);
+      expect(X.clickAllowed('export', 'menuitem', n)).toBe(false);
+    }
   });
   it('format selection never includes Word', () => {
     expect(X.selectExportFormats(['word', 'pdf', 'markdown'])).toEqual({ wanted: ['markdown', 'pdf'], subtype: 'document' });
